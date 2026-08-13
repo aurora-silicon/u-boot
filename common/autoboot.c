@@ -466,6 +466,13 @@ const char *bootdelay_process(void)
 	 */
 	if (IS_ENABLED(CONFIG_OF_CONTROL))
 		bootdelay = ofnode_conf_read_int("bootdelay", bootdelay);
+	if (IS_ENABLED(CONFIG_OF_CONTROL)) {
+		const char *fdt_bootdelay = ofnode_conf_read_str("bootdelay");
+
+		/* m1n1's /config interface carries all values as strings. */
+		if (fdt_bootdelay)
+			bootdelay = simple_strtol(fdt_bootdelay, NULL, 10);
+	}
 
 	debug("### main_loop entered: bootdelay=%d\n\n", bootdelay);
 

@@ -893,6 +893,14 @@ config S5P_SERIAL
 	help
 	  Select this to enable Samsung S5P UART support.
 
+config APPLE_DOCKCHANNEL_SERIAL
+	bool "Apple DockChannel UART support"
+	depends on DM_SERIAL && ARCH_APPLE
+	help
+	  Select this to enable the byte-stream console exposed through Apple's
+	  DockChannel hardware.  This is the console transported by USB-C serial
+	  mode on newer Apple platforms which do not expose a conventional UART.
+
 config S5P4418_PL011_SERIAL
 	bool "Extended PL011 driver for S5P4418"
 	depends on DM_SERIAL && PL01X_SERIAL && ARCH_NEXELL

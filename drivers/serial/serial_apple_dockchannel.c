@@ -12,10 +12,11 @@
 
 #define APPLE_DC_CHANNEL_STRIDE	0x10000
 
-#define APPLE_DC_DATA_TX8	0x4004
-#define APPLE_DC_DATA_TX_FREE	0x4014
-#define APPLE_DC_DATA_RX8	0x401c
-#define APPLE_DC_DATA_RX_COUNT	0x402c
+#define APPLE_DC_DATA_OFFSET	0x4000
+#define APPLE_DC_DATA_TX8	0x04
+#define APPLE_DC_DATA_TX_FREE	0x14
+#define APPLE_DC_DATA_RX8	0x1c
+#define APPLE_DC_DATA_RX_COUNT	0x2c
 
 struct apple_dc_serial_plat {
 	void __iomem *base;
@@ -66,11 +67,22 @@ static int apple_dc_serial_of_to_plat(struct udevice *dev)
 	fdt_addr_t addr;
 	u32 channel;
 
-	addr = dev_read_addr(dev);
-	if (addr == FDT_ADDR_T_NONE)
-		return -EINVAL;
-
-	channel = dev_read_u32_default(dev, "apple,channel", 1);
+	/*
+	 * Linux-style DTs describe the channel's data window explicitly.  The
+	 * compact m1n1 smoke DT instead supplies the shared config window and an
+	 * apple,channel selector.  Normalize both forms to the data window so the
+	 * handoff can stay on the firmware-selected DockChannel.
+	 */
+	addr = dev_read_addr_name(dev, "data");
+	if (addr != FDT_ADDR_T_NONE) {
+		channel = dev_read_u32_default(dev, "apple,channel", 0);
+	} else {
+		addr = dev_read_addr(dev);
+		if (addr == FDT_ADDR_T_NONE)
+			return -EINVAL;
+		channel = dev_read_u32_default(dev, "apple,channel", 1);
+		addr += APPLE_DC_DATA_OFFSET;
+	}
 	if (channel > 15)
 		return -EINVAL;
 

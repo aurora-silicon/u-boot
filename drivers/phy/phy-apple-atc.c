@@ -552,6 +552,7 @@ static int apple_atcphy_reset_remove(struct udevice *dev)
 static const struct udevice_id apple_atcphy_ids[] = {
 	{ .compatible = "apple,t6000-atcphy" },
 	{ .compatible = "apple,t8103-atcphy" },
+	{ .compatible = "apple,t8122-atcphy" },
 	{ .compatible = "apple,t8140-atcphy" },
 	{ }
 };

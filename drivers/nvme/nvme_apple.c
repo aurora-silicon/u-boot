@@ -16,6 +16,7 @@
 #include <asm/arch/sart.h>
 #include <linux/apple-mailbox.h>
 #include <linux/bitfield.h>
+#include <linux/bug.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
@@ -177,8 +178,14 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 {
 	struct apple_nvme_priv *priv =
 		container_of(nvmeq->dev, struct apple_nvme_priv, ndev);
+	u32 page_size = nvmeq->dev->page_size;
 	struct ans_nvmmu_tcb *tcb;
 	u16 tail = nvmeq->sq_tail;
+
+	if (nvmeq->qid == NVME_ADMIN_Q) {
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp1, page_size));
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp2, page_size));
+	}
 
 	tcb = ((void *)priv->tcbs[nvmeq->qid]) + tail * ANS_NVMMU_TCB_PITCH;
 	memset(tcb, 0, sizeof(*tcb));

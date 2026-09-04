@@ -182,21 +182,20 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 
 	tcb = ((void *)priv->tcbs[nvmeq->qid]) + tail * ANS_NVMMU_TCB_PITCH;
 	memset(tcb, 0, sizeof(*tcb));
+	/* Firmware interprets a nonzero opcode as an out-of-line command. */
+	tcb->opcode = 0;
 	if (priv->hw->post_m4) {
 		/* Post-M4 firmware checks the DMA direction against the command. */
-		tcb->opcode = 0;
 		if (!cmd->common.prp1)
 			tcb->flags = 0;
 		else if (cmd->common.opcode & 1)
 			tcb->flags = ANS_NVMMU_TCB_READ;
 		else
 			tcb->flags = ANS_NVMMU_TCB_WRITE;
+	} else if (cmd->common.prp1) {
+		tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
 	} else {
-		tcb->opcode = cmd->common.opcode;
-		if (cmd->common.prp1)
-			tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
-		else
-			tcb->flags = 0;
+		tcb->flags = 0;
 	}
 	tcb->slot = tail;
 	tcb->prpl_len = cmd->rw.length;

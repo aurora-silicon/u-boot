@@ -193,7 +193,10 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 			tcb->flags = ANS_NVMMU_TCB_WRITE;
 	} else {
 		tcb->opcode = cmd->common.opcode;
-		tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
+		if (cmd->common.prp1)
+			tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
+		else
+			tcb->flags = 0;
 	}
 	tcb->slot = tail;
 	tcb->prpl_len = cmd->rw.length;

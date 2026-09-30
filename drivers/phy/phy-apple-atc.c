@@ -282,6 +282,27 @@ static int atcphy_startup_failed(struct udevice *dev, int ret)
 	return ret;
 }
 
+static void atcphy_setup_pipehandler_dummy(struct apple_atcphy_priv *priv)
+{
+	void __iomem *mux = priv->pipehandler + PIPEHANDLER_MUX_CTRL;
+
+	mask32(mux, PIPEHANDLER_MUX_CTRL_CLK,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
+	udelay(10);
+	mask32(mux, PIPEHANDLER_MUX_CTRL_DATA,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA,
+			  PIPEHANDLER_MUX_CTRL_DATA_DUMMY));
+	udelay(10);
+	mask32(mux, PIPEHANDLER_MUX_CTRL_CLK,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK,
+			  PIPEHANDLER_MUX_CTRL_CLK_DUMMY));
+	udelay(10);
+
+	/* The dwc3 core does not finish initialising without the dummy PHY. */
+	set32(priv->pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	      PIPEHANDLER_DUMMY_PHY_EN);
+}
+
 /* Bring the block up in USB2 mode: SuperSpeed lanes off, PIPE on the dummy PHY. */
 static int atcphy_configure_usb2(struct udevice *dev)
 {
@@ -292,6 +313,7 @@ static int atcphy_configure_usb2(struct udevice *dev)
 
 	/* Stay conservative if startup and the subsequent power-off both fail. */
 	priv->powered = true;
+	atcphy_setup_pipehandler_dummy(priv);
 	ret = atcphy_usb2_power_on(dev);
 	if (ret)
 		goto err_power_off;
@@ -364,27 +386,6 @@ static int atcphy_configure_usb2(struct udevice *dev)
 
 err_power_off:
 	return atcphy_startup_failed(dev, ret);
-}
-
-static void atcphy_setup_pipehandler_dummy(struct apple_atcphy_priv *priv)
-{
-	void __iomem *mux = priv->pipehandler + PIPEHANDLER_MUX_CTRL;
-
-	mask32(mux, PIPEHANDLER_MUX_CTRL_CLK,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
-	udelay(10);
-	mask32(mux, PIPEHANDLER_MUX_CTRL_DATA,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA,
-			  PIPEHANDLER_MUX_CTRL_DATA_DUMMY));
-	udelay(10);
-	mask32(mux, PIPEHANDLER_MUX_CTRL_CLK,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK,
-			  PIPEHANDLER_MUX_CTRL_CLK_DUMMY));
-	udelay(10);
-
-	/* The dwc3 core does not finish initialising without the dummy PHY. */
-	set32(priv->pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
-	      PIPEHANDLER_DUMMY_PHY_EN);
 }
 
 static int apple_atcphy_usb2_init(struct phy *phy)
@@ -483,7 +484,7 @@ static int apple_atcphy_t8140_probe(struct udevice *dev)
 	priv->pipehandler = dev_read_addr_name_ptr(dev, "pipehandler");
 	priv->usb2phy = dev_read_addr_name_ptr(dev, "usb2phy");
 	priv->usb2phy_reg = dev_read_addr_size_name_ptr(dev, "usb2phy-reg",
-						     &priv->usb2phy_reg_size);
+							&priv->usb2phy_reg_size);
 	if (!priv->core || !priv->pipehandler || !priv->usb2phy ||
 	    !priv->usb2phy_reg || priv->usb2phy_reg_size < sizeof(u32))
 		return -EINVAL;
@@ -492,7 +493,6 @@ static int apple_atcphy_t8140_probe(struct udevice *dev)
 	ret = atcphy_stop(dev);
 	if (ret)
 		return ret;
-	atcphy_setup_pipehandler_dummy(priv);
 
 	set32(priv->usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
 	ret = atcphy_configure_usb2(dev);

@@ -5,12 +5,14 @@
 
 #include <dm.h>
 #include <dm/uclass-internal.h>
+#include <command.h>
 #include <efi_loader.h>
 #include <env.h>
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
 #include <linux/ioport.h>
+#include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
@@ -974,6 +976,112 @@ char *env_fat_get_dev_part(void)
 
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
+/*
+ * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
+ *
+ * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
+ * command line in /chosen/bootargs.  First load the removable-media EFI
+ * path from the internal ESP: shim then loads Fedora GRUB and its BLS entries.
+ * If that fails, boot the kernel and initramfs named by /chosen fallback
+ * properties, then try generic bootflow.  Both direct and EFI boot pass
+ * m1n1's devicetree (${fdtcontroladdr}).  With no
+ * aurora,fallback-initrd, an initramfs m1n1 already loaded is used.
+ *
+ * Nothing here is set if the variable already exists, so a saved
+ * uboot.env on the ESP can override any of it.
+ */
+static const char * const t8140_env[][2] = {
+	{ "aurora_boot",
+	  "echo AURORA_UBOOT_BOOT: EFI on internal ESP; run aurora_efi; "
+	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
+	  "echo AURORA_UBOOT_BOOT: bootflow; bootflow scan -b; "
+	  "echo AURORA_UBOOT_BOOT_FAIL: no bootable entry; run aurora_rescue" },
+	{ "aurora_efi",
+	  "if test -n \"${fw_dev_part}\"; then "
+	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
+	  "bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi" },
+	/* Keep MTP untouched even when every boot path fails. */
+	{ "aurora_rescue",
+	  "echo; echo Nothing could be booted. Use the serial console or reset." },
+	{ "aurora_fallback",
+	  "if test -n \"${aurora_fallback_image}\" -a -n \"${fw_dev_part}\"; then "
+	  "load nvme ${fw_dev_part} ${kernel_addr_r} ${aurora_fallback_image} && "
+	  "run aurora_fallback_initrd_load && "
+	  "booti ${kernel_addr_r} ${aurora_initrd} ${fdtcontroladdr}; "
+	  "fi" },
+	/*
+	 * Without a named initramfs, use the one the boot loader already
+	 * placed in memory (m1n1 passes it in /chosen/linux,initrd-*).
+	 */
+	{ "aurora_fallback_initrd_load",
+	  "if test -n \"${aurora_fallback_initrd}\"; then "
+	  "load nvme ${fw_dev_part} ${ramdisk_addr_r} ${aurora_fallback_initrd} && "
+	  "setenv aurora_initrd ${ramdisk_addr_r}:${filesize}; "
+	  "elif test -n \"${aurora_loader_initrd}\"; then "
+	  "setenv aurora_initrd ${aurora_loader_initrd}; "
+	  "else setenv aurora_initrd -; fi" },
+};
+
+/* The initramfs the boot loader placed in memory, as "start:size" */
+static void t8140_loader_initrd(ofnode chosen)
+{
+	u64 start, end;
+	char buf[40];
+
+	if (ofnode_read_u64(chosen, "linux,initrd-start", &start) ||
+	    ofnode_read_u64(chosen, "linux,initrd-end", &end) ||
+	    end <= start)
+		return;
+
+	snprintf(buf, sizeof(buf), "%llx:%llx", start, end - start);
+	env_set("aurora_loader_initrd", buf);
+}
+
+static void t8140_late_init(void)
+{
+	const char *str;
+	ofnode chosen;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8140_env); i++) {
+		if (!env_get(t8140_env[i][0]))
+			env_set(t8140_env[i][0], t8140_env[i][1]);
+	}
+
+	/*
+	 * Replace the generic Apple defaults unless a saved environment
+	 * changed them.  USB is neither started at boot nor a boot target
+	 * until the USB-C PHY support has been validated; "usb start" still
+	 * works by hand.
+	 */
+	if (!strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
+		env_set("bootcmd", "run aurora_boot");
+	if (!strcmp(env_get("boot_targets") ?: "", "nvme usb"))
+		env_set("boot_targets", "nvme");
+	if (!strcmp(env_get("preboot") ?: "", "usb start"))
+		env_set("preboot", "");
+	/* Keep the added boot time small; a key on the console still stops it. */
+	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
+		env_set("bootdelay", "1");
+
+	/* EFI ConIn uses the active stdin; keep serial input available. */
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) && IS_ENABLED(CONFIG_CMDLINE))
+		run_command("mtpkbd start", 0);
+
+	chosen = ofnode_path("/chosen");
+	if (!ofnode_valid(chosen))
+		return;
+
+	str = ofnode_read_string(chosen, "aurora,fallback-image");
+	if (str && !env_get("aurora_fallback_image"))
+		env_set("aurora_fallback_image", str);
+	str = ofnode_read_string(chosen, "aurora,fallback-initrd");
+	if (str && !env_get("aurora_fallback_initrd"))
+		env_set("aurora_fallback_initrd", str);
+
+	t8140_loader_initrd(chosen);
+}
+
 int board_late_init(void)
 {
 	u32 status = 0;
@@ -981,6 +1089,9 @@ int board_late_init(void)
 
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
+
+	if (of_machine_is_compatible("apple,t8140"))
+		t8140_late_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M

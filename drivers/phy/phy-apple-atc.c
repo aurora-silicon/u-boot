@@ -104,6 +104,7 @@ struct apple_atcphy_priv {
 	void __iomem *pipehandler;
 	void __iomem *usb2phy;
 	void __iomem *usb2phy_reg;
+	fdt_size_t usb2phy_reg_size;
 	bool powered;
 };
 
@@ -124,7 +125,7 @@ static void clear32(void __iomem *reg, u32 clear)
 
 /* Apply an "apple,tunable-*" property: <offset mask value> triplets. */
 static int atcphy_apply_tunable(struct udevice *dev, void __iomem *regs,
-				const char *name)
+				fdt_size_t size, const char *name)
 {
 	const fdt32_t *p;
 	int len, i;
@@ -132,14 +133,21 @@ static int atcphy_apply_tunable(struct udevice *dev, void __iomem *regs,
 	p = dev_read_prop(dev, name, &len);
 	if (!p)
 		return -ENOENT;
-	if (len % 12)
+	if (len <= 0 || len % (3 * sizeof(*p)) || size < sizeof(u32) ||
+	    !regs || (uintptr_t)regs % sizeof(u32))
 		return -EINVAL;
+
+	/* Validate the entire property before changing any register. */
+	for (i = 0; i < len / 4; i += 3) {
+		u32 off = fdt32_to_cpu(p[i]);
+
+		if (off % sizeof(u32) || off > size - sizeof(u32))
+			return -EINVAL;
+	}
 
 	for (i = 0; i < len / 4; i += 3) {
 		u32 off = fdt32_to_cpu(p[i]);
 
-		if (off % 4)
-			return -EINVAL;
 		mask32(regs + off, fdt32_to_cpu(p[i + 1]),
 		       fdt32_to_cpu(p[i + 2]));
 	}
@@ -210,6 +218,7 @@ static void atcphy_usb2_power_on(struct udevice *dev)
 
 	/* Per-device eUSB2 defaults; the resets above cleared them. */
 	ret = atcphy_apply_tunable(dev, priv->usb2phy_reg,
+				   priv->usb2phy_reg_size,
 				   "apple,tunable-usb2phy-reg-dflt");
 	if (ret)
 		dev_warn(dev, "no eUSB2 defaults applied (%d)\n", ret);
@@ -436,9 +445,10 @@ static int apple_atcphy_t8140_probe(struct udevice *dev)
 	priv->core = dev_read_addr_name_ptr(dev, "core");
 	priv->pipehandler = dev_read_addr_name_ptr(dev, "pipehandler");
 	priv->usb2phy = dev_read_addr_name_ptr(dev, "usb2phy");
-	priv->usb2phy_reg = dev_read_addr_name_ptr(dev, "usb2phy-reg");
+	priv->usb2phy_reg = dev_read_addr_size_name_ptr(dev, "usb2phy-reg",
+						     &priv->usb2phy_reg_size);
 	if (!priv->core || !priv->pipehandler || !priv->usb2phy ||
-	    !priv->usb2phy_reg)
+	    !priv->usb2phy_reg || priv->usb2phy_reg_size < sizeof(u32))
 		return -EINVAL;
 
 	atcphy_dwc3_reset_assert(priv);

@@ -105,7 +105,8 @@ struct apple_atcphy_priv {
 	void __iomem *usb2phy;
 	void __iomem *usb2phy_reg;
 	fdt_size_t usb2phy_reg_size;
-	bool powered;
+	bool powered;		/* May be powered; false only after full shutdown */
+	bool configured;	/* Core and dummy path are safe for fast restart */
 };
 
 static void mask32(void __iomem *reg, u32 mask, u32 set)
@@ -261,6 +262,8 @@ static int atcphy_stop(struct udevice *dev)
 {
 	struct apple_atcphy_priv *priv = dev_get_priv(dev);
 
+	/* The fast restart path is unsafe as soon as teardown begins. */
+	priv->configured = false;
 	atcphy_dwc3_reset_assert(priv);
 	atcphy_usb2_power_off(priv);
 	mask32(priv->pipehandler + PIPEHANDLER_MUX_CTRL,
@@ -313,6 +316,7 @@ static int atcphy_configure_usb2(struct udevice *dev)
 
 	/* Stay conservative if startup and the subsequent power-off both fail. */
 	priv->powered = true;
+	priv->configured = false;
 	atcphy_setup_pipehandler_dummy(priv);
 	ret = atcphy_usb2_power_on(dev);
 	if (ret)
@@ -381,7 +385,7 @@ static int atcphy_configure_usb2(struct udevice *dev)
 		goto err_power_off;
 	}
 
-	priv->powered = true;
+	priv->configured = true;
 	return 0;
 
 err_power_off:
@@ -399,8 +403,16 @@ static int apple_atcphy_usb2_init(struct phy *phy)
 
 	/* dwc3 releasing its reset powered the USB2 PHY off; bring it back. */
 	set32(priv->usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
-	if (!priv->powered)
+	if (!priv->configured) {
+		/* Finish an earlier incomplete shutdown before reconfiguration. */
+		if (priv->powered) {
+			ret = atcphy_stop(rdev);
+			if (ret)
+				return ret;
+		}
+
 		return atcphy_configure_usb2(rdev);
+	}
 
 	ret = atcphy_usb2_power_on(rdev);
 	if (ret)

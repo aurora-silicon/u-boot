@@ -340,6 +340,15 @@ static int apple_pcie_probe(struct udevice *dev)
 	ofnode of_port;
 	int ret;
 
+	/*
+	 * The A18 Pro's internal PCIe carries only the Wi-Fi/Bluetooth
+	 * module and needs a DMA path (PIODMA, locked DARTs) this driver
+	 * does not set up.  Leave it to the OS rather than resetting the
+	 * ports underneath it.
+	 */
+	if (device_is_compatible(dev, "apple,t8140-pcie"))
+		return -ENODEV;
+
 	pcie->hw = (struct reg_info *)dev_get_driver_data(dev);
 
 	pcie->dev = dev;

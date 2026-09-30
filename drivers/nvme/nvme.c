@@ -21,8 +21,8 @@
 #define NVME_AQ_DEPTH		2
 #define NVME_SQ_SIZE(depth)	(depth * sizeof(struct nvme_command))
 #define NVME_CQ_SIZE(depth)	(depth * sizeof(struct nvme_completion))
-#define NVME_CQ_ALLOCATION	ALIGN(NVME_CQ_SIZE(NVME_Q_DEPTH), \
-				      ARCH_DMA_MINALIGN)
+#define NVME_CQ_ALLOCATION(depth)	ALIGN(NVME_CQ_SIZE(depth), \
+					      ARCH_DMA_MINALIGN)
 #define ADMIN_TIMEOUT		60
 #define IO_TIMEOUT		30
 #define MAX_PRP_POOL		512
@@ -144,7 +144,7 @@ static u16 nvme_read_completion_status(struct nvme_queue *nvmeq, u16 index)
 	 * as the cache line should never become dirty.
 	 */
 	ulong start = (ulong)&nvmeq->cqes[0];
-	ulong stop = start + NVME_CQ_ALLOCATION;
+	ulong stop = start + NVME_CQ_ALLOCATION(nvmeq->q_depth);
 
 	invalidate_dcache_range(start, stop);
 
@@ -255,7 +255,7 @@ static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev,
 		return NULL;
 	memset(nvmeq, 0, sizeof(*nvmeq));
 
-	nvmeq->cqes = (void *)memalign(4096, NVME_CQ_ALLOCATION);
+	nvmeq->cqes = (void *)memalign(4096, NVME_CQ_ALLOCATION(depth));
 	if (!nvmeq->cqes)
 		goto free_nvmeq;
 	memset((void *)nvmeq->cqes, 0, NVME_CQ_SIZE(depth));
@@ -298,6 +298,11 @@ static int nvme_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
 	c.delete_queue.qid = cpu_to_le16(id);
 
 	return nvme_submit_admin_cmd(dev, &c, NULL);
+}
+
+static int nvme_delete_sq(struct nvme_dev *dev, u16 sqid)
+{
+	return nvme_delete_queue(dev, nvme_admin_delete_sq, sqid);
 }
 
 static int nvme_delete_cq(struct nvme_dev *dev, u16 cqid)
@@ -361,7 +366,7 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
 	memset((void *)nvmeq->cqes, 0, NVME_CQ_SIZE(nvmeq->q_depth));
 	flush_dcache_range((ulong)nvmeq->cqes,
-			   (ulong)nvmeq->cqes + NVME_CQ_ALLOCATION);
+			   (ulong)nvmeq->cqes + NVME_CQ_ALLOCATION(nvmeq->q_depth));
 	dev->online_queues++;
 }
 
@@ -555,6 +560,7 @@ int nvme_set_features(struct nvme_dev *dev, unsigned fid, unsigned dword11,
 static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
 {
 	struct nvme_dev *dev = nvmeq->dev;
+	struct nvme_ops *ops;
 	int result;
 
 	nvmeq->cq_vector = qid - 1;
@@ -568,8 +574,17 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
 
 	nvme_init_queue(nvmeq, qid);
 
+	ops = (struct nvme_ops *)dev->udev->driver->ops;
+	if (ops && ops->queue_created) {
+		result = ops->queue_created(nvmeq);
+		if (result < 0)
+			goto release_sq;
+	}
+
 	return result;
 
+ release_sq:
+	nvme_delete_sq(dev, qid);
  release_cq:
 	nvme_delete_cq(dev, qid);
  release_ret:
@@ -867,7 +882,8 @@ int nvme_init(struct udevice *udev)
 	memset(ndev->queues, 0, NVME_Q_NUM * sizeof(struct nvme_queue *));
 
 	ndev->cap = nvme_readq(&ndev->bar->cap);
-	ndev->q_depth = min_t(int, NVME_CAP_MQES(ndev->cap) + 1, NVME_Q_DEPTH);
+	ndev->q_depth = min_t(int, NVME_CAP_MQES(ndev->cap) + 1,
+			      ndev->max_q_depth ?: NVME_Q_DEPTH);
 	ndev->db_stride = 1 << NVME_CAP_STRIDE(ndev->cap);
 	ndev->dbs = ((void __iomem *)ndev->bar) + 4096;
 
@@ -950,6 +966,21 @@ free_queue:
 	free((void *)ndev->queues);
 free_nvme:
 	return ret;
+}
+
+int nvme_retire_io_queues(struct udevice *udev)
+{
+	struct nvme_dev *ndev = dev_get_priv(udev);
+	int qid, ret = 0;
+
+	for (qid = ndev->queue_count - 1; qid > NVME_ADMIN_Q; qid--) {
+		if (!ndev->queues[qid])
+			continue;
+		ret |= nvme_delete_sq(ndev, qid);
+		ret |= nvme_delete_cq(ndev, qid);
+	}
+
+	return ret ? -EIO : 0;
 }
 
 int nvme_shutdown(struct udevice *udev)

@@ -927,7 +927,8 @@ static char *asahi_esp_devpart(void)
 			break;
 
 		dev = dev_get_parent(nvme_blk->bdev);
-		if (!device_is_compatible(dev, "apple,nvme-ans2"))
+		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,t8132-nvme-ans2"))
 			continue;
 
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {

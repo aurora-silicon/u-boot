@@ -188,7 +188,7 @@ static void atcphy_usb2_power_off(struct apple_atcphy_priv *priv)
 	set32(priv->usb2phy + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
 }
 
-static void atcphy_usb2_power_on(struct udevice *dev)
+static int atcphy_usb2_power_on(struct udevice *dev)
 {
 	struct apple_atcphy_priv *priv = dev_get_priv(dev);
 	int ret;
@@ -221,7 +221,9 @@ static void atcphy_usb2_power_on(struct udevice *dev)
 				   priv->usb2phy_reg_size,
 				   "apple,tunable-usb2phy-reg-dflt");
 	if (ret)
-		dev_warn(dev, "no eUSB2 defaults applied (%d)\n", ret);
+		dev_err(dev, "failed to apply required eUSB2 defaults (%d)\n", ret);
+
+	return ret;
 }
 
 static int atcphy_power_off(struct udevice *dev)
@@ -255,6 +257,31 @@ static int atcphy_power_off(struct udevice *dev)
 	return 0;
 }
 
+static int atcphy_stop(struct udevice *dev)
+{
+	struct apple_atcphy_priv *priv = dev_get_priv(dev);
+
+	atcphy_dwc3_reset_assert(priv);
+	atcphy_usb2_power_off(priv);
+	mask32(priv->pipehandler + PIPEHANDLER_MUX_CTRL,
+	       PIPEHANDLER_MUX_CTRL_CLK,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
+	clear32(priv->pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+		PIPEHANDLER_DUMMY_PHY_EN);
+
+	return atcphy_power_off(dev);
+}
+
+static int atcphy_startup_failed(struct udevice *dev, int ret)
+{
+	int cleanup_ret = atcphy_stop(dev);
+
+	if (cleanup_ret)
+		dev_err(dev, "failed to unwind PHY startup (%d)\n", cleanup_ret);
+
+	return ret;
+}
+
 /* Bring the block up in USB2 mode: SuperSpeed lanes off, PIPE on the dummy PHY. */
 static int atcphy_configure_usb2(struct udevice *dev)
 {
@@ -263,7 +290,11 @@ static int atcphy_configure_usb2(struct udevice *dev)
 	u32 reg;
 	int ret;
 
-	atcphy_usb2_power_on(dev);
+	/* Stay conservative if startup and the subsequent power-off both fail. */
+	priv->powered = true;
+	ret = atcphy_usb2_power_on(dev);
+	if (ret)
+		goto err_power_off;
 
 	set32(core + ATCPHY_MISC, ATCPHY_MISC_RESET_N);
 
@@ -272,7 +303,7 @@ static int atcphy_configure_usb2(struct udevice *dev)
 				 reg & ATCPHY_POWER_SLEEP_SMALL, 100000);
 	if (ret) {
 		dev_err(dev, "failed to wake the PHY (small)\n");
-		return ret;
+		goto err_power_off;
 	}
 
 	set32(core + ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_BIG);
@@ -280,7 +311,7 @@ static int atcphy_configure_usb2(struct udevice *dev)
 				 reg & ATCPHY_POWER_SLEEP_BIG, 100000);
 	if (ret) {
 		dev_err(dev, "failed to wake the PHY (big)\n");
-		return ret;
+		goto err_power_off;
 	}
 
 	clear32(core + ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
@@ -325,11 +356,14 @@ static int atcphy_configure_usb2(struct udevice *dev)
 				 100000);
 	if (ret) {
 		dev_err(dev, "resistor calibration did not finish\n");
-		return ret;
+		goto err_power_off;
 	}
 
 	priv->powered = true;
 	return 0;
+
+err_power_off:
+	return atcphy_startup_failed(dev, ret);
 }
 
 static void atcphy_setup_pipehandler_dummy(struct apple_atcphy_priv *priv)
@@ -357,6 +391,7 @@ static int apple_atcphy_usb2_init(struct phy *phy)
 {
 	struct udevice *rdev = dev_get_parent(phy->dev);
 	struct apple_atcphy_priv *priv = dev_get_priv(rdev);
+	int ret;
 
 	if (!priv->usb2_only || phy->id != PHY_TYPE_USB2)
 		return 0;
@@ -366,7 +401,9 @@ static int apple_atcphy_usb2_init(struct phy *phy)
 	if (!priv->powered)
 		return atcphy_configure_usb2(rdev);
 
-	atcphy_usb2_power_on(rdev);
+	ret = atcphy_usb2_power_on(rdev);
+	if (ret)
+		return atcphy_startup_failed(rdev, ret);
 
 	return 0;
 }
@@ -451,9 +488,8 @@ static int apple_atcphy_t8140_probe(struct udevice *dev)
 	    !priv->usb2phy_reg || priv->usb2phy_reg_size < sizeof(u32))
 		return -EINVAL;
 
-	atcphy_dwc3_reset_assert(priv);
-	atcphy_usb2_power_off(priv);
-	ret = atcphy_power_off(dev);
+	priv->powered = true;
+	ret = atcphy_stop(dev);
 	if (ret)
 		return ret;
 	atcphy_setup_pipehandler_dummy(priv);
@@ -469,6 +505,7 @@ static int apple_atcphy_t8140_probe(struct udevice *dev)
 
 static int apple_atcphy_reset_probe(struct udevice *dev)
 {
+	struct apple_atcphy_priv *priv = dev_get_priv(dev);
 	struct udevice *child;
 	int ret;
 
@@ -478,8 +515,13 @@ static int apple_atcphy_reset_probe(struct udevice *dev)
 			return ret;
 	}
 
-	device_bind(dev, &apple_atcphy_driver, "apple-atcphy", NULL,
-		    dev_ofnode(dev), &child);
+	ret = device_bind(dev, &apple_atcphy_driver, "apple-atcphy", NULL,
+			  dev_ofnode(dev), &child);
+	if (ret) {
+		if (priv->usb2_only)
+			return atcphy_startup_failed(dev, ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -489,11 +531,8 @@ static int apple_atcphy_reset_remove(struct udevice *dev)
 	struct apple_atcphy_priv *priv = dev_get_priv(dev);
 
 	/* Leave dwc3 in reset and the PHY off for the OS driver. */
-	if (priv->usb2_only) {
-		atcphy_dwc3_reset_assert(priv);
-		atcphy_usb2_power_off(priv);
-		atcphy_power_off(dev);
-	}
+	if (priv->usb2_only)
+		return atcphy_stop(dev);
 
 	return 0;
 }

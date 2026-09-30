@@ -584,6 +584,7 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
 	return result;
 
  release_sq:
+	dev->online_queues--;
 	nvme_delete_sq(dev, qid);
  release_cq:
 	nvme_delete_cq(dev, qid);

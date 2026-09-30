@@ -10,6 +10,7 @@
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <linux/ioport.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
@@ -752,6 +753,20 @@ static struct mm_region t8122_mem_map[] = {
 	}
 };
 
+/* Apple A18 Pro (T8140) */
+
+static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
+	{
+		/* I/O */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 12UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
 struct mm_region *mem_map;
 
 int board_init(void)
@@ -766,6 +781,21 @@ int dram_init(void)
 
 int dram_init_banksize(void)
 {
+	ofnode mem = ofnode_null();
+	struct resource res;
+	int bank = 0, reg;
+
+	/* fdtdec_setup_memory_banksize() stops silently at the array limit. */
+	while (ofnode_valid(mem = fdtdec_get_next_memory_node(mem))) {
+		for (reg = 0; !ofnode_read_resource(mem, reg, &res); reg++) {
+			if (++bank > CONFIG_NR_DRAM_BANKS) {
+				log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
+					bank, CONFIG_NR_DRAM_BANKS);
+				return -E2BIG;
+			}
+		}
+	}
+
 	return fdtdec_setup_memory_banksize();
 }
 
@@ -784,7 +814,7 @@ void build_mem_map(void)
 	ofnode node;
 	fdt_addr_t base;
 	fdt_size_t size;
-	int i;
+	int i, bank, fb_slot;
 
 	if (of_machine_is_compatible("apple,t8103") ||
 	    of_machine_is_compatible("apple,t8112"))
@@ -801,24 +831,43 @@ void build_mem_map(void)
 		mem_map = t6022_mem_map;
 	else if (of_machine_is_compatible("apple,t8122"))
 		mem_map = t8122_mem_map;
+	else if (of_machine_is_compatible("apple,t8140"))
+		mem_map = t8140_mem_map;
 	else
 		panic("Unsupported SoC\n");
 
-	/* Find list terminator. */
-	for (i = 0; mem_map[i].size || mem_map[i].attrs; i++)
-		;
-
-	/* Align RAM mapping to page boundaries */
-	base = gd->bd->bi_dram[0].start;
-	size = gd->bd->bi_dram[0].size;
-	size += (base - ALIGN_DOWN(base, SZ_4K));
-	base = ALIGN_DOWN(base, SZ_4K);
-	size = ALIGN(size, SZ_4K);
-
-	/* Update RAM mapping */
-	mem_map[i - 2].virt = base;
-	mem_map[i - 2].phys = base;
-	mem_map[i - 2].size = size;
+	if (mem_map == t8140_mem_map) {
+		/* LMB and EFI see every bank, so the MMU must map every bank. */
+		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
+			base = gd->bd->bi_dram[bank].start;
+			size = gd->bd->bi_dram[bank].size;
+			if (!size)
+				break;
+			size += base - ALIGN_DOWN(base, SZ_4K);
+			base = ALIGN_DOWN(base, SZ_4K);
+			mem_map[bank + 1].virt = base;
+			mem_map[bank + 1].phys = base;
+			mem_map[bank + 1].size = ALIGN(size, SZ_4K);
+			mem_map[bank + 1].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+						  PTE_BLOCK_INNER_SHARE;
+		}
+		fb_slot = bank + 1;
+		mem_map[fb_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+					 PTE_BLOCK_INNER_SHARE |
+					 PTE_BLOCK_PXN | PTE_BLOCK_UXN;
+	} else {
+		/* Find list terminator and update the original single RAM slot. */
+		for (i = 0; mem_map[i].size || mem_map[i].attrs; i++)
+			;
+		base = gd->bd->bi_dram[0].start;
+		size = gd->bd->bi_dram[0].size;
+		size += base - ALIGN_DOWN(base, SZ_4K);
+		base = ALIGN_DOWN(base, SZ_4K);
+		mem_map[i - 2].virt = base;
+		mem_map[i - 2].phys = base;
+		mem_map[i - 2].size = ALIGN(size, SZ_4K);
+		fb_slot = i - 1;
+	}
 
 	node = ofnode_path("/chosen/framebuffer");
 	if (!ofnode_valid(node))
@@ -834,9 +883,9 @@ void build_mem_map(void)
 	size = ALIGN(size, SZ_4K);
 
 	/* Add framebuffer mapping */
-	mem_map[i - 1].virt = base;
-	mem_map[i - 1].phys = base;
-	mem_map[i - 1].size = size;
+	mem_map[fb_slot].virt = base;
+	mem_map[fb_slot].phys = base;
+	mem_map[fb_slot].size = size;
 }
 
 void enable_caches(void)

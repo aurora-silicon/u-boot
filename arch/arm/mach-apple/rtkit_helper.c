@@ -20,10 +20,13 @@
 #define REG_CPU_CTRL		0x0044
 #define  REG_CPU_CTRL_RUN	BIT(4)
 
+#define APPLE_RTKIT_EP_OSLOG 8
+
 struct rtkit_helper_priv {
 	void *asc;		/* ASC registers */
 	struct mbox_chan chan;
 	struct apple_rtkit *rtk;
+	bool sram_stolen;
 	/*
 	 * DMA window of the helper's DART ("apple,dma-range").  Buffers are
 	 * handed to the firmware by physical address (the DART is in bypass),
@@ -31,6 +34,12 @@ struct rtkit_helper_priv {
 	 */
 	u64 dma_start, dma_end;
 };
+
+static bool rtkit_helper_uses_dram(struct udevice *dev)
+{
+	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	       device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
+}
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
 {
@@ -76,7 +85,26 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 	fdt_addr_t sram;
 
 	if (!buf->is_mapped) {
-		/* Use DMA memory for AP-owned requests, including OSLog. */
+		/* Older MTP firmware retains OSLog in SRAM across OS handoff. */
+		if (buf->endpoint == APPLE_RTKIT_EP_OSLOG &&
+		    !rtkit_helper_uses_dram(dev)) {
+			if (priv->sram_stolen)
+				return -EBUSY;
+
+			sram = dev_read_addr_size_name(dev, "sram", &sram_size);
+			if (sram == FDT_ADDR_T_NONE || !buf->size ||
+			    buf->size > sram_size || sram_size > (u64)-1 - sram)
+				return -EFAULT;
+
+			buf->dva = ALIGN_DOWN(sram + sram_size - buf->size, SZ_16K);
+			if (buf->dva < sram)
+				return -EFAULT;
+
+			priv->sram_stolen = true;
+			return 0;
+		}
+
+		/* DRAM OSLog is only for the unsafe, opt-in T8140 MTP path. */
 		buf->buffer = rtkit_helper_alloc(priv, buf->size);
 		if (!buf->buffer)
 			return -ENOMEM;
@@ -103,7 +131,8 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 	struct udevice *dev = cookie;
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 
-	if (!buf->buffer)
+	/* Firmware keeps OSLog even after QUIESCED and ASC RUN is cleared. */
+	if (!buf->buffer || buf->endpoint == APPLE_RTKIT_EP_OSLOG)
 		return;
 
 	if (priv->dma_end)
@@ -139,7 +168,8 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (ret < 0)
 		return ret;
 
-	rtkit_helper_read_dma_window(dev);
+	if (rtkit_helper_uses_dram(dev))
+		rtkit_helper_read_dma_window(dev);
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);

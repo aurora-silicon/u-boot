@@ -61,7 +61,7 @@
 /* Messages for internal endpoints. */
 #define APPLE_RTKIT_BUFFER_REQUEST 1
 #define APPLE_RTKIT_BUFFER_REQUEST_SIZE GENMASK(51, 44)
-#define APPLE_RTKIT_BUFFER_REQUEST_IOVA GENMASK(41, 0)
+#define APPLE_RTKIT_BUFFER_REQUEST_IOVA GENMASK(43, 0)
 
 #define TIMEOUT_1SEC_US 1000000
 
@@ -125,6 +125,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct apple_mbox_msg *msg)
 {
 	struct apple_rtkit_buffer *buf;
+	struct apple_rtkit_buffer request = { 0 };
 	int ret;
 
 	switch (endpoint) {
@@ -147,39 +148,50 @@ static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct ap
 
 	switch (endpoint) {
 	case APPLE_RTKIT_EP_OSLOG:
-		buf->size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg->msg0);
-		buf->dva = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg->msg0 << 12);
+		request.size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg->msg0);
+		request.dva = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg->msg0) << 12;
 		break;
 	default:
-		buf->size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg->msg0) << 12;
-		buf->dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg->msg0);
+		request.size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
+					 msg->msg0) << 12;
+		request.dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
+					msg->msg0);
 		break;
 	}
+	request.is_mapped = !!request.dva;
+	request.endpoint = endpoint;
 
-	if (buf->size == 0) {
+	if (!request.size) {
 		printf("%s: unexpected request for buffer without size\n", __func__);
-		return -1;
+		return -EINVAL;
 	}
-
-	buf->dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg->msg0);
-	buf->is_mapped = !!buf->dva;
-	buf->endpoint = endpoint;
+	/* Linux retains live buffers across duplicate requests. */
+	if (buf->size) {
+		if (request.size != buf->size ||
+		    (request.dva != buf->dva &&
+		     (request.dva || buf->is_mapped)))
+			return -EBUSY;
+		goto reply;
+	}
+	if (request.is_mapped && !rtk->shmem_setup)
+		return -EINVAL;
 
 	if (rtk->shmem_setup) {
-		ret = rtk->shmem_setup(rtk->cookie, buf);
+		ret = rtk->shmem_setup(rtk->cookie, &request);
 		if (ret < 0) {
-			printf("%s: shmen_setup failed for endpoint %d\n", __func__,
-			       endpoint);
+			printf("%s: shmem_setup failed for endpoint %d (%d)\n",
+			       __func__, endpoint, ret);
 			return ret;
 		}
-	} else if (!buf->is_mapped){
-		buf->buffer = memalign(SZ_16K, ALIGN(buf->size, SZ_16K));
-		if (!buf->buffer)
+	} else {
+		request.buffer = memalign(SZ_16K, ALIGN(request.size, SZ_16K));
+		if (!request.buffer)
 			return -ENOMEM;
-
-		buf->dva = (u64)buf->buffer;
+		request.dva = (u64)request.buffer;
 	}
+	*buf = request;
 
+reply:
 	if (!buf->is_mapped) {
 		/* oslog uses different fields */
 		if (endpoint == APPLE_RTKIT_EP_OSLOG) {
@@ -194,7 +206,8 @@ static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct ap
 			msg->msg0 |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA, buf->dva);
 		}
 
-		return mbox_send(rtk->chan, msg);
+		ret = mbox_send(rtk->chan, msg);
+		return ret;
 	}
 
 	return 0;
@@ -262,6 +275,9 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 			return 0;
 		}
 	}
+	if (endpoint == APPLE_RTKIT_EP_DEBUG ||
+	    endpoint == APPLE_RTKIT_EP_TRACEKIT)
+		return 0;
 
 	if (endpoint != APPLE_RTKIT_EP_MGMT) {
 		printf("%s: unexpected endpoint %d\n", __func__, endpoint);
@@ -295,9 +311,13 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	u32 bitmap, base;
 	int i, ret;
 
-	/* Wakup the IOP. */
+	/*
+	 * Ask firmware to initialize after starting the coprocessor.  Linux uses
+	 * INIT rather than ON here; ON alone can complete the RTKit endpoint
+	 * handshake without starting the helper's application protocol.
+	 */
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
-		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_INIT);
 	msg.msg1 = APPLE_RTKIT_EP_MGMT;
 	ret = mbox_send(rtk->chan, &msg);
 	if (ret < 0)
@@ -385,19 +405,12 @@ wait_epmap:
 		goto wait_epmap;
 
 	for (i = 0; i < nendpoints; i++) {
-		/* Start only necessary endpoints. The syslog endpoint is
-		 * particularly noisy and its message can't easily be handled
-		 * within U-Boot.
+		/*
+		 * Start advertised system endpoints as Linux does. MTP waits for
+		 * them before announcing its DockChannel interfaces.
 		 */
-		switch (endpoints[i]) {
-		case APPLE_RTKIT_EP_MGMT:
-		case APPLE_RTKIT_EP_SYSLOG:
-		case APPLE_RTKIT_EP_DEBUG:
-		case APPLE_RTKIT_EP_TRACEKIT:
+		if (endpoints[i] == APPLE_RTKIT_EP_MGMT)
 			continue;
-		default:
-			break;
-		}
 
 		/* Request endpoint. */
 		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |

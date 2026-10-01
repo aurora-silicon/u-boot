@@ -172,7 +172,7 @@ static __always_inline efi_status_t gop_blt_int(struct efi_gop *this,
 		break;
 	case EFI_BLT_VIDEO_TO_BLT_BUFFER:
 	case EFI_BLT_VIDEO_TO_VIDEO:
-		swidth = gopobj->info.width;
+		swidth = gopobj->info.pixels_per_scanline;
 		if (!vid_bpp)
 			return EFI_UNSUPPORTED;
 		break;
@@ -185,7 +185,7 @@ static __always_inline efi_status_t gop_blt_int(struct efi_gop *this,
 	case EFI_BLT_BUFFER_TO_VIDEO:
 	case EFI_BLT_VIDEO_FILL:
 	case EFI_BLT_VIDEO_TO_VIDEO:
-		dwidth = gopobj->info.width;
+		dwidth = gopobj->info.pixels_per_scanline;
 		if (!vid_bpp)
 			return EFI_UNSUPPORTED;
 		break;
@@ -551,7 +551,8 @@ efi_status_t efi_gop_register(void)
 		gopobj->info.pixel_bitmask[1] = 0x07e0; /* green */
 		gopobj->info.pixel_bitmask[2] = 0x001f; /* blue */
 	}
-	gopobj->info.pixels_per_scanline = col;
+	/* The scanline may be padded beyond the visible width. */
+	gopobj->info.pixels_per_scanline = priv->line_length / VNBYTES(bpix);
 	gopobj->bpix = bpix;
 	gopobj->fb = map_sysmem(fb_base, fb_size);
 	gopobj->vdev = vdev;

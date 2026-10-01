@@ -6,6 +6,7 @@
 #define APPLE_RTKIT_PWR_STATE_SLEEP	0x01
 #define APPLE_RTKIT_PWR_STATE_QUIESCED	0x10
 #define APPLE_RTKIT_PWR_STATE_ON	0x20
+#define APPLE_RTKIT_PWR_STATE_INIT	0x220
 
 struct apple_rtkit_buffer {
 	void *buffer;
@@ -20,6 +21,8 @@ typedef int (*apple_rtkit_shmem_setup)(void *cookie,
 typedef void (*apple_rtkit_shmem_destroy)(void *cookie,
 					  struct apple_rtkit_buffer *buf);
 
+#include <dm/ofnode.h>
+
 struct apple_rtkit;
 
 struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
@@ -32,3 +35,5 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout);
 int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);
 
 int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
+
+bool apple_rtkit_helper_allowed(ofnode node);

@@ -605,6 +605,11 @@ struct nvme_dev {
 	unsigned online_queues;
 	unsigned max_qid;
 	int q_depth;
+	/*
+	 * Upper bound for the I/O queue depth.  Controller drivers may set
+	 * this before calling nvme_init(); 0 selects the conservative default.
+	 */
+	int max_q_depth;
 	u32 db_stride;
 	u32 ctrl_config;
 	struct nvme_bar __iomem *bar;
@@ -689,6 +694,17 @@ struct nvme_ops {
 	 * @cmd:   NVM Express command
 	 */
 	void (*complete_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd);
+	/**
+	 * queue_created - Controller-specific setup after queue creation
+	 *
+	 * Called once the controller has accepted the Create I/O Completion
+	 * and Submission Queue commands for an I/O queue, before any command
+	 * is submitted to it.
+	 *
+	 * @nvmeq: NVM Express queue
+	 * Return: 0 if OK, -ve on error
+	 */
+	int (*queue_created)(struct nvme_queue *nvmeq);
 };
 
 /**
@@ -697,6 +713,17 @@ struct nvme_ops {
  * Return: 0 if OK, -ve on error
  */
 int nvme_init(struct udevice *udev);
+
+/**
+ * nvme_retire_io_queues() - Delete the I/O queues, keep the controller enabled
+ *
+ * For handing a controller to a next stage that takes it over without a
+ * reset: only the admin queue is left, idle.
+ *
+ * @udev:	The NVM Express device
+ * Return: 0 if OK, -ve on error
+ */
+int nvme_retire_io_queues(struct udevice *udev);
 
 /**
  * nvme_shutdown() - Shutdown NVM Express device

@@ -5,6 +5,7 @@
 
 #include <asm/io.h>
 #include <dm.h>
+#include <dm/device_compat.h>
 #include <dm/device-internal.h>
 #include <linux/err.h>
 #include <linux/bitfield.h>
@@ -14,6 +15,7 @@
 #include <syscon.h>
 
 #define APPLE_PMGR_RESET	BIT(31)
+#define APPLE_PMGR_AUTO_ENABLE	BIT(28)
 #define APPLE_PMGR_DEV_DISABLE	BIT(10)
 #define APPLE_PMGR_WAS_CLKGATED	BIT(9)
 #define APPLE_PMGR_WAS_PWRGATED BIT(8)
@@ -25,7 +27,7 @@
 #define APPLE_PMGR_PS_ACTIVE	0xf
 #define APPLE_PMGR_PS_PWRGATE	0x0
 
-#define APPLE_PMGR_PS_SET_TIMEOUT_US	100
+#define APPLE_PMGR_PS_SET_TIMEOUT_US	10000
 
 struct apple_pmgr_priv {
 	struct regmap *regmap;
@@ -83,14 +85,39 @@ static int apple_pmgr_ps_set(struct power_domain *power_domain, u32 pstate)
 {
 	struct apple_pmgr_priv *priv = dev_get_priv(power_domain->dev);
 	uint reg;
+	int ret;
 
-	regmap_update_bits(priv->regmap, priv->offset, APPLE_PMGR_PS_TARGET,
-			   FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate));
+	ret = regmap_read(priv->regmap, priv->offset, &reg);
+	if (ret)
+		return ret;
+	/*
+	 * Match Linux's inherited-domain test.  With hardware auto-PM enabled,
+	 * an active target may currently be clock- or power-gated while still
+	 * satisfying an active consumer.  Rewriting the same target and waiting
+	 * for ACTUAL to become ACTIVE would then fight the hardware-owned state.
+	 */
+	if (pstate == APPLE_PMGR_PS_ACTIVE &&
+	    (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate ||
+	     (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) == pstate &&
+	      (reg & APPLE_PMGR_AUTO_ENABLE))))
+		return 0;
+	if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate &&
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, reg) == pstate)
+		return 0;
 
-	return regmap_read_poll_timeout(
-		priv->regmap, priv->offset, reg,
-		(FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate), 1,
-		APPLE_PMGR_PS_SET_TIMEOUT_US);
+	ret = regmap_update_bits(priv->regmap, priv->offset,
+				 APPLE_PMGR_PS_TARGET,
+				 FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate));
+	if (ret)
+		return ret;
+
+	ret = regmap_read_poll_timeout(priv->regmap, priv->offset, reg,
+				       (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate),
+				       1, APPLE_PMGR_PS_SET_TIMEOUT_US);
+	if (ret)
+		dev_err(power_domain->dev,
+			"power state %u timed out (register %#x)\n", pstate, reg);
+	return ret;
 }
 
 static int apple_pmgr_on(struct power_domain *power_domain)

@@ -5,7 +5,9 @@
 
 #include <cpu_func.h>
 #include <dm.h>
+#include <dm/device_compat.h>
 #include <iommu.h>
+#include <linux/bitfield.h>
 #include <linux/sizes.h>
 #include <lmb.h>
 #include <memalign.h>
@@ -35,7 +37,9 @@
 #define  DART_T8110_PARAMS4_NSID_MASK		(0x1ff << 0)
 #define DART_T8110_TLB_CMD		0x0080
 #define  DART_T8110_TLB_CMD_BUSY		BIT(31)
-#define  DART_T8110_TLB_CMD_FLUSH_ALL		BIT(8)
+#define  DART_T8110_TLB_CMD_OP		GENMASK(10, 8)
+#define  DART_T8110_TLB_CMD_OP_FLUSH_SID	1
+#define  DART_T8110_TLB_CMD_STREAM		GENMASK(7, 0)
 #define DART_T8110_ERROR		0x0100
 #define DART_T8110_ERROR_MASK		0x0104
 #define DART_T8110_ERROR_ADDR_LO	0x0170
@@ -103,13 +107,20 @@ static void apple_dart_t8020_flush_tlb(struct apple_dart_priv *priv)
 
 static void apple_dart_t8110_flush_tlb(struct apple_dart_priv *priv)
 {
+	int sid;
+
 	dsb();
 
-	writel(DART_T8110_TLB_CMD_FLUSH_ALL,
-	       priv->base + DART_T8110_TLB_CMD_FLUSH_ALL);
-	while (readl(priv->base + DART_T8110_TLB_CMD) &
-	       DART_T8110_TLB_CMD_BUSY)
-		continue;
+	/* OP=1 flushes one SID, not all streams. Match Linux's sequence. */
+	for (sid = 0; sid < priv->nsid; sid++) {
+		writel(FIELD_PREP(DART_T8110_TLB_CMD_OP,
+				  DART_T8110_TLB_CMD_OP_FLUSH_SID) |
+		       FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid),
+		       priv->base + DART_T8110_TLB_CMD);
+		while (readl(priv->base + DART_T8110_TLB_CMD) &
+		       DART_T8110_TLB_CMD_BUSY)
+			continue;
+	}
 }
 
 static dma_addr_t apple_dart_map(struct udevice *dev, void *addr, size_t size)
@@ -184,6 +195,17 @@ static int apple_dart_probe(struct udevice *dev)
 		return -EINVAL;
 
 	if (device_is_compatible(dev, "apple,t8110-dart")) {
+		/*
+		 * A DART the firmware locked (e.g. the display DARTs) keeps
+		 * translation tables the firmware depends on and ignores or
+		 * faults on writes to them.  Never reset one.
+		 */
+		if (readl(priv->base + DART_T8110_PROTECT) &
+		    DART_T8110_PROTECT_TTBR_TCR) {
+			dev_err(dev, "DART is locked by firmware\n");
+			return -EPERM;
+		}
+
 		params4 = readl(priv->base + DART_T8110_PARAMS4);
 		priv->nsid = params4 & DART_T8110_PARAMS4_NSID_MASK;
 		priv->nttbr = 1;
@@ -275,7 +297,7 @@ static int apple_dart_probe(struct udevice *dev)
 	priv->flush_tlb(priv);
 
 	/* Enable all streams. */
-	for (i = 0; i < priv->nsid / 32; i++)
+	for (i = 0; i < DIV_ROUND_UP(priv->nsid, 32); i++)
 		writel(~0, priv->base + DART_SID_ENABLE(priv, i));
 
 	/* Enable translations. */

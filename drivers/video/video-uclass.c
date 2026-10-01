@@ -345,9 +345,16 @@ u32 video_index_to_colour(struct video_priv *priv, enum colour_idx idx)
 		break;
 	case VIDEO_BPP32:
 		if (CONFIG_IS_ENABLED(VIDEO_BPP32)) {
+			/*
+			 * The X bits are don't-care for a true XRGB scanout,
+			 * but some display engines (e.g. the Apple A18 Pro's
+			 * DCP) blend them as alpha.  Write them as ones so
+			 * the console stays opaque either way.
+			 */
 			switch (priv->format) {
 			case VIDEO_X2R10G10B10:
-				return (colours[idx].r << 22) |
+				return (0x3U << 30) |
+				       (colours[idx].r << 22) |
 				       (colours[idx].g << 12) |
 				       (colours[idx].b <<  2);
 			case VIDEO_RGBA8888:
@@ -355,7 +362,8 @@ u32 video_index_to_colour(struct video_priv *priv, enum colour_idx idx)
 				       (colours[idx].g << 16) |
 				       (colours[idx].b << 8) | 0xff;
 			default:
-				return (colours[idx].r << 16) |
+				return (0xffU << 24) |
+				       (colours[idx].r << 16) |
 				       (colours[idx].g <<  8) |
 				       (colours[idx].b <<  0);
 			}

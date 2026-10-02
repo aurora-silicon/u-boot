@@ -13,6 +13,7 @@ obj-$(CONFIG_PL01X_SERIAL) += serial_pl01x.o
 obj-$(CONFIG_$(PHASE_)SYS_NS16550_SERIAL) += serial_ns16550.o
 
 obj-$(CONFIG_ALTERA_UART) += altera_uart.o
+obj-$(CONFIG_APPLE_DOCKCHANNEL_SERIAL) += serial_apple_dockchannel.o
 obj-$(CONFIG_ALTERA_JTAG_UART) += altera_jtag_uart.o
 obj-$(CONFIG_AR933X_UART) += serial_ar933x.o
 obj-$(CONFIG_ARM_DCC) += arm_dcc.o

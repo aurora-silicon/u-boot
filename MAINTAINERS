@@ -138,6 +138,7 @@ S:	Maintained
 F:	arch/arm/include/asm/arch-apple/
 F:	arch/arm/mach-apple/
 F:	board/apple/
+F:	configs/apple_j873_defconfig
 F:	configs/apple_m1_defconfig
 F:	doc/board/apple/
 F:	drivers/input/apple_spi_kbd.c
@@ -148,6 +149,7 @@ F:	drivers/pci/pcie_apple.c
 F:	drivers/phy/phy-apple-atc.c
 F:	drivers/pinctrl/pinctrl-apple.c
 F:	drivers/power/domain/apple-pmgr.c
+F:	drivers/serial/serial_apple_dockchannel.c
 F:	drivers/spi/apple_spi.c
 F:	drivers/usb/host/xhci-pci-asmedia.c
 F:	drivers/watchdog/apple_wdt.c

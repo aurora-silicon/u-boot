@@ -752,6 +752,29 @@ static struct mm_region t8122_mem_map[] = {
 	}
 };
 
+/* T8152: only DockChannel is qualified for initial RAM boot. */
+static struct mm_region t8152_mem_map[] = {
+	{
+		.virt = 0x308000000,
+		.phys = 0x308000000,
+		.size = SZ_2M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* Replaced by the first FDT memory bank before enabling caches. */
+		.virt = 0x10000000000,
+		.phys = 0x10000000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE
+	}, {
+		/* Inherited framebuffer, populated from the FDT. */
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		0,
+	}
+};
+
 struct mm_region *mem_map;
 
 int board_init(void)
@@ -801,6 +824,9 @@ void build_mem_map(void)
 		mem_map = t6022_mem_map;
 	else if (of_machine_is_compatible("apple,t8122"))
 		mem_map = t8122_mem_map;
+	else if (of_machine_is_compatible("apple,t8152") &&
+		 of_machine_is_compatible("apple,j873g"))
+		mem_map = t8152_mem_map;
 	else
 		panic("Unsupported SoC\n");
 
@@ -863,6 +889,10 @@ static char *asahi_esp_devpart(void)
 	ofnode node;
 
 	if (devpart[0])
+		return devpart;
+
+	/* Initial T8152 boot is RAM-only; do not probe its unported ANS. */
+	if (of_machine_is_compatible("apple,t8152"))
 		return devpart;
 
 	node = ofnode_path("/chosen");

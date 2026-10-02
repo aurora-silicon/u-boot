@@ -27,6 +27,30 @@ On these SoCs the following hardware is supported:
 Device trees are provided in dts/upstream/src/arm64/apple/ and available
 for all M1 and M2 (t8103, t8112, t600x and t602x) devices.
 
+Initial M5 J813 native boot
+--------------------------
+
+The M5 MacBook Air (J813, T8142) additionally supports RAM-loaded native
+Linux boot with the firmware framebuffer and DockChannel console. Its
+memory map covers the ADT-measured I/O aperture from ``0x210000000`` to
+``0x600000000``. m1n1 supplies the usable RAM bank and framebuffer mapping
+through the FDT; DRAM starts at ``0x10000000000``.
+
+Use ``apple_m1_defconfig`` and ``u-boot-nodtb.bin`` with the J813 DTB from
+the companion Linux support. m1n1 must fill that DTB before entering U-Boot.
+The DT's named DockChannel ``data`` window provides the serial console.
+m1n1's string-valued ``/config/bootdelay`` is accepted alongside the existing
+integer form, allowing an unattended RAM ``booti`` command.
+
+Validate using a RAM-only initramfs and ``maxcpus=1``. Record source commits,
+binary hashes, payload readbacks and the serial boot log. At the Linux shell,
+verify the kernel/config identity, CPU0, framebuffer registration, advancing
+uptime and architectural timer interrupts over ``sleep 5``, and RAM-only
+mounts. Repeat from a fresh firmware boot and retain both captures.
+This initial J813 path does not qualify storage, USB host devices, input,
+networking, native GPU/display drivers or SMP. The existing M1/M2 hardware
+support list above does not apply to J813.
+
 Building U-Boot
 ---------------
 

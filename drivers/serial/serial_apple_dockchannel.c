@@ -35,7 +35,7 @@ static int apple_dc_serial_putc(struct udevice *dev, const char ch)
 		if (plat->tx_stalled)
 			return -ETIMEDOUT;
 		if (readl_poll_timeout(plat->base + APPLE_DC_DATA_TX_FREE,
-				      space, space, APPLE_DC_TX_TIMEOUT_US)) {
+				       space, space, APPLE_DC_TX_TIMEOUT_US)) {
 			plat->tx_stalled = true;
 			return -ETIMEDOUT;
 		}

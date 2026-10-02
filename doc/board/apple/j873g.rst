@@ -24,6 +24,20 @@ The generic Apple board code still links the USB and NVMe drivers. Leave these
 devices absent or disabled in the handoff FDT; their presence in the binary is
 not a claim of T8152 support.
 
+USB-C display handoff
+--------------------
+
+m1n1 must establish the USB-C DisplayPort link before entering U-Boot. The
+J873 configuration enables the simple framebuffer, video console and
+``NO_FB_CLEAR``; U-Boot inherits the active scanout rather than initializing
+the M6 display PHY. Keep the DCP session and its live allocations reserved.
+
+Describe ``/chosen/framebuffer`` using m1n1's updated ``cur_boot_args`` after
+the modeset. The original firmware boot arguments may still describe its
+dummy framebuffer. Supply the current base, width, height, stride and size,
+and use ``x8r8g8b8`` for the M6 32-bit BGRA surface. Preserve serial output
+alongside ``vidconsole`` so the handoff can be diagnosed if the display fails.
+
 End-to-end qualification
 ------------------------
 

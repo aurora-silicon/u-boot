@@ -1,0 +1,68 @@
+.. SPDX-License-Identifier: GPL-2.0+
+
+Apple M6 Mac mini (J873g)
+=======================
+
+The initial T8152 port boots from RAM using the firmware-selected DockChannel
+UART. Build with ``make apple_j873_defconfig`` followed by ``make`` using an
+AArch64 GNU toolchain. Supply an external FDT from m1n1; the built-in M1 DT does
+not describe this board. The root must include ``apple,j873g`` and ``apple,t8152``.
+Use ``u-boot-nodtb.bin`` for RAM handoff.
+
+The FDT must describe one contiguous usable RAM bank, reserve the resident loader
+and all live allocations, and supply the inherited simple framebuffer if used.
+The UART uses ``apple,dockchannel-uart`` with named ``config`` and ``data``
+register ranges and ``bootph-all``. The measured console windows are
+``0x308128000`` and ``0x30812c000`` (each 16 KiB). Set ``/chosen/stdout-path`` to
+that node. Only the DockChannel I/O aperture is initially mapped.
+
+Storage, USB, networking, keyboard, SMP and EFI operating-system boot remain
+unqualified. Automatic boot and persistent EFI variable storage are disabled.
+Preserve the installed recovery loader.
+
+The generic Apple board code still links the USB and NVMe drivers. Leave these
+devices absent or disabled in the handoff FDT; their presence in the binary is
+not a claim of T8152 support.
+
+USB-C display handoff
+--------------------
+
+m1n1 must establish the USB-C DisplayPort link before entering U-Boot. The
+J873 configuration enables the simple framebuffer, video console and
+``NO_FB_CLEAR``; U-Boot inherits the active scanout rather than initializing
+the M6 display PHY. Keep the DCP session and its live allocations reserved.
+
+Describe ``/chosen/framebuffer`` using m1n1's updated ``cur_boot_args`` after
+the modeset. The original firmware boot arguments may still describe its
+dummy framebuffer. Supply the current base, width, height, stride and size,
+and use ``x8r8g8b8`` for the M6 32-bit BGRA surface. Preserve serial output
+alongside ``vidconsole`` so the handoff can be diagnosed if the display fails.
+
+Stage Linux outside the RAM reserved for the loader and display session. A
+kernel inside a ``NOOVERWRITE`` reservation is rejected by ``booti``. Leave
+``fdt_high`` and ``initrd_high`` unset so U-Boot can relocate those payloads
+into available RAM while preserving the firmware allocations.
+
+End-to-end qualification
+------------------------
+
+Failure cases to check include a mismatched board, incorrect UART window,
+missing RAM or framebuffer mappings, relocation into a live loader allocation,
+lost console characters and broken return from an EFI payload. A compile alone
+does not rule these out.
+
+From a fresh single-CPU m1n1 session on chip ``0x8152``, board ``0x24``, target
+``J873g`` / model ``Mac18,5``, hash the candidate, upload to reserved RAM, and
+verify complete readback. Enter with caches/MMU off and the FDT in x0. Capture
+the banner and prompt, then run ``version``, ``bdinfo``, ``printenv`` and
+``echo J873_UBOOT_E2E_PASS``. Save the source commit, binary/FDT hashes, console
+log and result receipt. Verify the RAM map and command responses after relocation;
+the marker alone is insufficient.
+
+A physical J873g run used public m1n1 to train four USB-C DisplayPort lanes
+and initialize 1280x720x32 scanout. U-Boot reported the active framebuffer
+and ``stdout=vidconsole,serial``, then booted Aurora WIP Linux with ``booti``.
+Linux registered ``simplefb`` and passed the 12-CPU and bounded frequency
+workloads. This qualifies the RAM boot path; EFI and persistent boot remain
+unqualified. The operator confirmed the Linux console and test banner were
+visible on the USB-C monitor.

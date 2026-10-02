@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <serial.h>
 #include <asm/io.h>
+#include <linux/iopoll.h>
 
 #define APPLE_DC_CHANNEL_STRIDE	0x10000
 
@@ -17,19 +18,30 @@
 #define APPLE_DC_DATA_TX_FREE	0x14
 #define APPLE_DC_DATA_RX8	0x1c
 #define APPLE_DC_DATA_RX_COUNT	0x2c
+#define APPLE_DC_TX_TIMEOUT_US	100000
 
 struct apple_dc_serial_plat {
 	void __iomem *base;
+	bool tx_stalled;
 };
 
 static int apple_dc_serial_putc(struct udevice *dev, const char ch)
 {
 	struct apple_dc_serial_plat *plat = dev_get_plat(dev);
+	u32 space;
 
-	/* A disconnected Type-C serial peer must never stall the boot path. */
-	if (!readl(plat->base + APPLE_DC_DATA_TX_FREE))
-		return 0;
+	/* Allow FIFO backpressure, but bound the wait for a disconnected peer. */
+	if (!readl(plat->base + APPLE_DC_DATA_TX_FREE)) {
+		if (plat->tx_stalled)
+			return -ETIMEDOUT;
+		if (readl_poll_timeout(plat->base + APPLE_DC_DATA_TX_FREE,
+				      space, space, APPLE_DC_TX_TIMEOUT_US)) {
+			plat->tx_stalled = true;
+			return -ETIMEDOUT;
+		}
+	}
 
+	plat->tx_stalled = false;
 	writel(ch, plat->base + APPLE_DC_DATA_TX8);
 	return 0;
 }
@@ -51,7 +63,7 @@ static int apple_dc_serial_pending(struct udevice *dev, bool input)
 	if (input)
 		return readl(plat->base + APPLE_DC_DATA_RX_COUNT);
 
-	/* Writes are best-effort, so there is no software queue to drain. */
+	/* Writes are synchronous, so there is no software queue to drain. */
 	return 0;
 }
 

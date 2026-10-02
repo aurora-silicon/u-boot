@@ -64,5 +64,5 @@ and initialize 1280x720x32 scanout. U-Boot reported the active framebuffer
 and ``stdout=vidconsole,serial``, then booted Aurora WIP Linux with ``booti``.
 Linux registered ``simplefb`` and passed the 12-CPU and bounded frequency
 workloads. This qualifies the RAM boot path; EFI and persistent boot remain
-unqualified. The console evidence does not replace checking the monitor's
-visible output.
+unqualified. The operator confirmed the Linux console and test banner were
+visible on the USB-C monitor.

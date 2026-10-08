@@ -774,6 +774,38 @@ static int nvme_blk_probe(struct udevice *udev)
 	return 0;
 }
 
+/**
+ * nvme_blk_flush() - commit a namespace's cached writes to media
+ *
+ * A controller with a volatile write cache may complete a write before
+ * its data is on media, and keeps it there until a Flush command or a
+ * normal shutdown.  Without one, writes are on media when they complete.
+ *
+ * @udev:	The namespace's block device
+ * Return: 0 if OK, -ve on error
+ */
+static int nvme_blk_flush(struct udevice *udev)
+{
+	struct nvme_ns *ns = dev_get_priv(udev);
+	struct nvme_dev *dev = ns->dev;
+	struct nvme_command c;
+	int ret;
+
+	if (!(dev->vwc & NVME_CTRL_VWC_PRESENT))
+		return 0;
+
+	memset(&c, 0, sizeof(c));
+	c.common.opcode = nvme_cmd_flush;
+	c.common.nsid = cpu_to_le32(ns->ns_id);
+
+	ret = nvme_submit_sync_cmd(dev->queues[NVME_IO_Q], &c, NULL,
+				   IO_TIMEOUT);
+	if (ret)
+		printf("Error: %s: Flush failed!\n", udev->name);
+
+	return ret;
+}
+
 static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 			 lbaint_t blkcnt, void *buffer, bool read)
 {
@@ -831,6 +863,14 @@ static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 	if (read)
 		invalidate_dcache_range((unsigned long)buffer,
 					(unsigned long)buffer + total_len);
+
+	/*
+	 * The block layer has no flush operation and a reset does not
+	 * remove devices first, so a write must be on media before it is
+	 * reported done.  Writes are rare here; flush after each one.
+	 */
+	if (!read && temp_len != total_len && nvme_blk_flush(udev))
+		return 0;
 
 	return (total_len - temp_len) >> desc->log2blksz;
 }

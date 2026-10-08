@@ -464,6 +464,12 @@ static int apple_nvme_remove(struct udevice *dev)
 		 * controller with live I/O queues, and clear their addresses.
 		 * Shutting the firmware down instead would leave the machine
 		 * without storage until the next reset.
+		 *
+		 * Without a shutdown nothing commits the controller's volatile
+		 * write cache, but every write was flushed before it completed
+		 * (see nvme_blk_rw()), so the cache holds nothing of ours.  Do
+		 * not flush here: on the A18 Pro a Flush to one of Apple's small
+		 * system namespaces (2 to 4) is fatal to the firmware.
 		 */
 		if (nvme_retire_io_queues(dev))
 			printf("%s: could not delete the I/O queues\n", dev->name);

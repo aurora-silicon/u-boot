@@ -178,16 +178,69 @@ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
 	nvmeq->sq_tail = tail;
 }
 
+/**
+ * nvme_reap_timed_out() - wait for a command that timed out to complete
+ *
+ * A command that timed out keeps its submission queue slot, and on some
+ * controllers per-slot state, until the controller completes it.  Its
+ * completion would also be taken for that of the next command.  Consume
+ * it before the queue is used again or handed over.
+ *
+ * @nvmeq:	The queue
+ * @timeout:	How long to wait, in the units of nvme_submit_sync_cmd()
+ * Return: 0 if no command is outstanding, -ETIMEDOUT if one still is
+ */
+static int nvme_reap_timed_out(struct nvme_queue *nvmeq, unsigned int timeout)
+{
+	struct nvme_ops *ops;
+	u16 head = nvmeq->cq_head;
+	ulong start_time = timer_get_us();
+	ulong timeout_us = timeout * 100000;
+
+	if (!nvmeq->timed_out)
+		return 0;
+
+	while ((nvme_read_completion_status(nvmeq, head) & 0x01) !=
+	       nvmeq->cq_phase) {
+		if (timeout_us > 0 &&
+		    (timer_get_us() - start_time) >= timeout_us)
+			return -ETIMEDOUT;
+	}
+
+	ops = (struct nvme_ops *)nvmeq->dev->udev->driver->ops;
+	if (ops && ops->complete_cmd)
+		ops->complete_cmd(nvmeq, NULL);
+
+	if (++head == nvmeq->q_depth) {
+		head = 0;
+		nvmeq->cq_phase = !nvmeq->cq_phase;
+	}
+	writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
+	nvmeq->cq_head = head;
+	nvmeq->timed_out = false;
+
+	return 0;
+}
+
 static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 				struct nvme_command *cmd,
 				u32 *result, unsigned timeout)
 {
 	struct nvme_ops *ops;
-	u16 head = nvmeq->cq_head;
-	u16 phase = nvmeq->cq_phase;
+	u16 head;
+	u16 phase;
 	u16 status;
 	ulong start_time;
 	ulong timeout_us = timeout * 100000;
+
+	/* Never submit over a command that is still outstanding. */
+	if (nvme_reap_timed_out(nvmeq, timeout)) {
+		printf("Error: nvme: queue %d still has a command outstanding\n",
+		       nvmeq->qid);
+		return -EIO;
+	}
+	head = nvmeq->cq_head;
+	phase = nvmeq->cq_phase;
 
 	cmd->common.command_id = nvme_get_cmd_id();
 	nvme_submit_cmd(nvmeq, cmd);
@@ -201,6 +254,7 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 		if (timeout_us > 0 && (timer_get_us() - start_time)
 		    >= timeout_us) {
 			pr_warn("nvme: cmd %#x timed out\n", cmd->common.command_id);
+			nvmeq->timed_out = true;
 			return -ETIMEDOUT;
 		}
 	}
@@ -774,6 +828,38 @@ static int nvme_blk_probe(struct udevice *udev)
 	return 0;
 }
 
+/**
+ * nvme_blk_flush() - commit a namespace's cached writes to media
+ *
+ * A controller with a volatile write cache may complete a write before
+ * its data is on media, and keeps it there until a Flush command or a
+ * normal shutdown.  Without one, writes are on media when they complete.
+ *
+ * @udev:	The namespace's block device
+ * Return: 0 if OK, -ve on error
+ */
+static int nvme_blk_flush(struct udevice *udev)
+{
+	struct nvme_ns *ns = dev_get_priv(udev);
+	struct nvme_dev *dev = ns->dev;
+	struct nvme_command c;
+	int ret;
+
+	if (!(dev->vwc & NVME_CTRL_VWC_PRESENT))
+		return 0;
+
+	memset(&c, 0, sizeof(c));
+	c.common.opcode = nvme_cmd_flush;
+	c.common.nsid = cpu_to_le32(ns->ns_id);
+
+	ret = nvme_submit_sync_cmd(dev->queues[NVME_IO_Q], &c, NULL,
+				   IO_TIMEOUT);
+	if (ret)
+		printf("Error: %s: Flush failed!\n", udev->name);
+
+	return ret;
+}
+
 static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 			 lbaint_t blkcnt, void *buffer, bool read)
 {
@@ -831,6 +917,14 @@ static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 	if (read)
 		invalidate_dcache_range((unsigned long)buffer,
 					(unsigned long)buffer + total_len);
+
+	/*
+	 * The block layer has no flush operation and a reset does not
+	 * remove devices first, so a write must be on media before it is
+	 * reported done.  Writes are rare here; flush after each one.
+	 */
+	if (!read && temp_len != total_len && nvme_blk_flush(udev))
+		return 0;
 
 	return (total_len - temp_len) >> desc->log2blksz;
 }
@@ -977,6 +1071,16 @@ int nvme_retire_io_queues(struct udevice *udev)
 	for (qid = ndev->queue_count - 1; qid > NVME_ADMIN_Q; qid--) {
 		if (!ndev->queues[qid])
 			continue;
+		/*
+		 * The next owner must not inherit a command in flight.  Wait a
+		 * bounded time for one that timed out, then delete the queue
+		 * anyway.
+		 */
+		if (nvme_reap_timed_out(ndev->queues[qid], IO_TIMEOUT)) {
+			printf("Error: %s: I/O queue %d still has a command outstanding\n",
+			       udev->name, qid);
+			ret = -EIO;
+		}
 		ret |= nvme_delete_sq(ndev, qid);
 		ret |= nvme_delete_cq(ndev, qid);
 	}

@@ -652,6 +652,8 @@ struct nvme_queue {
 	u16 qid;
 	u8 cq_phase;
 	u8 cqe_seen;
+	/* A command timed out and the controller has not completed it yet. */
+	bool timed_out;
 	unsigned long cmdid_data[];
 };
 
@@ -691,7 +693,8 @@ struct nvme_ops {
 	 * complete_cmd - Controller-specific NVM Express command completion
 	 *
 	 * @nvmeq: NVM Express queue
-	 * @cmd:   NVM Express command
+	 * @cmd:   NVM Express command, or NULL when completing a command
+	 *         that had timed out
 	 */
 	void (*complete_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd);
 	/**
@@ -718,7 +721,8 @@ int nvme_init(struct udevice *udev);
  * nvme_retire_io_queues() - Delete the I/O queues, keep the controller enabled
  *
  * For handing a controller to a next stage that takes it over without a
- * reset: only the admin queue is left, idle.
+ * reset: only the admin queue is left, idle.  A command that timed out is
+ * waited for first, for a bounded time.
  *
  * @udev:	The NVM Express device
  * Return: 0 if OK, -ve on error

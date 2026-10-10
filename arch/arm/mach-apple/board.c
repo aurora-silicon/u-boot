@@ -769,6 +769,52 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 	}
 };
 
+/* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
+ * RAM and framebuffer entries are populated from the m1n1-patched FDT.
+ */
+static struct mm_region t8142_mem_map[] = {
+	{
+		.virt = 0x210000000,
+		.phys = 0x210000000,
+		.size = 0x3f0000000,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		.virt = 0x10000000000,
+		.phys = 0x10000000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE
+	}, {
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		0,
+	}
+};
+
+/* T8152: only DockChannel is qualified for initial RAM boot. */
+static struct mm_region t8152_mem_map[] = {
+	{
+		.virt = 0x308000000,
+		.phys = 0x308000000,
+		.size = SZ_2M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* Replaced by the first FDT memory bank before enabling caches. */
+		.virt = 0x10000000000,
+		.phys = 0x10000000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE
+	}, {
+		/* Inherited framebuffer, populated from the FDT. */
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		0,
+	}
+};
+
 struct mm_region *mem_map;
 
 int board_init(void)
@@ -835,6 +881,11 @@ void build_mem_map(void)
 		mem_map = t8122_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
+	else if (of_machine_is_compatible("apple,t8142"))
+		mem_map = t8142_mem_map;
+	else if (of_machine_is_compatible("apple,t8152") &&
+		 of_machine_is_compatible("apple,j873g"))
+		mem_map = t8152_mem_map;
 	else
 		panic("Unsupported SoC\n");
 
@@ -914,6 +965,10 @@ static char *asahi_esp_devpart(void)
 	ofnode node;
 
 	if (devpart[0])
+		return devpart;
+
+	/* Initial T8152 boot is RAM-only; do not probe its unported ANS. */
+	if (of_machine_is_compatible("apple,t8152"))
 		return devpart;
 
 	node = ofnode_path("/chosen");

@@ -389,6 +389,14 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	u32 rx_irq;
 	fdt_addr_t reg;
 
+	/*
+	 * J813's MTP firmware cold-boots correctly, but restarting it after
+	 * U-Boot's RTKit shutdown crashes while restoring its logging state.
+	 * Leave the helper and its FIFOs untouched so Linux owns the first boot.
+	 */
+	if (of_machine_is_compatible("apple,j813"))
+		return -ENODEV;
+
 	reg = dev_read_addr_name(dev, "data");
 	if (reg == FDT_ADDR_T_NONE) {
 		dev_err(dev, "no reg property for local FIFO data registers\n");

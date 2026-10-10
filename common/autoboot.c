@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fdtdec.h>
 #include <hash.h>
+#include <limits.h>
 #include <log.h>
 #include <malloc.h>
 #include <memalign.h>
@@ -466,6 +467,20 @@ const char *bootdelay_process(void)
 	 */
 	if (IS_ENABLED(CONFIG_OF_CONTROL))
 		bootdelay = ofnode_conf_read_int("bootdelay", bootdelay);
+	if (IS_ENABLED(CONFIG_OF_CONTROL)) {
+		const char *fdt_bootdelay = ofnode_conf_read_str("bootdelay");
+		char *end;
+		long long delay;
+
+		/* Integer properties can also look like empty or binary strings. */
+		if (fdt_bootdelay && *fdt_bootdelay &&
+		    strlen(fdt_bootdelay) <= 11) {
+			delay = simple_strtoll(fdt_bootdelay, &end, 10);
+			if (end > fdt_bootdelay + (*fdt_bootdelay == '-') &&
+			    !*end && delay >= INT_MIN && delay <= INT_MAX)
+				bootdelay = delay;
+		}
+	}
 
 	debug("### main_loop entered: bootdelay=%d\n\n", bootdelay);
 

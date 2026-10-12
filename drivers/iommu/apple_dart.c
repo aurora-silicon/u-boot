@@ -12,6 +12,7 @@
 #include <lmb.h>
 #include <memalign.h>
 #include <asm/io.h>
+#include <asm/arch/dart.h>
 
 #define DART_PARAMS2		0x0004
 #define  DART_PARAMS2_BYPASS_SUPPORT	BIT(0)
@@ -77,6 +78,8 @@ struct apple_dart_priv {
 	void *base;
 	u64 *l1, *l2;
 	int bypass, shift;
+	/* Leave bypass in place at removal: a coprocessor still uses it. */
+	bool retain_bypass;
 
 	struct lmb io_lmb;
 
@@ -314,6 +317,12 @@ static int apple_dart_remove(struct udevice *dev)
 	struct apple_dart_priv *priv = dev_get_priv(dev);
 	int sid, i;
 
+	/* Bypass leaves no tables behind that would outlive U-Boot. */
+	if (priv->retain_bypass) {
+		io_lmb_teardown(&priv->io_lmb);
+		return 0;
+	}
+
 	/* Disable translations. */
 	for (sid = 0; sid < priv->nsid; sid++)
 		writel(0, priv->base + DART_TCR(priv, sid));
@@ -328,6 +337,28 @@ static int apple_dart_remove(struct udevice *dev)
 	io_lmb_teardown(&priv->io_lmb);
 
 	return 0;
+}
+
+int apple_dart_retain_bypass(struct udevice *dev)
+{
+	struct apple_dart_priv *priv;
+
+	if (!dev || dev->driver != DM_DRIVER_GET(apple_dart) ||
+	    !device_active(dev))
+		return -ENODEV;
+
+	priv = dev_get_priv(dev);
+	if (!priv->bypass)
+		return -EINVAL;
+
+	priv->retain_bypass = true;
+	return 0;
+}
+
+void apple_dart_release_bypass(struct udevice *dev)
+{
+	if (dev && dev->driver == DM_DRIVER_GET(apple_dart) && device_active(dev))
+		((struct apple_dart_priv *)dev_get_priv(dev))->retain_bypass = false;
 }
 
 static const struct udevice_id apple_dart_ids[] = {

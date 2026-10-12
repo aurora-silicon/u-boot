@@ -24,6 +24,7 @@ typedef void (*apple_rtkit_shmem_destroy)(void *cookie,
 #include <dm/ofnode.h>
 
 struct apple_rtkit;
+struct mbox_chan;
 
 struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
 				     apple_rtkit_shmem_setup shmem_setup,
@@ -37,3 +38,5 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);
 int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
 
 bool apple_rtkit_helper_allowed(ofnode node);
+/* Describe a helper the OS must adopt while it runs (OS device tree fixup). */
+int apple_rtkit_helper_fdt_fixup(void *blob);

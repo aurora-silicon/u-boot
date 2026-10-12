@@ -18,6 +18,7 @@
 #include <asm/global_data.h>
 #include <asm/io.h>
 #include <asm/system.h>
+#include <asm/arch/rtkit.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -1275,6 +1276,10 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	struct udevice *dev;
 	const char *stdoutname;
 	int node, ret;
+
+	/* Coprocessors handed over running must be described in every case. */
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
+		apple_rtkit_helper_fdt_fixup(blob);
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

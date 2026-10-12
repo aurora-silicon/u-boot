@@ -10,8 +10,10 @@
 #include <mailbox.h>
 #include <mapmem.h>
 #include <reset.h>
+#include <linux/libfdt.h>
 
 #include <asm/io.h>
+#include <asm/arch/dart.h>
 #include <asm/arch/rtkit.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
@@ -21,6 +23,18 @@
 #define  REG_CPU_CTRL_RUN	BIT(4)
 
 #define APPLE_RTKIT_EP_OSLOG 8
+
+/*
+ * Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs:
+ * T8140 MTP firmware cannot be restarted after QUIESCED or SLEEP.
+ */
+#define RTKIT_HELPER_HANDOFF	"mtp-live-v1"
+#define RTKIT_HELPER_MAX_BUFS	8
+
+struct rtkit_helper_buf {
+	u64 dva;
+	size_t size;
+};
 
 struct rtkit_helper_priv {
 	void *asc;		/* ASC registers */
@@ -33,6 +47,14 @@ struct rtkit_helper_priv {
 	 * so they must lie inside the window the coprocessor can address.
 	 */
 	u64 dma_start, dma_end;
+	/* The helper's DART and stream, for a live OS handoff. */
+	struct udevice *dart;
+	u32 dart_sid;
+	/* DRAM buffers the running firmware holds. */
+	struct rtkit_helper_buf bufs[RTKIT_HELPER_MAX_BUFS];
+	int nbufs;
+	/* The OS device tree describes the running session; see remove(). */
+	bool handoff_published;
 };
 
 static bool rtkit_helper_uses_dram(struct udevice *dev)
@@ -56,6 +78,11 @@ static void rtkit_helper_read_dma_window(struct udevice *dev)
 
 	priv->dma_start = range[0];
 	priv->dma_end = range[0] + range[1];
+
+	/* A live handoff additionally needs the DART left in bypass. */
+	if (args.args_count == 1 &&
+	    !uclass_get_device_by_ofnode(UCLASS_IOMMU, args.node, &priv->dart))
+		priv->dart_sid = args.args[0];
 }
 
 static void *rtkit_helper_alloc(struct rtkit_helper_priv *priv, size_t size)
@@ -113,6 +140,13 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 		flush_dcache_range((ulong)buf->buffer,
 				   (ulong)buf->buffer + ALIGN(buf->size, SZ_16K));
 		buf->dva = map_to_sysmem(buf->buffer);
+
+		/* An untracked buffer rules out a live handoff. */
+		if (priv->nbufs < RTKIT_HELPER_MAX_BUFS) {
+			priv->bufs[priv->nbufs].dva = buf->dva;
+			priv->bufs[priv->nbufs].size = ALIGN(buf->size, SZ_16K);
+		}
+		priv->nbufs++;
 		return 0;
 	}
 
@@ -133,6 +167,10 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 
 	/* Firmware keeps OSLog even after QUIESCED and ASC RUN is cleared. */
 	if (!buf->buffer || buf->endpoint == APPLE_RTKIT_EP_OSLOG)
+		return;
+
+	/* A live session keeps every buffer; the OS reserves them. */
+	if (priv->handoff_published)
 		return;
 
 	if (priv->dma_end)
@@ -206,6 +244,18 @@ static int rtkit_helper_remove(struct udevice *dev)
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
 
+	/*
+	 * The OS was told to adopt this session: leave the coprocessor running
+	 * with its buffers and its DART in bypass.  Only the U-Boot side of the
+	 * transport is torn down.
+	 */
+	if (priv->handoff_published && !apple_dart_retain_bypass(priv->dart)) {
+		printf("%s: leaving RTKit running for the OS\n", dev->name);
+		apple_rtkit_free(priv->rtk);
+		priv->rtk = NULL;
+		return 0;
+	}
+
 	apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_QUIESCED);
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
@@ -222,6 +272,133 @@ int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout)
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 
 	return apple_rtkit_poll(priv->rtk, timeout);
+}
+
+/* Node offsets move as the blob grows, so always look them up by path. */
+static int rtkit_helper_fdt_node(void *blob, struct udevice *dev)
+{
+	char path[256];
+	int ret;
+
+	ret = ofnode_get_path(dev_ofnode(dev), path, sizeof(path));
+	if (ret)
+		return ret;
+	return fdt_path_offset(blob, path);
+}
+
+/*
+ * Describe the running session to the OS: one no-map reservation per
+ * buffer, identity-mapped for the helper through its DART, the stream the
+ * DART must keep in bypass until the OS maps those regions, and finally the
+ * handoff contract itself.
+ */
+static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+	int resv, node, sub, parent, i, ret;
+	char name[48];
+	u32 phandle, rphandle;
+	fdt64_t reg[2];
+
+	if (!priv->rtk || !priv->dart || !priv->nbufs ||
+	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
+		return -ENODEV;
+	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
+		return -ENODEV;
+	ret = apple_dart_retain_bypass(priv->dart);
+	if (ret)
+		return ret;
+
+	resv = fdt_path_offset(blob, "/reserved-memory");
+	node = rtkit_helper_fdt_node(blob, dev);
+	if (resv < 0 || node < 0)
+		return -ENOENT;
+	parent = fdt_parent_offset(blob, node);
+	if (fdt_address_cells(blob, resv) != 2 || fdt_size_cells(blob, resv) != 2 ||
+	    fdt_address_cells(blob, parent) != 2 || fdt_size_cells(blob, parent) != 2)
+		return -EINVAL;
+
+	phandle = fdt_get_phandle(blob, node);
+	if (!phandle) {
+		ret = fdt_generate_phandle(blob, &phandle);
+		if (!ret)
+			ret = fdt_setprop_u32(blob, node, "phandle", phandle);
+		if (ret)
+			return -ENOSPC;
+	}
+
+	for (i = 0; i < priv->nbufs; i++) {
+		struct rtkit_helper_buf *b = &priv->bufs[i];
+
+		snprintf(name, sizeof(name), "mtp-rtkit@%llx", b->dva);
+		resv = fdt_path_offset(blob, "/reserved-memory");
+		sub = fdt_add_subnode(blob, resv, name);
+		if (sub < 0)
+			return -ENOSPC;
+
+		reg[0] = cpu_to_fdt64(b->dva);
+		reg[1] = cpu_to_fdt64(b->size);
+		ret = fdt_generate_phandle(blob, &rphandle);
+		ret = ret ?: fdt_setprop_u32(blob, sub, "phandle", rphandle);
+		ret = ret ?: fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
+		ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
+		/* The DART passed these addresses through unchanged: IOVA == PA. */
+		ret = ret ?: fdt_setprop_u32(blob, sub, "iommu-addresses", phandle);
+		ret = ret ?: fdt_appendprop(blob, sub, "iommu-addresses", reg,
+					    sizeof(reg));
+		if (ret)
+			return -ENOSPC;
+
+		node = rtkit_helper_fdt_node(blob, dev);
+		if (node < 0 ||
+		    fdt_appendprop_u32(blob, node, "memory-region", rphandle))
+			return -ENOSPC;
+	}
+
+	node = rtkit_helper_fdt_node(blob, priv->dart);
+	if (node < 0 ||
+	    fdt_appendprop_u32(blob, node, "apple,bypass-handoff-streams",
+			       priv->dart_sid))
+		return -ENOSPC;
+
+	node = rtkit_helper_fdt_node(blob, dev);
+	if (node < 0 ||
+	    fdt_setprop_string(blob, node, "apple,rtkit-handoff",
+			       RTKIT_HELPER_HANDOFF))
+		return -ENOSPC;
+
+	priv->handoff_published = true;
+	printf("%s: live OS handoff published (%d buffers, DART stream %u)\n",
+	       dev->name, priv->nbufs, priv->dart_sid);
+	return 0;
+}
+
+int apple_rtkit_helper_fdt_fixup(void *blob)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+	int ret;
+
+	uclass_id_foreach_dev(UCLASS_MISC, dev, uc) {
+		struct rtkit_helper_priv *priv;
+
+		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
+		    !device_active(dev) || !rtkit_helper_uses_dram(dev))
+			continue;
+
+		priv = dev_get_priv(dev);
+		/* A second fixup describes the same session again. */
+		priv->handoff_published = false;
+		ret = rtkit_helper_fdt_publish(dev, blob);
+		if (ret) {
+			priv->handoff_published = false;
+			apple_dart_release_bypass(priv->dart);
+			dev_warn(dev, "no live OS handoff (%d); stopping RTKit at boot\n",
+				 ret);
+		}
+	}
+
+	return 0;
 }
 
 static const struct udevice_id rtkit_helper_ids[] = {

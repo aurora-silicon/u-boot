@@ -1,0 +1,75 @@
+name: Apple builds
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, aurora-wip ]
+    tags: [ 'v*' ]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-aarch64-linux-gnu libgnutls28-dev libssl-dev device-tree-compiler bison flex swig python3-dev python3-setuptools
+      - name: Select build version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            echo "RELEASE_VERSION=$REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=dev-${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+          fi
+      - name: Build and package both configurations
+        run: |
+          for config in apple_m1 apple_j873; do
+            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- "${config}_defconfig"
+            scripts/config --file "build-$config/.config" --enable WERROR
+            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm -j2
+            python3 tools/aurora_release.py --version "$RELEASE_VERSION" --config "$config" --build-dir "build-$config" --compiler aarch64-linux-gnu-gcc
+          done
+          cd dist
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: u-boot-release
+          path: dist/*
+          if-no-files-found: error
+  draft:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: u-boot-release
+          path: dist
+      - name: Create or update draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            jq -e '.isDraft == true' release-state.json
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            notes="doc/board/apple/aurora-releases/${RELEASE_TAG#v}.md"
+            if [ ! -f "$notes" ]; then
+              printf 'Draft release %s. Edit these notes before publishing.\n' "$RELEASE_TAG" > release-notes.txt
+              notes=release-notes.txt
+            fi
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --draft \
+              --title "Aurora U-Boot ${RELEASE_TAG#v}" --notes-file "$notes"
+          fi

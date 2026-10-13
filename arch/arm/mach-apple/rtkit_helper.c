@@ -8,6 +8,7 @@
 #include <cpu_func.h>
 #include <lmb.h>
 #include <mailbox.h>
+#include <malloc.h>
 #include <mapmem.h>
 #include <reset.h>
 #include <linux/libfdt.h>
@@ -286,37 +287,72 @@ static int rtkit_helper_fdt_node(void *blob, struct udevice *dev)
 	return fdt_path_offset(blob, path);
 }
 
-/*
- * Describe the running session to the OS: one no-map reservation per
- * buffer, identity-mapped for the helper through its DART, the stream the
- * DART must keep in bypass until the OS maps those regions, and finally the
- * handoff contract itself.
- */
-static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
+/* Append a provider/reference cell once, preserving unrelated references. */
+static int rtkit_helper_fdt_append_unique(void *blob, int node,
+					  const char *name, u32 value)
+{
+	const fdt32_t *cells;
+	int len, i;
+
+	cells = fdt_getprop(blob, node, name, &len);
+	if (!cells && len != -FDT_ERR_NOTFOUND)
+		return len;
+	if (cells) {
+		if (len % (int)sizeof(*cells))
+			return -EINVAL;
+		for (i = 0; i < len / (int)sizeof(*cells); i++)
+			if (fdt32_to_cpu(cells[i]) == value)
+				return 0;
+	}
+	return fdt_appendprop_u32(blob, node, name, value);
+}
+
+/* Reuse only a reservation that already describes this exact helper buffer. */
+static bool rtkit_helper_fdt_buffer_matches(void *blob, int node,
+					    u32 phandle, const fdt64_t *reg)
+{
+	const fdt32_t *mapping;
+	const void *prop;
+	int len;
+
+	prop = fdt_getprop(blob, node, "reg", &len);
+	if (!prop || len != 2 * (int)sizeof(*reg) || memcmp(prop, reg, len))
+		return false;
+	prop = fdt_getprop(blob, node, "no-map", &len);
+	if (!prop || len)
+		return false;
+	mapping = fdt_getprop(blob, node, "iommu-addresses", &len);
+	return mapping && len == (int)sizeof(*mapping) + 2 * (int)sizeof(*reg) &&
+	       fdt32_to_cpu(mapping[0]) == phandle &&
+	       !memcmp(mapping + 1, reg, 2 * sizeof(*reg));
+}
+
+/* Build only on a scratch blob; failure cannot publish a partial contract. */
+static int rtkit_helper_fdt_build(struct udevice *dev, void *blob)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
-	int resv, node, sub, parent, i, ret;
+	int resv, node, sub, parent, i, ret, len;
+	const char *contract;
 	char name[48];
 	u32 phandle, rphandle;
 	fdt64_t reg[2];
-
-	if (!priv->rtk || !priv->dart || !priv->nbufs ||
-	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
-		return -ENODEV;
-	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
-		return -ENODEV;
-	ret = apple_dart_retain_bypass(priv->dart);
-	if (ret)
-		return ret;
 
 	resv = fdt_path_offset(blob, "/reserved-memory");
 	node = rtkit_helper_fdt_node(blob, dev);
 	if (resv < 0 || node < 0)
 		return -ENOENT;
 	parent = fdt_parent_offset(blob, node);
-	if (fdt_address_cells(blob, resv) != 2 || fdt_size_cells(blob, resv) != 2 ||
+	if (parent < 0 || fdt_address_cells(blob, resv) != 2 ||
+	    fdt_size_cells(blob, resv) != 2 ||
 	    fdt_address_cells(blob, parent) != 2 || fdt_size_cells(blob, parent) != 2)
 		return -EINVAL;
+
+	contract = fdt_getprop(blob, node, "apple,rtkit-handoff", &len);
+	if (contract && (len != (int)sizeof(RTKIT_HELPER_HANDOFF) ||
+			 memcmp(contract, RTKIT_HELPER_HANDOFF, len)))
+		return -EINVAL;
+	if (!contract && len != -FDT_ERR_NOTFOUND)
+		return len;
 
 	phandle = fdt_get_phandle(blob, node);
 	if (!phandle) {
@@ -324,53 +360,107 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 		if (!ret)
 			ret = fdt_setprop_u32(blob, node, "phandle", phandle);
 		if (ret)
-			return -ENOSPC;
+			return ret;
 	}
 
 	for (i = 0; i < priv->nbufs; i++) {
 		struct rtkit_helper_buf *b = &priv->bufs[i];
 
 		snprintf(name, sizeof(name), "mtp-rtkit@%llx", b->dva);
-		resv = fdt_path_offset(blob, "/reserved-memory");
-		sub = fdt_add_subnode(blob, resv, name);
-		if (sub < 0)
-			return -ENOSPC;
-
 		reg[0] = cpu_to_fdt64(b->dva);
 		reg[1] = cpu_to_fdt64(b->size);
-		ret = fdt_generate_phandle(blob, &rphandle);
-		ret = ret ?: fdt_setprop_u32(blob, sub, "phandle", rphandle);
-		ret = ret ?: fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
-		ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
-		/* The DART passed these addresses through unchanged: IOVA == PA. */
-		ret = ret ?: fdt_setprop_u32(blob, sub, "iommu-addresses", phandle);
-		ret = ret ?: fdt_appendprop(blob, sub, "iommu-addresses", reg,
-					    sizeof(reg));
-		if (ret)
-			return -ENOSPC;
+		resv = fdt_path_offset(blob, "/reserved-memory");
+		sub = fdt_subnode_offset(blob, resv, name);
+		if (sub >= 0) {
+			rphandle = fdt_get_phandle(blob, sub);
+			if (!rphandle ||
+			    !rtkit_helper_fdt_buffer_matches(blob, sub, phandle, reg))
+				return -EEXIST;
+		} else if (sub == -FDT_ERR_NOTFOUND) {
+			sub = fdt_add_subnode(blob, resv, name);
+			if (sub < 0)
+				return sub;
+			ret = fdt_generate_phandle(blob, &rphandle);
+			ret = ret ?: fdt_setprop_u32(blob, sub, "phandle", rphandle);
+			ret = ret ?: fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
+			ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
+			ret = ret ?: fdt_setprop_u32(blob, sub, "iommu-addresses", phandle);
+			/* The bypass DART maps the helper's IOVA to the same PA. */
+			ret = ret ?: fdt_appendprop(blob, sub, "iommu-addresses", reg,
+						    sizeof(reg));
+			if (ret)
+				return ret;
+		} else {
+			return sub;
+		}
 
 		node = rtkit_helper_fdt_node(blob, dev);
-		if (node < 0 ||
-		    fdt_appendprop_u32(blob, node, "memory-region", rphandle))
-			return -ENOSPC;
+		if (node < 0)
+			return node;
+		ret = rtkit_helper_fdt_append_unique(blob, node, "memory-region",
+						     rphandle);
+		if (ret)
+			return ret;
 	}
 
 	node = rtkit_helper_fdt_node(blob, priv->dart);
-	if (node < 0 ||
-	    fdt_appendprop_u32(blob, node, "apple,bypass-handoff-streams",
-			       priv->dart_sid))
-		return -ENOSPC;
-
+	if (node < 0)
+		return node;
+	ret = rtkit_helper_fdt_append_unique(blob, node,
+					     "apple,bypass-handoff-streams",
+					     priv->dart_sid);
+	if (ret)
+		return ret;
 	node = rtkit_helper_fdt_node(blob, dev);
-	if (node < 0 ||
-	    fdt_setprop_string(blob, node, "apple,rtkit-handoff",
-			       RTKIT_HELPER_HANDOFF))
-		return -ENOSPC;
+	if (node < 0)
+		return node;
+	return fdt_setprop_string(blob, node, "apple,rtkit-handoff",
+				  RTKIT_HELPER_HANDOFF);
+}
 
-	priv->handoff_published = true;
-	printf("%s: live OS handoff published (%d buffers, DART stream %u)\n",
-	       dev->name, priv->nbufs, priv->dart_sid);
-	return 0;
+/* Commit the FDT and live-session state together after every write succeeds. */
+static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+	void *scratch;
+	size_t size;
+	int i, j, ret;
+
+	if (!priv->rtk || !priv->dart || priv->nbufs <= 0 ||
+	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
+		return -ENODEV;
+	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
+		return -ENODEV;
+	for (i = 0; i < priv->nbufs; i++) {
+		struct rtkit_helper_buf *b = &priv->bufs[i];
+
+		if (!b->size || b->dva % SZ_16K || b->size % SZ_16K ||
+		    b->size > (u64)-1 - b->dva)
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (b->dva < priv->bufs[j].dva + priv->bufs[j].size &&
+			    priv->bufs[j].dva < b->dva + b->size)
+				return -EINVAL;
+	}
+	ret = fdt_check_header(blob);
+	if (ret)
+		return ret;
+	size = fdt_totalsize(blob);
+	scratch = malloc(size);
+	if (!scratch)
+		return -ENOMEM;
+	memcpy(scratch, blob, size);
+	ret = rtkit_helper_fdt_build(dev, scratch);
+	if (!ret)
+		ret = apple_dart_retain_bypass(priv->dart);
+	if (!ret) {
+		memcpy(blob, scratch, size);
+		priv->handoff_published = true;
+		printf("%s: live OS handoff published (%d buffers, DART stream %u)\n",
+		       dev->name, priv->nbufs, priv->dart_sid);
+	}
+	free(scratch);
+	return ret;
 }
 
 int apple_rtkit_helper_fdt_fixup(void *blob)
@@ -380,21 +470,14 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 	int ret;
 
 	uclass_id_foreach_dev(UCLASS_MISC, dev, uc) {
-		struct rtkit_helper_priv *priv;
-
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
 		    !device_active(dev) || !rtkit_helper_uses_dram(dev))
 			continue;
 
-		priv = dev_get_priv(dev);
-		/* A second fixup describes the same session again. */
-		priv->handoff_published = false;
 		ret = rtkit_helper_fdt_publish(dev, blob);
 		if (ret) {
-			priv->handoff_published = false;
-			apple_dart_release_bypass(priv->dart);
-			dev_warn(dev, "no live OS handoff (%d); stopping RTKit at boot\n",
-				 ret);
+			dev_warn(dev, "cannot publish live OS handoff (%d)\n", ret);
+			return ret;
 		}
 	}
 

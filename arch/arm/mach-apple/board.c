@@ -1278,8 +1278,11 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	int node, ret;
 
 	/* Coprocessors handed over running must be described in every case. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
-		apple_rtkit_helper_fdt_fixup(blob);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

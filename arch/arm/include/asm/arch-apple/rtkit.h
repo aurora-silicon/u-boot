@@ -30,12 +30,17 @@ struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
 				     apple_rtkit_shmem_setup shmem_setup,
 				     apple_rtkit_shmem_destroy shmem_destroy);
 void apple_rtkit_free(struct apple_rtkit *rtk);
+int apple_rtkit_get_buffers(struct apple_rtkit *rtk,
+			   struct apple_rtkit_buffer *buffers, size_t count);
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps);
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate);
 int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout);
 int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);
 
 int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
+/* Only publish a J713 session after its first HID discovery header is pending. */
+void apple_rtkit_helper_input_ready(struct udevice *dev);
 
 bool apple_rtkit_helper_allowed(ofnode node);
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */

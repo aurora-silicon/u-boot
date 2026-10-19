@@ -11,7 +11,9 @@
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <time.h>
 #include <linux/ioport.h>
+#include <linux/delay.h>
 #include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
@@ -1309,6 +1311,53 @@ static void apple_efi_late_init(void)
 	apple_loader_initrd(chosen);
 }
 
+/* Start only the mailbox helper; Linux owns DockChannel discovery and HID. */
+static int j713_prepare_input(void)
+{
+	ofnode node, input;
+	struct udevice *helper;
+	fdt_addr_t data;
+	ulong start;
+	int ret, index;
+
+	node = ofnode_by_compatible(ofnode_null(), "apple,t8132-rtk-helper-asc4");
+	if (!ofnode_valid(node))
+		return -ENODEV;
+	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
+	if (ret) {
+		printf("J713: failed to initialize input helper (%d)\n", ret);
+		return ret;
+	}
+	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
+	if (!ofnode_valid(input))
+		return -ENODEV;
+	index = ofnode_stringlist_search(input, "reg-names", "data");
+	if (index < 0)
+		return index;
+	data = ofnode_get_addr_index(input, index);
+	if (data == FDT_ADDR_T_NONE)
+		return -EINVAL;
+
+	/* AP power ON can precede IOReport/buffer requests. Finish those
+	 * startup exchanges before Linux inherits a mailbox it will not poll.
+	 * Observe the first HID header without consuming any FIFO bytes. */
+	start = get_timer(0);
+	while (readl((void *)(data + 0x2c)) < 8 && get_timer(start) < 2000) {
+		ret = apple_rtkit_helper_poll(helper, 0);
+		if (ret && ret != -ETIMEDOUT) {
+			printf("J713: input startup mailbox error %d\n", ret);
+			return ret;
+		}
+		udelay(50);
+	}
+	printf("J713: input discovery FIFO has %u bytes at handoff\n",
+	       readl((void *)(data + 0x2c)));
+	if (readl((void *)(data + 0x2c)) < 8)
+		return -ETIMEDOUT;
+	apple_rtkit_helper_input_ready(helper);
+	return 0;
+}
+
 int board_late_init(void)
 {
 	u32 status = 0;
@@ -1317,6 +1366,13 @@ int board_late_init(void)
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
 
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    of_machine_is_compatible("apple,j713")) {
+		int ret = j713_prepare_input();
+
+		if (ret)
+			printf("J713: input unavailable (%d); continuing boot\n", ret);
+	}
 	if (of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132"))
 		apple_efi_late_init();
@@ -1353,8 +1409,11 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	int node, ret;
 
 	/* Coprocessors handed over running must be described in every case. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
-		apple_rtkit_helper_fdt_fixup(blob);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

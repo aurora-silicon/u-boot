@@ -98,6 +98,26 @@ struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
 	return rtk;
 }
 
+/* Snapshot protocol descriptors before the next stage starts receiving. */
+int apple_rtkit_get_buffers(struct apple_rtkit *rtk,
+			   struct apple_rtkit_buffer *buffers, size_t count)
+{
+	const struct apple_rtkit_buffer *live[] = {
+		&rtk->crashlog_buffer, &rtk->syslog_buffer,
+		&rtk->ioreport_buffer, &rtk->oslog_buffer,
+	};
+	int n = 0;
+
+	for (int i = 0; i < ARRAY_SIZE(live); i++) {
+		if (!live[i]->size)
+			continue;
+		if (n >= count)
+			return -ENOSPC;
+		buffers[n++] = *live[i];
+	}
+	return n;
+}
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	if (rtk->shmem_destroy) {
@@ -299,7 +319,7 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
-int apple_rtkit_boot(struct apple_rtkit *rtk)
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -411,6 +431,8 @@ wait_epmap:
 		 */
 		if (endpoints[i] == APPLE_RTKIT_EP_MGMT)
 			continue;
+		if (endpoints[i] < 32 && !(system_eps & BIT(endpoints[i])))
+			continue;
 
 		/* Request endpoint. */
 		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |
@@ -432,6 +454,11 @@ wait_epmap:
 	}
 
 	return 0;
+}
+
+int apple_rtkit_boot(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_with_sys_ep_mask(rtk, ~0U);
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)

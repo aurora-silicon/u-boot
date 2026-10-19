@@ -51,6 +51,49 @@ This initial J813 path does not qualify storage, USB host devices, input,
 networking, native GPU/display drivers or SMP. The existing M1/M2 hardware
 support list above does not apply to J813.
 
+M4 J713 boot
+------------
+
+J713/T8132 uses ``apple_m1_defconfig`` and ``u-boot-nodtb.bin``. The control
+DT used for building is not the runtime DT: m1n1 supplies the J713 tree,
+its usable DRAM banks, firmware reservations and inherited framebuffer.
+The T8132 map includes the ANS/NVMMU, PCIe and both ATC apertures; every
+incoming DRAM bank is mapped before EFI can allocate from it.
+
+This is the bootloader companion to the basic Linux support in
+https://github.com/aurora-silicon/linux/pull/366 and the m1n1 review
+branch at https://github.com/aurora-silicon/m1n1/tree/m4/pr1-basic-bringup.
+The firmware resource handoff supports the basic framebuffer boot and
+later native graphics without activating a GPU or DCP driver here.
+
+J713 uses the shared internal-ESP EFI boot flow: the ESP UUID supplied by
+m1n1 selects ``EFI/BOOT/BOOTAA64.EFI``, with the prepared runtime FDT.
+Saved environment overrides remain effective.
+
+The shared post-M4 NVMe driver adopts the live ANS firmware session and
+keeps it running at OS handoff. Do not reset that coprocessor or reclaim
+its firmware buffers between m1n1, U-Boot and Linux. Native GPU and DCP
+firmware mappings remain owned by the OS drivers.
+
+Initialize J713's RTKit helper, retain its buffers and bypass stream, and
+publish the inherited-session marker for Linux. Leave DockChannel discovery
+and HID configuration to Linux. Late mailbox startup must finish until a HID
+header is pending before publishing that marker. Firmware DRAM buffers are
+described by no-map reserved-memory nodes, consumed by both the EFI memory map
+and Linux. The helper's ``memory-region`` references these DRAM reservations.
+``apple,rtkit-buffers`` contains five-cell tuples: endpoint, address high/low,
+exact protocol byte size and the original request's ``is_mapped`` flag. The
+last flag records whether firmware supplied the address; SRAM placement is
+validated independently. The ``mtp-live-v1`` marker permits Linux to preload
+that inventory before receiving RTKit traffic. The legacy inherited marker
+remains for stable kernels that preserve the session without servicing it.
+If optional input initialization or handoff fails, stop the helper
+before freeing its buffers, disable its outgoing DT nodes and continue booting.
+This retained input contract is qualified only for J713. The built-in MTP
+keyboard is therefore unavailable in U-Boot; a USB keyboard can be used
+for bootloader interaction after USB is started manually. USB keyboard
+interaction has not been hardware-qualified by this series.
+
 Building U-Boot
 ---------------
 

@@ -390,11 +390,12 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * J813's MTP firmware cold-boots correctly, but restarting it after
-	 * U-Boot's RTKit shutdown crashes while restoring its logging state.
-	 * Leave the helper and its FIFOs untouched so Linux owns the first boot.
+	 * J813 cannot restart MTP after U-Boot shuts it down. J713 starts only
+	 * the shared RTKit helper and hands that session to Linux; its FIFO and
+	 * HID setup belong to Linux. Neither route uses this keyboard transport.
 	 */
-	if (of_machine_is_compatible("apple,j813"))
+	if (of_machine_is_compatible("apple,j813") ||
+	    of_machine_is_compatible("apple,j713"))
 		return -ENODEV;
 
 	reg = dev_read_addr_name(dev, "data");

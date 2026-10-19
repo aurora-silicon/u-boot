@@ -94,6 +94,12 @@ keyboard is therefore unavailable in U-Boot; a USB keyboard can be used
 for bootloader interaction after USB is started manually. USB keyboard
 interaction has not been hardware-qualified by this series.
 
+The per-UKI ``u-boot,j713-dtb-imported`` marker reports runtime import only;
+optional input may still be disabled. Input qualification must separately check
+``apple,rtkit-handoff = "mtp-live-v1"``, its buffer inventory and reservations,
+the running ASC, and physical keyboard/trackpad response. A marker alone does
+not establish that the coprocessor is live.
+
 Building U-Boot
 ---------------
 
@@ -122,6 +128,53 @@ can be found here:
 
 This uses ``u-boot-nodtb.bin`` as the device tree is passed to U-Boot
 by m1n1 after making some adjustments.
+
+Per-kernel J713 device trees
+----------------------------
+
+J713 may boot an OS-supplied DTB through ``EFI_DT_FIXUP_PROTOCOL``, including
+the ``.dtb`` section of a systemd-stub unified kernel image. This lets a new
+kernel use its own platform descriptions while older fallback kernels keep
+the original DTB bundled with m1n1.
+
+The shared ``apple_m1_defconfig`` enables ``APPLE_J713_FDT`` with the retained
+MTP helper. Configurations for other Apple systems may omit this option and
+keep their existing FDT padding and input configuration.
+
+The OS tree opts in by supplying ``/chosen/u-boot,j713-dtb-source`` as a
+NUL-terminated string containing its 40 lowercase hexadecimal source commit
+characters. Both trees must identify J713 and T8132. U-Boot imports this boot's
+CPU release slots, firmware memory reservations, ANS/SPMI resources, firmware
+identities, PMP tunables, calibration, framebuffer and native graphics handoff.
+References to reserved memory and display devices are translated to the OS
+tree's phandles. PMGR ownership, power domains, pinctrl, clocks and all other
+static topology remain the OS tree's descriptions.
+
+The import is bounded to source trees and used OS-tree data of at most 128 KiB;
+``SYS_FDT_PAD`` provides 256 KiB for the runtime additions. Unsupported address
+cell layouts, missing CPU release slots, incomplete resource descriptions and
+unknown reserved-memory properties cause refusal before the live input helper
+is touched. The currently supported DMA-parent layout is the J713 structural
+parent, without a ``dma-mem`` interconnect. A basic platform DTB may omit the
+GPU and display devices; their firmware carveouts remain reserved without
+references to the omitted devices. CPU configurations that differ from m1n1's
+available set need explicit support rather than invented release addresses.
+
+Import validation and allocation use a scratch tree. A failed import changes
+neither the OS tree nor m1n1's control tree. The existing RTKit helper then
+publishes its actual current input session, including explicit disabled input
+if that optional initialization failed. After those fixups U-Boot publishes
+``/chosen/u-boot,j713-dtb-imported = <1>``. Repeated preparation of the same
+session is supported.
+
+If a later candidate cannot describe an already-published input session,
+its fixup fails so EFI can keep the prior device tree and live session.
+
+systemd-stub may continue with its original firmware DTB if an embedded tree's
+fixups fail. Qualification must therefore inspect both marker properties in
+the running flattened device tree and inspect the new platform descriptions;
+a successful kernel boot alone does not establish use of the new DTB.
+The unmarked legacy path does not use this import.
 
 Image installation
 ------------------

@@ -21,6 +21,7 @@
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
+#include <asm/arch/j713_fdt.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -1406,13 +1407,27 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	struct udevice *dev;
 	const char *stdoutname;
-	int node, ret;
+	int node, ret, imported;
+
+	imported = 0;
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT))
+		imported = apple_j713_import_fdt(blob, gd->fdt_blob);
+	if (imported < 0) {
+		printf("J713: refused OS devicetree runtime import (%d)\n", imported);
+		return imported;
+	}
 
 	/* Coprocessors handed over running must be described in every case. */
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
 		ret = apple_rtkit_helper_fdt_fixup(blob);
 		if (ret)
 			return ret;
+	}
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT) && imported) {
+		ret = apple_j713_complete_fdt(blob);
+		if (ret)
+			return ret;
+		printf("J713: OS devicetree runtime import complete\n");
 	}
 
 	/*

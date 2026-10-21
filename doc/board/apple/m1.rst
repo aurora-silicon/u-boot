@@ -76,8 +76,10 @@ its firmware buffers between m1n1, U-Boot and Linux. Native GPU and DCP
 firmware mappings remain owned by the OS drivers.
 
 Initialize J713's RTKit helper, retain its buffers and bypass stream, and
-publish the inherited-session marker for Linux. Leave DockChannel discovery
-and HID configuration to Linux. Late mailbox startup must finish until a HID
+publish the inherited-session marker for Linux. U-Boot enables only the keyboard
+interface and saves complete DockChannel INIT packets plus the keyboard READY event
+for Linux to discover all interfaces and adopt the already enabled keyboard.
+Late mailbox startup must finish until a HID
 header is pending before publishing that marker. Firmware DRAM buffers are
 described by no-map reserved-memory nodes, consumed by both the EFI memory map
 and Linux. The helper's ``memory-region`` references these DRAM reservations.
@@ -89,10 +91,27 @@ that inventory before receiving RTKit traffic. The legacy inherited marker
 remains for stable kernels that preserve the session without servicing it.
 If optional input initialization or handoff fails, stop the helper
 before freeing its buffers, disable its outgoing DT nodes and continue booting.
-This retained input contract is qualified only for J713. The built-in MTP
-keyboard is therefore unavailable in U-Boot; a USB keyboard can be used
-for bootloader interaction after USB is started manually. USB keyboard
-interaction has not been hardware-qualified by this series.
+This retained input contract applies only to J713. Its built-in keyboard is
+registered as ``mtpkbd`` alongside the other console inputs, including EFI
+ConIn. Keyboard setup uses the announcement parser even though J713 has an STM
+interface: STM identity discovery remains Linux's responsibility. Before OS
+entry, U-Boot drains reports and replays the saved INIT packets and the original
+keyboard READY in their wire order, using word-wide FIFO writes while leaving
+the helper, buffers and DART bypass live.
+Replay waits for FIFO space, bounds draining, and refuses observed concurrent
+writes; this shared FIFO has no established packet-atomic producer lock. The
+trackpad is configured by Linux after that replay. J813 remains excluded from
+this keyboard transport.
+
+A failed J713 startup is not retried by keyboard probing. The helper stops
+accepting buffer requests after publishing its OS inventory. A stopped helper
+is no longer polled. An incomplete startup cache disables a first optional
+input handoff; if a session was already published, cache or replay errors
+panic before OS entry without revoking its live reservations. EFI and direct
+boot discard driver removal errors, so returning an error would not protect
+that contract. That session requires a reboot before retrying input
+initialization. Physical typing at the handoff
+boundary remains a separate hardware test.
 
 The per-UKI ``u-boot,j713-dtb-imported`` marker reports runtime import only;
 optional input may still be disabled. Input qualification must separately check

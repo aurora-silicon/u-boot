@@ -1267,7 +1267,7 @@ static void apple_loader_initrd(ofnode chosen)
 	env_set("aurora_loader_initrd", buf);
 }
 
-static void apple_efi_late_init(void)
+static void apple_efi_late_init(bool start_keyboard)
 {
 	const char *str;
 	ofnode chosen;
@@ -1295,7 +1295,8 @@ static void apple_efi_late_init(void)
 		env_set("bootdelay", "1");
 
 	/* EFI ConIn uses the active stdin; keep serial input available. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) && IS_ENABLED(CONFIG_CMDLINE))
+	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    IS_ENABLED(CONFIG_CMDLINE))
 		run_command("mtpkbd start", 0);
 
 	chosen = ofnode_path("/chosen");
@@ -1312,7 +1313,7 @@ static void apple_efi_late_init(void)
 	apple_loader_initrd(chosen);
 }
 
-/* Start only the mailbox helper; Linux owns DockChannel discovery and HID. */
+/* Prepare the live helper before the keyboard console consumes discovery. */
 static int j713_prepare_input(void)
 {
 	ofnode node, input;
@@ -1361,6 +1362,7 @@ static int j713_prepare_input(void)
 
 int board_late_init(void)
 {
+	bool start_keyboard = true;
 	u32 status = 0;
 	phys_addr_t addr;
 
@@ -1371,12 +1373,13 @@ int board_late_init(void)
 	    of_machine_is_compatible("apple,j713")) {
 		int ret = j713_prepare_input();
 
+		start_keyboard = !ret;
 		if (ret)
 			printf("J713: input unavailable (%d); continuing boot\n", ret);
 	}
 	if (of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132"))
-		apple_efi_late_init();
+		apple_efi_late_init(start_keyboard);
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M

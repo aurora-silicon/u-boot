@@ -289,3 +289,131 @@ int main(void)
     binary = tmp_path / 'startup'
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def test_helper_stopped_poll_and_frozen_inventory(tmp_path):
+    """A published handoff cannot acquire new firmware-visible buffers."""
+    import re
+    root = Path(__file__).resolve().parents[3]
+    text = (root / 'arch/arm/mach-apple/rtkit_helper.c').read_text()
+    def function(name):
+        match = re.search(r'^(?:static )?(?:int|bool|void) ' + name + r'\([^;{}]*\)\s*\{', text, re.M)
+        assert match, name
+        start, end, depth = match.start(), match.end(), 1
+        while depth:
+            depth += (text[end] == '{') - (text[end] == '}')
+            end += 1
+        return text[start:end] + '\n'
+    unit = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+typedef uint64_t u64;typedef uint32_t u32;typedef unsigned long ulong;
+typedef uint64_t fdt_size_t;typedef uint64_t fdt_addr_t;
+#define SZ_16K 16384
+#define ALIGN(v,a) (((v)+(a)-1)&~((a)-1))
+#define ALIGN_DOWN(v,a) ((v)&~((a)-1))
+#define FDT_ADDR_T_NONE UINT64_MAX
+#define APPLE_RTKIT_EP_OSLOG 8
+#define RTKIT_HELPER_MAX_BUFS 8
+#define DM_FLAG_LEAVE_PD_ON 0x2000
+#define dev_err(...) ((void)0)
+struct rtkit_helper_buf {u64 dva;size_t size;};
+struct rtkit_helper_priv {
+ void *rtk;bool handoff_published,input_ready,sram_stolen;int nbufs;
+ struct rtkit_helper_buf bufs[8];
+};
+struct udevice {struct rtkit_helper_priv *priv;bool active;u32 flags;};
+struct apple_rtkit_buffer {void *buffer;u64 dva;size_t size;bool is_mapped;int endpoint;};
+static unsigned allocs,polls,sram_reads;static unsigned char arena[65536];
+static void *dev_get_priv(struct udevice *d){return d->priv;}
+static bool device_active(struct udevice *d){return d->active;}
+static u32 dev_get_flags(struct udevice *d){return d->flags;}
+static int apple_rtkit_poll(void *rtk,ulong timeout){assert(rtk==(void *)1&&timeout==0);polls++;return 0;}
+static bool rtkit_helper_uses_dram(struct udevice *d){(void)d;return true;}
+static void *rtkit_helper_alloc(struct rtkit_helper_priv *p,size_t size){(void)p;assert(size<=sizeof(arena));allocs++;return arena;}
+static fdt_addr_t dev_read_addr_size_name(struct udevice *d,const char *n,fdt_size_t *size){
+ (void)d;assert(!strcmp(n,"sram"));sram_reads++;*size=65536;return 0x100000;
+}
+static void flush_dcache_range(ulong start,ulong end){assert(end>=start);}
+static u64 map_to_sysmem(void *p){assert(p==arena);return 0x200000;}
+'''
+    for name in ('shmem_setup', 'apple_rtkit_helper_poll', 'apple_rtkit_helper_input_prepared',
+                 'apple_rtkit_helper_input_retained', 'apple_rtkit_helper_input_failed'):
+        unit += function(name)
+    unit += r'''
+int main(void){
+ struct rtkit_helper_priv p={.rtk=(void *)1,.input_ready=true};
+ struct udevice d={.priv=&p,.active=true};
+ assert(apple_rtkit_helper_input_prepared(&d));assert(!apple_rtkit_helper_poll(&d,0)&&polls==1);
+ p.rtk=NULL;assert(!apple_rtkit_helper_input_prepared(&d));
+ assert(apple_rtkit_helper_poll(&d,0)==-ENODEV&&polls==1);
+ d.priv=NULL;assert(apple_rtkit_helper_poll(&d,0)==-ENODEV&&polls==1);
+ assert(!apple_rtkit_helper_input_prepared(&d));
+ d.flags=DM_FLAG_LEAVE_PD_ON;assert(apple_rtkit_helper_input_retained(&d));
+ d.priv=&p;p.rtk=(void *)1;
+ struct apple_rtkit_buffer b={.size=0x2000,.endpoint=1};
+ assert(!shmem_setup(&d,&b)&&allocs==1&&p.nbufs==1&&b.dva==0x200000);
+ p.handoff_published=true;
+ struct apple_rtkit_buffer late={.size=0x4000,.endpoint=4};
+ assert(shmem_setup(&d,&late)==-EBUSY&&allocs==1&&p.nbufs==1&&!late.buffer&&!late.dva);
+ late.is_mapped=true;late.dva=0x100000;
+ assert(shmem_setup(&d,&late)==-EBUSY&&!sram_reads&&allocs==1&&p.nbufs==1);
+ apple_rtkit_helper_input_failed(&d);assert(p.input_ready);
+ p.handoff_published=false;apple_rtkit_helper_input_failed(&d);assert(!p.input_ready);
+ return 0;
+}
+'''
+    c, binary = tmp_path / 'frozen.c', tmp_path / 'frozen'
+    c.write_text(unit)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                    str(c), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+def test_published_j713_remove_never_stops_firmware_on_dart_failure(tmp_path):
+    repo = Path(__file__).resolve().parents[3]
+    text = (repo / 'arch/arm/mach-apple/rtkit_helper.c').read_text()
+    start = text.index('static int rtkit_helper_remove(')
+    production = text[start:text.index('int apple_rtkit_helper_poll(', start)]
+    unit = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <errno.h>
+#include <setjmp.h>
+struct rtkit_helper_priv { bool handoff_published;void *rtk,*dart; };
+struct udevice { const char *name;struct rtkit_helper_priv *priv; };
+static int retention_error,stops,frees,panics;static bool j713=true;
+static jmp_buf boundary;
+static void *dev_get_priv(struct udevice *d) { return d->priv; }
+static int apple_dart_retain_bypass(void *d) { assert(d);return retention_error; }
+static bool rtkit_helper_j713_handoff(struct udevice *d) { assert(d);return j713; }
+static void apple_rtkit_free(void *r) { assert(r);frees++; }
+static void rtkit_helper_stop(struct udevice *d) { d->priv->rtk=NULL;stops++; }
+static void __attribute__((noreturn)) panic(const char *fmt,...) {
+ assert(fmt);panics++;longjmp(boundary,1);
+}
+''' + production + r'''
+int main(void) {
+ struct rtkit_helper_priv p={.handoff_published=true,.rtk=(void *)1,.dart=(void *)2};
+ struct udevice d={.name="mtp",.priv=&p};retention_error=-ENODEV;
+ if(!setjmp(boundary)){rtkit_helper_remove(&d);assert(false);}
+ assert(panics==1&&!stops&&!frees&&p.rtk&&p.handoff_published);
+ retention_error=0;assert(!rtkit_helper_remove(&d));assert(frees==1&&!stops&&!p.rtk);
+ p.rtk=(void *)1;p.handoff_published=false;
+ assert(!rtkit_helper_remove(&d)&&stops==1&&!p.rtk);
+ p.rtk=(void *)1;p.handoff_published=true;j713=false;retention_error=-EINVAL;
+ assert(!rtkit_helper_remove(&d)&&stops==2&&!p.rtk&&panics==1);
+ return 0;
+}
+'''
+    c, binary = tmp_path / 'remove.c', tmp_path / 'remove'
+    c.write_text(unit)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                    str(c), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

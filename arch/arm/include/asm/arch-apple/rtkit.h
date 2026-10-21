@@ -41,6 +41,9 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);
 int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
 /* Only publish a J713 session after its first HID discovery header is pending. */
 void apple_rtkit_helper_input_ready(struct udevice *dev);
+bool apple_rtkit_helper_input_prepared(struct udevice *dev);
+bool apple_rtkit_helper_input_retained(struct udevice *dev);
+void apple_rtkit_helper_input_failed(struct udevice *dev);
 
 bool apple_rtkit_helper_allowed(ofnode node);
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */

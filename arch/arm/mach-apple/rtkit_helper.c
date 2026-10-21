@@ -4,6 +4,7 @@
  */
 
 #include <dm.h>
+#include <vsprintf.h>
 #include <dm/device_compat.h>
 #include <cpu_func.h>
 #include <lmb.h>
@@ -119,6 +120,10 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 	fdt_size_t sram_size;
 	fdt_addr_t sram;
+
+	/* The published inventory and reservations are immutable until reset. */
+	if (priv->handoff_published)
+		return -EBUSY;
 
 	if (!buf->is_mapped) {
 		/* Older MTP firmware retains OSLog in SRAM across OS handoff. */
@@ -284,13 +289,23 @@ static int rtkit_helper_remove(struct udevice *dev)
 	 * with its buffers and its DART in bypass.  Only the U-Boot side of the
 	 * transport is torn down.
 	 */
-	if (priv->handoff_published && !apple_dart_retain_bypass(priv->dart)) {
+	if (priv->handoff_published) {
+		int ret = apple_dart_retain_bypass(priv->dart);
+
+		/* A published J713 inventory already promises a running session.
+		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
+		if (ret && rtkit_helper_j713_handoff(dev))
+			panic("J713: refusing OS entry after MTP DART retention error %d", ret);
+		if (ret)
+			goto stop;
+
 		printf("%s: leaving RTKit running for the OS\n", dev->name);
 		apple_rtkit_free(priv->rtk);
 		priv->rtk = NULL;
 		return 0;
 	}
 
+stop:
 	rtkit_helper_stop(dev);
 
 	return 0;
@@ -300,7 +315,32 @@ int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 
+	if (!priv || !priv->rtk)
+		return -ENODEV;
 	return apple_rtkit_poll(priv->rtk, timeout);
+}
+
+bool apple_rtkit_helper_input_prepared(struct udevice *dev)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+
+	return device_active(dev) && priv && priv->rtk && priv->input_ready;
+}
+
+bool apple_rtkit_helper_input_retained(struct udevice *dev)
+{
+	/* Device flags outlive private transport teardown at OS prepare. */
+	return dev_get_flags(dev) & DM_FLAG_LEAVE_PD_ON;
+}
+
+void apple_rtkit_helper_input_failed(struct udevice *dev)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+
+	/* A prior EFI table still owns a published session. Refuse new boots
+	 * in the keyboard remove path, without revoking its reservations. */
+	if (priv && !priv->handoff_published)
+		priv->input_ready = false;
 }
 
 void apple_rtkit_helper_input_ready(struct udevice *dev)

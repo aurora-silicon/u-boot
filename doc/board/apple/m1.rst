@@ -176,6 +176,14 @@ the running flattened device tree and inspect the new platform descriptions;
 a successful kernel boot alone does not establish use of the new DTB.
 The unmarked legacy path does not use this import.
 
+J713 peripheral calibration export requires ``atcphy0`` and ``atcphy1``
+aliases to the ``apple,t8132-atcphy`` nodes in m1n1's control DTB, and a
+``bluetooth0`` alias to the ``pci14e4,5f72`` endpoint. Without matching
+source nodes and calibration, Bluetooth remains disabled and no USB3
+calibration is imported. An explicitly USB2-only OS port stays USB2;
+calibration never adds registers or changes power ownership. Malformed
+supplied calibration refuses the candidate transactionally.
+
 Image installation
 ------------------
 

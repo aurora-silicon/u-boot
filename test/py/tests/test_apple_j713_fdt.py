@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 
 
-def fixture_tree(runtime, graphics=True):
+def fixture_tree(runtime, graphics=True, peripherals=False):
     shift = 0 if runtime else 1000
     aliases = {
         'ans': '/soc/nvme', 'ans-mbox': '/soc/mailbox', 'sart-ans': '/soc/sart',
@@ -20,6 +20,9 @@ def fixture_tree(runtime, graphics=True):
     if graphics:
         aliases.update(gpu='/soc/gpu', dcp='/soc/dcp', disp0='/soc/display',
                        disp0_piodma='/soc/dcp/piodma')
+    if peripherals:
+        aliases.update(bluetooth0='/soc/bluetooth', atcphy0='/soc/phy0',
+                       atcphy1='/soc/phy1')
     strings = ['asahi,iboot1-version', 'asahi,iboot2-version', 'asahi,system-fw-version',
                'asahi,os-fw-version', 'asahi,m1n1-stage1-version',
                'asahi,m1n1-stage2-version', 'asahi,efi-system-partition',
@@ -63,6 +66,29 @@ def fixture_tree(runtime, graphics=True):
             display {{ phandle = <{11 + shift}>; iommus = <{30 + shift} 0>; {frontend} }};
         '''
     tunables = 'apple,tunable-test = [01 02 03 04];' if runtime else ''
+    peripheral_nodes = ''
+    if peripherals:
+        bt = ('local-bd-address = [01 02 03 04 05 06];'
+              'brcm,taurus-cal-blob = [12 34]; brcm,taurus-bf-cal-blob = [56 78];'
+              if runtime else 'local-bd-address = [00 00 00 00 00 00];')
+        peripheral_nodes = f'bluetooth {{ compatible = "pci14e4,5f72"; {bt} }};'
+        for port in range(2):
+            cal = ('apple,tunable-usb3-axi2af = <0x7ffc 0xffffffff 0x12345678>;'
+                   'apple,tunable-usb3-lioa = <0x3ffc 0xff 0x12>;'
+                   'apple,tunable-usb3-fabric = <0x3ffc 0xff 0x12>;'
+                   'apple,tunable-usb3-config = <0x3ffc 0xff 0x12>;'
+                   'apple,tunable-usb3-common = <0x23ffc 0xff 0x12>;'
+                   'apple,tunable-usb3-dp = <0x16008 0x38 8>, <0x1600c 0x1f 0>;'
+                   if runtime else 'apple,tunable-usb3-efuse = <4 0xff 0x99>;'
+                   'apple,tunable-usb3-dp = <0x16008 0xff 0x99>;')
+            peripheral_nodes += f'''phy{port} {{ compatible = "apple,t8132-atcphy";
+              reg = <4 {0x03000000 + port * 0x8000000} 0 0x24000>,
+                    <4 {port * 0x8000000} 0 0x8000>,
+                    <4 {0x00020000 + port * 0x8000000} 0 0x4000>,
+                    <4 {0x03044000 + port * 0x8000000} 0 0x4000>,
+                    <4 {0x03050000 + port * 0x8000000} 0 0x4000>;
+              reg-names = "core", "axi2af", "lioa", "fabric", "common-config"; {cal}
+            }};'''
     return f'''/dts-v1/;
     / {{ compatible = "apple,j713", "apple,t8132"; serial-number = "fixture";
       #address-cells = <2>; #size-cells = <2>;
@@ -91,6 +117,7 @@ def fixture_tree(runtime, graphics=True):
         pmgr {{ status = "{'okay' if runtime else 'disabled'}";
            {'apple,firmware-owned;' if not runtime else ''} }};
         {graphics_nodes}
+        {peripheral_nodes}
       }};
     }};'''
 
@@ -224,12 +251,62 @@ int main(int argc, char **argv)
   fdt32_t tuple[] = {cpu_to_fdt32(10), 0, 0, 0, cpu_to_fdt32(0x4000), cpu_to_fdt32(11), 0, 0};
   assert(!fdt_setprop(source, node, "iommu-addresses", tuple, sizeof(tuple)));
  }
+  if (fault == 20) {
+   int node = fdt_path_offset(source, "bluetooth0");
+   assert(!fdt_setprop_u32(source, node, "local-bd-address", 1));
+  }
+  if (fault == 21) {
+   int node = fdt_path_offset(source, "bluetooth0");
+   assert(!fdt_delprop(source, node, "brcm,taurus-cal-blob"));
+  }
+  if (fault == 22) {
+   int aliases = fdt_path_offset(source, "/aliases");
+   assert(!fdt_delprop(source, aliases, "atcphy0"));
+   assert(!fdt_delprop(source, aliases, "bluetooth0"));
+  }
+  if (fault >= 23 && fault <= 25) {
+   int node = fdt_path_offset(source, "atcphy0");
+   fdt32_t tuple[] = {cpu_to_fdt32(fault == 23 ? 1 : 0x8000),
+                      cpu_to_fdt32(0xff), cpu_to_fdt32(0x12)};
+   assert(!fdt_setprop(source, node, "apple,tunable-usb3-axi2af", tuple,
+                       fault == 25 ? 8 : sizeof(tuple)));
+  }
+  if (fault == 26 || fault == 28) {
+   int node = fdt_path_offset(target, "atcphy0");
+   const char names[] = "usb2phy\0pipehandler";
+   fdt32_t regs[] = {cpu_to_fdt32(4), cpu_to_fdt32(0x02a90000), 0, cpu_to_fdt32(0x4000),
+                    cpu_to_fdt32(4), cpu_to_fdt32(0x02a84000), 0, cpu_to_fdt32(0x4000)};
+   assert(!fdt_setprop(target, node, "reg-names", names, sizeof(names)));
+   assert(!fdt_setprop(target, node, "reg", regs, sizeof(regs)));
+   if (fault == 28) {
+    fdt32_t malformed[2] = {0};
+    node = fdt_path_offset(source, "atcphy0");
+    assert(!fdt_setprop(source, node, "apple,tunable-usb3-axi2af", malformed, sizeof(malformed)));
+   }
+  }
+  if (fault == 27) {
+   int node = fdt_path_offset(target, "atcphy0");
+   const char names[] = "core\0axi2af\0lioa\0common-config";
+   assert(!fdt_setprop(target, node, "reg-names", names, sizeof(names)));
+  }
+  if (fault == 29) {
+   int node = fdt_path_offset(source, "atcphy0");
+   assert(!fdt_delprop(source, node, "apple,tunable-usb3-dp"));
+  }
+  if (fault >= 30 && fault <= 34) {
+   int node = fdt_path_offset(source, "atcphy0");
+   fdt32_t tuple[] = {cpu_to_fdt32(fault == 30 ? 0x24000 :
+                                 fault == 31 ? 0x16002 : 0x23ffc),
+                      cpu_to_fdt32(0xff), cpu_to_fdt32(0x12)};
+   assert(!fdt_setprop(source, node, "apple,tunable-usb3-dp", tuple,
+                     fault == 32 ? 8 : fault == 33 ? 0 : sizeof(tuple)));
+  }
  assert(!fdt_add_mem_rsv(source, 0x900040000ULL, 0x4000));
  void *saved = malloc(capacity), *saved_source = malloc(fdt_totalsize(source));
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
- if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -245,6 +322,43 @@ int main(int argc, char **argv)
  if (fault == 17) {
   const char *s = fdt_getprop(target, fdt_path_offset(target, "/soc/pcie@1cb0000000"), "status", NULL);
   assert(s && !strcmp(s, "disabled"));
+ }
+  int bt = fdt_path_offset(target, "bluetooth0");
+  if (bt >= 0) {
+   const char *status = fdt_getprop(target, bt, "status", NULL);
+   if (fault == 21 || fault == 22) {
+    assert(status && !strcmp(status, "disabled"));
+   } else {
+    const char *names[] = {"local-bd-address", "brcm,taurus-cal-blob", "brcm,taurus-bf-cal-blob"};
+    int sn = fdt_path_offset(source, "bluetooth0");
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+     int expected_len;
+     const void *expected = fdt_getprop(source, sn, names[i], &expected_len);
+     const void *actual = fdt_getprop(target, bt, names[i], &len);
+     assert(expected && actual && len == expected_len && !memcmp(expected, actual, len));
+    }
+   }
+  }
+ for (unsigned port = 0; port < 2; port++) {
+  const char *alias = port ? "atcphy1" : "atcphy0";
+  int phy = fdt_path_offset(target, alias);
+  if (phy >= 0) {
+   bool usb2_only = fdt_stringlist_count(target, phy, "reg-names") == 2;
+   const char *names[] = {"apple,tunable-usb3-axi2af", "apple,tunable-usb3-lioa",
+                         "apple,tunable-usb3-fabric", "apple,tunable-usb3-config",
+                         "apple,tunable-usb3-common", "apple,tunable-usb3-efuse",
+                         "apple,tunable-usb3-dp",
+                         "apple,tunable-lane0-usb", "apple,tunable-lane1-usb"};
+   int sn = fdt_path_offset(source, alias);
+   for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    int expected_len;
+    const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
+    if (usb2_only) expected = NULL;
+    const void *actual = fdt_getprop(target, phy, names[i], &len);
+    if (!expected) assert(!actual);
+    else assert(actual && len == expected_len && !memcmp(expected, actual, len));
+   }
+  }
  }
  check_policy(saved, target);
  chosen = fdt_path_offset(target, "/chosen");
@@ -312,6 +426,23 @@ def test_j713_runtime_import(tmp_path):
     for target in [graphics, basic]:
         for fault in range(20):
             subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+
+
+def test_j713_peripheral_calibration(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, peripherals=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, peripherals=True))
+    for fault in [0, *range(20, 29)]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+
+
+def test_j713_optional_multifunction_calibration(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, peripherals=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, peripherals=True))
+    # Missing AUX preserves USB; malformed AUX refuses without publishing changes.
+    for fault in range(29, 35):
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
 
 
 def test_j713_fdt_padding_guard():

@@ -96,7 +96,7 @@ static int j713_map_node(void *dst, const void *src, int sn)
 	static const char * const aliases[] = {
 		"gpu", "dcp", "disp0", "disp0_piodma", "ans", "ans-mbox",
 		"sart-ans", "spmi-primary", "pmu-primary", "pmp", "wifi0",
-		"keyboard",
+		"keyboard", "bluetooth0", "atcphy0", "atcphy1",
 	};
 	char path[J713_FDT_PATH];
 	unsigned int i;
@@ -486,6 +486,112 @@ static int j713_pcie_admission(void *dst, const void *src)
 	return fdt_setprop_string(dst, dn, "status", "disabled");
 }
 
+static int j713_bluetooth(void *dst, const void *src)
+{
+	static const struct j713_property props[] = {
+		{ "bluetooth0", "local-bd-address", 6 },
+		{ "bluetooth0", "brcm,taurus-cal-blob", -1 },
+		{ "bluetooth0", "brcm,taurus-bf-cal-blob", -1 },
+	};
+	int dn = j713_alias_node(dst, "bluetooth0");
+	int sn = j713_alias_node(src, "bluetooth0");
+	unsigned int i;
+	int len, ret;
+
+	/* Older OS trees have no Bluetooth node. Do not extend their topology. */
+	if (dn == -FDT_ERR_NOTFOUND)
+		return 0;
+	if (dn < 0 || fdt_node_check_compatible(dst, dn, "pci14e4,5f72"))
+		return -EINVAL;
+	/* A bootloader without this device's calibration cannot admit it. */
+	if (sn == -FDT_ERR_NOTFOUND)
+		return fdt_setprop_string(dst, dn, "status", "disabled");
+	if (sn < 0 || fdt_node_check_compatible(src, sn, "pci14e4,5f72"))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(props); i++) {
+		if (!fdt_getprop(src, sn, props[i].property, &len) || !len)
+			return fdt_setprop_string(dst, dn, "status", "disabled");
+		ret = j713_copy_prop(dst, dn, src, sn, props[i].property, props[i].size);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int j713_atc_tunables(void *dst, const void *src, const char *alias)
+{
+	static const struct {
+		const char *name;
+		const char *bank;
+	} props[] = {
+		{ "apple,tunable-usb3-axi2af", "axi2af" },
+		{ "apple,tunable-usb3-lioa", "lioa" },
+		{ "apple,tunable-usb3-fabric", "fabric" },
+		{ "apple,tunable-usb3-config", "common-config" },
+		{ "apple,tunable-usb3-common", "core" },
+		{ "apple,tunable-usb3-efuse", "core" },
+		{ "apple,tunable-usb3-dp", "core" },
+		{ "apple,tunable-lane0-usb", "core" },
+		{ "apple,tunable-lane1-usb", "core" },
+	};
+	int dn = j713_alias_node(dst, alias), sn = j713_alias_node(src, alias);
+	unsigned int i;
+	int ret, reg_len;
+	bool usb2_only;
+
+	if (dn == -FDT_ERR_NOTFOUND)
+		return 0;
+	if (dn < 0 || fdt_node_check_compatible(dst, dn, "apple,t8132-atcphy"))
+		return -EINVAL;
+	if (sn >= 0 && fdt_node_check_compatible(src, sn, "apple,t8132-atcphy"))
+		return -EINVAL;
+	if (sn < 0 && sn != -FDT_ERR_NOTFOUND)
+		return -EINVAL;
+	/* An OS may retain USB2 on a port whose common bank is not admitted.
+	 * Calibration does not authorize importing the missing USB3 topology.
+	 */
+	usb2_only = fdt_stringlist_count(dst, dn, "reg-names") == 2 &&
+		fdt_stringlist_search(dst, dn, "reg-names", "usb2phy") == 0 &&
+		fdt_stringlist_search(dst, dn, "reg-names", "pipehandler") == 1 &&
+		fdt_getprop(dst, dn, "reg", &reg_len) && reg_len == 32;
+	for (i = 0; i < ARRAY_SIZE(props); i++) {
+		const fdt32_t *value = NULL, *reg;
+		int len, bank, parent, reg_len, j;
+		u64 size;
+
+		if (!usb2_only && sn >= 0)
+			value = fdt_getprop(src, sn, props[i].name, &len);
+		if (!value) {
+			/* Never reuse calibration left in an OS tree from another boot. */
+			ret = fdt_delprop(dst, dn, props[i].name);
+			if (ret && ret != -FDT_ERR_NOTFOUND)
+				return ret;
+			continue;
+		}
+		if (len <= 0 || len > J713_FDT_MAX_SOURCE || len % 12)
+			return -EINVAL;
+		parent = fdt_parent_offset(dst, dn);
+		bank = fdt_stringlist_search(dst, dn, "reg-names", props[i].bank);
+		reg = fdt_getprop(dst, dn, "reg", &reg_len);
+		if (parent < 0 || fdt_address_cells(dst, parent) != 2 ||
+		    fdt_size_cells(dst, parent) != 2 || bank < 0 || !reg ||
+		    reg_len % 16 || bank >= reg_len / 16)
+			return -EINVAL;
+		size = (u64)fdt32_to_cpu(reg[bank * 4 + 2]) << 32 |
+		       fdt32_to_cpu(reg[bank * 4 + 3]);
+		for (j = 0; j < len / 4; j += 3) {
+			u32 offset = fdt32_to_cpu(value[j]);
+
+			if (offset % 4 || (u64)offset + 4 > size)
+				return -EINVAL;
+		}
+		ret = fdt_setprop(dst, dn, props[i].name, value, len);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int j713_devices(void *dst, const void *src)
 {
 	static const struct j713_property props[] = {
@@ -800,6 +906,9 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = j713_reservations(scratch, source);
 	ret = ret ?: j713_cpus(scratch, source);
 	ret = ret ?: j713_devices(scratch, source);
+	ret = ret ?: j713_bluetooth(scratch, source);
+	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy0");
+	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy1");
 	ret = ret ?: j713_pcie_admission(scratch, source);
 	ret = ret ?: j713_display_refs(scratch, source);
 	ret = ret ?: j713_chosen(scratch, source);

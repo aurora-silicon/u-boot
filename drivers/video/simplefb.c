@@ -20,6 +20,8 @@ static int simple_video_probe(struct udevice *dev)
 	fdt_addr_t base;
 	fdt_size_t size;
 	u32 width, height, stride;
+	u32 width_mm, height_mm;
+	ofnode panel;
 
 	base = dev_read_addr_size(dev, &size);
 	if (base == FDT_ADDR_T_NONE) {
@@ -50,6 +52,16 @@ static int simple_video_probe(struct udevice *dev)
 	uc_priv->rot = ofnode_read_u32_default(node, "rot", 0);
 	uc_priv->xsize = width;
 	uc_priv->ysize = height;
+
+	/* Optional - the physical size of the panel, as Linux's simpledrm */
+	panel = ofnode_parse_phandle(node, "panel", 0);
+	if (ofnode_valid(panel) &&
+	    !ofnode_read_u32(panel, "width-mm", &width_mm) &&
+	    !ofnode_read_u32(panel, "height-mm", &height_mm) &&
+	    width_mm <= USHRT_MAX && height_mm <= USHRT_MAX) {
+		uc_priv->width_mm = width_mm;
+		uc_priv->height_mm = height_mm;
+	}
 
 	/* Optional - in most cases, auto-calculation works */
 	ret = ofnode_read_u32(node, "stride", &stride);

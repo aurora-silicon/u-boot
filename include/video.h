@@ -81,6 +81,8 @@ enum video_format {
  * @vidconsole_drv_name:	Driver to use for the text console, NULL to
  *		select automatically
  * @font_size:	Font size in pixels (0 to use a default value)
+ * @width_mm:	Physical width of the display in millimetres, 0 if unknown
+ * @height_mm:	Physical height of the display in millimetres, 0 if unknown
  * @fb:		Frame buffer
  * @fb_size:	Frame buffer size
  * @copy_fb:	Copy of the frame buffer to keep up to date; see struct
@@ -111,6 +113,8 @@ struct video_priv {
 	enum video_format format;
 	const char *vidconsole_drv_name;
 	int font_size;
+	ushort width_mm;
+	ushort height_mm;
 
 	/*
 	 * Things that are private to the uclass: don't use these in the

@@ -209,6 +209,21 @@ int draw_cursor_vertically(void **line, struct video_priv *vid_priv,
 
 int console_probe(struct udevice *dev)
 {
+	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
+	struct video_fontdata *font;
+
+	/*
+	 * The first font is the default.  On a HiDPI display, use a built-in
+	 * font twice its size instead, if there is one.
+	 */
+	if (fonts->name && video_is_hidpi(vid_priv)) {
+		for (font = fonts; font->name; font++) {
+			if (font->width == 2 * fonts->width &&
+			    font->height == 2 * fonts->height)
+				return console_set_font(dev, font);
+		}
+	}
+
 	return console_set_font(dev, fonts);
 }
 

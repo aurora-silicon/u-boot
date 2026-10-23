@@ -220,6 +220,150 @@ static int dm_test_video_text_12x22(struct unit_test_state *uts)
 }
 DM_TEST(dm_test_video_text_12x22, UTF_SCAN_PDATA | UTF_SCAN_FDT);
 
+/* Test the choice between normal and double-size text */
+static int dm_test_video_hidpi(struct unit_test_state *uts)
+{
+	struct video_priv priv = {};
+
+	/* 2408x1506 on a 13-inch panel, 219 dpi */
+	priv.xsize = 2408;
+	priv.ysize = 1506;
+	priv.width_mm = 279;
+	priv.height_mm = 175;
+	ut_assert(video_is_hidpi(&priv));
+
+	/* The same panel turned by 90 degrees */
+	priv.rot = 1;
+	ut_assert(video_is_hidpi(&priv));
+	priv.rot = 0;
+
+	/* 2560x1600 on a 13.3-inch panel, 227 dpi */
+	priv.xsize = 2560;
+	priv.ysize = 1600;
+	priv.width_mm = 286;
+	priv.height_mm = 179;
+	ut_assert(video_is_hidpi(&priv));
+
+	/* A 27-inch 4K monitor, 163 dpi */
+	priv.xsize = 3840;
+	priv.ysize = 2160;
+	priv.width_mm = 597;
+	priv.height_mm = 336;
+	ut_assert(!video_is_hidpi(&priv));
+
+	/* A 24-inch 1080p monitor, 92 dpi */
+	priv.xsize = 1920;
+	priv.ysize = 1080;
+	priv.width_mm = 531;
+	priv.height_mm = 299;
+	ut_assert(!video_is_hidpi(&priv));
+
+	/* Dense, but with too few rows: 1280x800 on 7 inches */
+	priv.xsize = 1280;
+	priv.ysize = 800;
+	priv.width_mm = 151;
+	priv.height_mm = 94;
+	ut_assert(!video_is_hidpi(&priv));
+
+	/* Only the aspect ratio in place of the size: guess */
+	priv.xsize = 3840;
+	priv.ysize = 2160;
+	priv.width_mm = 160;
+	priv.height_mm = 90;
+	ut_assert(video_is_hidpi(&priv));
+	priv.xsize = 1920;
+	priv.ysize = 1080;
+	ut_assert(!video_is_hidpi(&priv));
+
+	/* Unknown size: guess from the resolution */
+	priv.width_mm = 0;
+	priv.height_mm = 0;
+	ut_assert(!video_is_hidpi(&priv));
+	priv.xsize = 2560;
+	priv.ysize = 1440;
+	ut_assert(!video_is_hidpi(&priv));
+	priv.xsize = 2880;
+	priv.ysize = 1620;
+	ut_assert(video_is_hidpi(&priv));
+	priv.xsize = 5120;
+	priv.ysize = 2880;
+	ut_assert(video_is_hidpi(&priv));
+	priv.xsize = 2408;
+	priv.ysize = 1506;
+	ut_assert(!video_is_hidpi(&priv));
+
+	/* 3:2, either way up */
+	priv.xsize = 1800;
+	priv.ysize = 1200;
+	ut_assert(video_is_hidpi(&priv));
+	priv.xsize = 1200;
+	priv.ysize = 1800;
+	ut_assert(video_is_hidpi(&priv));
+	priv.xsize = 1500;
+	priv.ysize = 1000;
+	ut_assert(!video_is_hidpi(&priv));
+
+	return 0;
+}
+DM_TEST(dm_test_video_hidpi, 0);
+
+/* Test that the text console uses a double-size font on a HiDPI panel */
+static int dm_test_video_hidpi_font(struct unit_test_state *uts)
+{
+	struct vidconsole_priv *vc_priv;
+	struct sandbox_sdl_plat *plat;
+	struct udevice *dev, *con;
+
+	ut_assertok(select_vidconsole(uts, "vidconsole0"));
+	ut_assertok(uclass_find_first_device(UCLASS_VIDEO, &dev));
+	plat = dev_get_plat(dev);
+	plat->xres = 2408;
+	plat->yres = 1506;
+	plat->width_mm = 279;
+	plat->height_mm = 175;
+	ut_assertok(video_get_nologo(uts, &dev));
+	ut_assertok(uclass_get_device(UCLASS_VIDEO_CONSOLE, 0, &con));
+	vc_priv = dev_get_uclass_priv(con);
+
+	if (IS_ENABLED(CONFIG_VIDEO_FONT_16X32)) {
+		ut_asserteq(16, vc_priv->x_charsize);
+		ut_asserteq(32, vc_priv->y_charsize);
+		ut_asserteq(150, vc_priv->cols);
+		ut_asserteq(47, vc_priv->rows);
+	} else {
+		ut_asserteq(8, vc_priv->x_charsize);
+		ut_asserteq(16, vc_priv->y_charsize);
+	}
+
+	return 0;
+}
+DM_TEST(dm_test_video_hidpi_font, UTF_SCAN_PDATA | UTF_SCAN_FDT);
+
+/* Test that the text console keeps the default font on other displays */
+static int dm_test_video_lodpi_font(struct unit_test_state *uts)
+{
+	struct vidconsole_priv *vc_priv;
+	struct sandbox_sdl_plat *plat;
+	struct udevice *dev, *con;
+
+	ut_assertok(select_vidconsole(uts, "vidconsole0"));
+	ut_assertok(uclass_find_first_device(UCLASS_VIDEO, &dev));
+	plat = dev_get_plat(dev);
+	/* 1366x768 on 15.6 inches, 100 dpi */
+	plat->width_mm = 344;
+	plat->height_mm = 193;
+	ut_assertok(video_get_nologo(uts, &dev));
+	ut_assertok(uclass_get_device(UCLASS_VIDEO_CONSOLE, 0, &con));
+	vc_priv = dev_get_uclass_priv(con);
+	ut_asserteq(8, vc_priv->x_charsize);
+	ut_asserteq(16, vc_priv->y_charsize);
+	ut_asserteq(170, vc_priv->cols);
+	ut_asserteq(48, vc_priv->rows);
+
+	return 0;
+}
+DM_TEST(dm_test_video_lodpi_font, UTF_SCAN_PDATA | UTF_SCAN_FDT);
+
 /* Test handling of special characters in the console */
 static int dm_test_video_chars(struct unit_test_state *uts)
 {

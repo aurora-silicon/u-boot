@@ -380,6 +380,20 @@ void video_set_default_colors(struct udevice *dev, bool invert);
 void video_set_white_on_black(struct udevice *dev, bool white_on_black);
 
 /**
+ * video_is_hidpi() - Check whether a display wants text at twice the size
+ *
+ * With its physical size known, a display is HiDPI when it has more than 192
+ * pixels per inch both ways and at least 1200 rows, the rule with which
+ * Plymouth 24 scales its splash by two.  Otherwise its resolution decides,
+ * as in Plymouth's guess: at least 2880x1620, or 1800x1200 for a 3:2
+ * display.
+ *
+ * @priv:	video device's uclass data
+ * Return: true if the display is HiDPI
+ */
+bool video_is_hidpi(const struct video_priv *priv);
+
+/**
  * video_default_font_height() - Get the default font height
  *
  * @dev:	video device

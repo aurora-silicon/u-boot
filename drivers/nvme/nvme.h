@@ -627,6 +627,11 @@ struct nvme_dev {
 	u32 prp_entry_num;
 	u32 nn;
 	/*
+	 * Highest namespace ID to create a block device for, 0 for all.
+	 * Controller drivers may set this before calling nvme_init().
+	 */
+	u32 max_ns_id;
+	/*
 	 * The controller stopped completing commands, or its driver found it
 	 * dead: every command fails at once instead of timing out.
 	 */

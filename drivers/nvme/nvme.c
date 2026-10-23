@@ -992,6 +992,7 @@ int nvme_init(struct udevice *udev)
 {
 	struct nvme_dev *ndev = dev_get_priv(udev);
 	struct nvme_id_ns *id;
+	u32 nn;
 	int ret;
 
 	ndev->udev = udev;
@@ -1047,7 +1048,11 @@ int nvme_init(struct udevice *udev)
 		goto free_prp_pool;
 	}
 
-	for (int i = 1; i <= ndev->nn; i++) {
+	nn = ndev->nn;
+	if (ndev->max_ns_id && ndev->max_ns_id < nn)
+		nn = ndev->max_ns_id;
+
+	for (int i = 1; i <= nn; i++) {
 		struct udevice *ns_udev;
 		char name[20];
 

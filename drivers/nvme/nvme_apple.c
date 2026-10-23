@@ -93,6 +93,8 @@ struct ans_nvmmu_tcb {
  */
 struct apple_nvme_hw {
 	bool post_m4;
+	/* Highest namespace ID to expose, 0 for all */
+	u32 max_ns_id;
 };
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
@@ -106,6 +108,15 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
  */
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.post_m4 = true,
+	/*
+	 * Only namespace 1 holds anything a boot loader can use.  The others
+	 * (2 to 4 on the A18 Pro) are small system namespaces that the
+	 * firmware handles specially: a Flush to one of them is fatal to it.
+	 * Without block devices for them, nothing in U-Boot or a boot loader
+	 * on top of it (GRUB searching every disk for a file system, say)
+	 * sends them commands.
+	 */
+	.max_ns_id = 1,
 };
 
 struct apple_nvme_priv {
@@ -542,6 +553,7 @@ static int apple_nvme_probe(struct udevice *dev)
 	}
 
 	strcpy(priv->ndev.vendor, "Apple");
+	priv->ndev.max_ns_id = priv->hw->max_ns_id;
 
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)

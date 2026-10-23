@@ -626,6 +626,11 @@ struct nvme_dev {
 	u64 *prp_pool;
 	u32 prp_entry_num;
 	u32 nn;
+	/*
+	 * The controller stopped completing commands, or its driver found it
+	 * dead: every command fails at once instead of timing out.
+	 */
+	bool failed;
 };
 
 /* Admin queue and a single I/O queue. */
@@ -708,6 +713,18 @@ struct nvme_ops {
 	 * Return: 0 if OK, -ve on error
 	 */
 	int (*queue_created)(struct nvme_queue *nvmeq);
+	/**
+	 * poll - Controller-specific work while waiting for the controller
+	 *
+	 * Called repeatedly while a command, or a change of the controller
+	 * state, is outstanding, for controllers whose firmware needs the
+	 * host's attention to make progress.
+	 *
+	 * @dev:   NVM Express device
+	 * Return: 0 if OK, -ve if the controller can no longer complete
+	 *         commands
+	 */
+	int (*poll)(struct nvme_dev *dev);
 };
 
 /**

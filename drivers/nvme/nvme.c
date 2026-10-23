@@ -44,6 +44,28 @@ static inline void nvme_invalidate_cache_aligned(uintptr_t addr, int length)
 	invalidate_dcache_range(start_addr, end_addr);
 }
 
+/**
+ * nvme_poll_ctrl() - let the controller driver work while we wait
+ *
+ * A controller found dead stays failed: every later command fails at once.
+ *
+ * @dev:	The NVM Express device
+ * Return: 0 if OK, -EIO if the controller can no longer complete commands
+ */
+static int nvme_poll_ctrl(struct nvme_dev *dev)
+{
+	struct nvme_ops *ops = (struct nvme_ops *)dev->udev->driver->ops;
+
+	if (dev->failed)
+		return -EIO;
+	if (ops && ops->poll && ops->poll(dev)) {
+		dev->failed = true;
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static int nvme_wait_csts(struct nvme_dev *dev, u32 mask, u32 val)
 {
 	int timeout;
@@ -56,6 +78,8 @@ static int nvme_wait_csts(struct nvme_dev *dev, u32 mask, u32 val)
 	while (get_timer(start) < timeout) {
 		if ((readl(&dev->bar->csts) & mask) == val)
 			return 0;
+		if (nvme_poll_ctrl(dev))
+			return -EIO;
 	}
 
 	return -ETIME;
@@ -202,6 +226,8 @@ static int nvme_reap_timed_out(struct nvme_queue *nvmeq, unsigned int timeout)
 
 	while ((nvme_read_completion_status(nvmeq, head) & 0x01) !=
 	       nvmeq->cq_phase) {
+		if (nvme_poll_ctrl(nvmeq->dev))
+			return -EIO;
 		if (timeout_us > 0 &&
 		    (timer_get_us() - start_time) >= timeout_us)
 			return -ETIMEDOUT;
@@ -233,6 +259,10 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 	ulong start_time;
 	ulong timeout_us = timeout * 100000;
 
+	/* A controller found dead fails every command at once. */
+	if (nvmeq->dev->failed)
+		return -EIO;
+
 	/* Never submit over a command that is still outstanding. */
 	if (nvme_reap_timed_out(nvmeq, timeout)) {
 		printf("Error: nvme: queue %d still has a command outstanding\n",
@@ -251,6 +281,10 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 		status = nvme_read_completion_status(nvmeq, head);
 		if ((status & 0x01) == phase)
 			break;
+		if (nvme_poll_ctrl(nvmeq->dev)) {
+			nvmeq->timed_out = true;
+			return -EIO;
+		}
 		if (timeout_us > 0 && (timer_get_us() - start_time)
 		    >= timeout_us) {
 			pr_warn("nvme: cmd %#x timed out\n", cmd->common.command_id);

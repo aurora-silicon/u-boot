@@ -19,7 +19,7 @@ static int simple_video_probe(struct udevice *dev)
 	int ret;
 	fdt_addr_t base;
 	fdt_size_t size;
-	u32 width, height, stride, rot;
+	u32 width, height, stride;
 
 	base = dev_read_addr_size(dev, &size);
 	if (base == FDT_ADDR_T_NONE) {
@@ -47,8 +47,7 @@ static int simple_video_probe(struct udevice *dev)
 		log_err("%s: invalid width or height: %d\n", __func__, ret);
 		return ret ?: -EINVAL;
 	}
-	ofnode_read_u32(node, "rot", &rot);
-	uc_priv->rot = rot;
+	uc_priv->rot = ofnode_read_u32_default(node, "rot", 0);
 	uc_priv->xsize = width;
 	uc_priv->ysize = height;
 

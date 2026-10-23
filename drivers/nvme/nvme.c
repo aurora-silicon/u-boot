@@ -248,6 +248,8 @@ static int nvme_reap_timed_out(struct nvme_queue *nvmeq, unsigned int timeout)
 	return 0;
 }
 
+static int nvme_reset_ctrl(struct nvme_dev *dev);
+
 static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 				struct nvme_command *cmd,
 				u32 *result, unsigned timeout)
@@ -263,8 +265,12 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 	if (nvmeq->dev->failed)
 		return -EIO;
 
-	/* Never submit over a command that is still outstanding. */
-	if (nvme_reap_timed_out(nvmeq, timeout)) {
+	/*
+	 * Never submit over a command that is still outstanding.  If it does
+	 * not complete, a controller reset gives it up, where supported.
+	 */
+	if (nvme_reap_timed_out(nvmeq, timeout) &&
+	    (nvmeq->dev->failed || nvme_reset_ctrl(nvmeq->dev))) {
 		printf("Error: nvme: queue %d still has a command outstanding\n",
 		       nvmeq->qid);
 		return -EIO;
@@ -460,6 +466,7 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
 
 static int nvme_configure_admin_queue(struct nvme_dev *dev)
 {
+	bool allocated = false;
 	int result;
 	u32 aqa;
 	u64 cap = dev->cap;
@@ -490,6 +497,7 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 		nvmeq = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
 		if (!nvmeq)
 			return -ENOMEM;
+		allocated = true;
 	}
 
 	aqa = nvmeq->q_depth - 1;
@@ -517,7 +525,9 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 	return result;
 
  free_nvmeq:
-	nvme_free_queues(dev, 0);
+	/* A controller reset keeps its queues even if it fails. */
+	if (allocated)
+		nvme_free_queues(dev, 0);
 
 	return result;
 }
@@ -735,6 +745,60 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	result = nvme_create_io_queues(dev);
 	if (result)
 		return result;
+
+	return 0;
+}
+
+/**
+ * nvme_reset_ctrl() - recover from a command that never completed
+ *
+ * Have the controller driver stop the controller, which gives up every
+ * command it holds, then set up the same queues again, empty.  If that
+ * fails, the controller is marked failed and every later command fails at
+ * once.
+ *
+ * @dev:	The NVM Express device
+ * Return: 0 if the controller can take commands again, -ve otherwise
+ */
+static int nvme_reset_ctrl(struct nvme_dev *dev)
+{
+	struct nvme_ops *ops = (struct nvme_ops *)dev->udev->driver->ops;
+	int i, ret;
+
+	if (!ops || !ops->reset_ctrl)
+		return -ENOSYS;
+	/* A command of the reset itself never completed. */
+	if (dev->resetting)
+		return -EBUSY;
+
+	dev->resetting = true;
+	ret = ops->reset_ctrl(dev);
+	if (ret == -EOPNOTSUPP) {
+		/* Not for this controller: leave it as it is. */
+		dev->resetting = false;
+		return ret;
+	}
+	if (!ret) {
+		for (i = 0; i < dev->queue_count; i++) {
+			if (dev->queues[i])
+				dev->queues[i]->timed_out = false;
+		}
+		dev->online_queues = 0;
+		ret = nvme_configure_admin_queue(dev);
+	}
+	if (!ret)
+		ret = nvme_setup_io_queues(dev);
+
+	dev->resetting = false;
+	if (ret) {
+		printf("Error: nvme: %s: a command never completed and a reset failed (%d), giving up on the controller\n",
+		       dev->udev->name, ret);
+		dev->failed = true;
+		return ret;
+	}
+
+	printf("nvme: %s: reset after a command that never completed\n",
+	       dev->udev->name);
 
 	return 0;
 }
@@ -1112,10 +1176,11 @@ int nvme_retire_io_queues(struct udevice *udev)
 			continue;
 		/*
 		 * The next owner must not inherit a command in flight.  Wait a
-		 * bounded time for one that timed out, then delete the queue
-		 * anyway.
+		 * bounded time for one that timed out, reset the controller if
+		 * it does not complete, then delete the queue anyway.
 		 */
-		if (nvme_reap_timed_out(ndev->queues[qid], IO_TIMEOUT)) {
+		if (nvme_reap_timed_out(ndev->queues[qid], IO_TIMEOUT) &&
+		    (ndev->failed || nvme_reset_ctrl(ndev))) {
 			printf("Error: %s: I/O queue %d still has a command outstanding\n",
 			       udev->name, qid);
 			ret = -EIO;

@@ -365,17 +365,70 @@ static bool apple_nvme_ans_running(struct apple_nvme_priv *priv)
 }
 
 /*
+ * Stop a post-M4 controller: only a completed disable stops its DMA and
+ * gives up the commands it holds.  Retire the I/O queue addresses first,
+ * as for a handoff: the disable must not meet a controller that still
+ * advertises live I/O queues.
+ */
+static int apple_nvme_disable_post_m4(struct apple_nvme_priv *priv)
+{
+	u32 csts;
+
+	nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
+	nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
+	writel(readl(&priv->ndev.bar->cc) & ~NVME_CC_ENABLE,
+	       &priv->ndev.bar->cc);
+	if (apple_nvme_wait_disabled(priv, &csts)) {
+		printf("%s: controller did not disable (CSTS %#x)\n",
+		       priv->ndev.udev->name, csts);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+/* Program a disabled post-M4 controller for our queues. */
+static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
+{
+	struct udevice *dev = priv->ndev.udev;
+	u32 ioqa;
+
+	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
+	if (!(readl(priv->base + ANS_LINEAR_SQ_CTRL) & ANS_LINEAR_SQ_CTRL_EN)) {
+		dev_err(dev, "failed to enable linear submission queues\n");
+		return -EIO;
+	}
+
+	/*
+	 * On post-M4 this register is IOQA: both fields hold the zero-based
+	 * I/O queue size, like AQA.  Programming the entry count instead makes
+	 * the firmware reject the CQ head once the queue wraps.
+	 */
+	ioqa = (ANS_MAX_QUEUE_DEPTH - 1) | ((ANS_MAX_QUEUE_DEPTH - 1) << 16);
+	writel(ioqa, priv->base + ANS_MAX_PEND_CMDS_CTRL);
+	if (readl(priv->base + ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
+		dev_err(dev, "failed to program the I/O queue aperture\n");
+		return -EIO;
+	}
+
+	writel(ANS_MAX_QUEUE_DEPTH - 1, priv->nvmmu + ANS_NVMMU_NUM);
+
+	return 0;
+}
+
+/*
  * Post-M4: take over the ANS session the previous boot stage left running.
  * HELLO and the endpoint map are one-time messages of an RTKit session, so
- * the firmware is left alone entirely -- no RTKit, no SART, no reset -- and
- * only the NVMe controller and its queues are reprogrammed.  An enabled
- * controller is disabled first, exactly as Linux does when it adopts the
- * session.
+ * the firmware is left alone -- no RTKit handshake, no SART, no reset; we
+ * only answer what it waits for -- and only the NVMe controller and its
+ * queues are reprogrammed.  An enabled controller is disabled first,
+ * exactly as Linux does when it adopts the session.
  */
 static int apple_nvme_adopt(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
-	u32 ioqa, csts, cc;
+	u32 csts, cc;
+	int ret;
 
 	if (!apple_nvme_ans_running(priv)) {
 		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x): post-M4 ANS can only be adopted from the boot loader\n",
@@ -406,41 +459,55 @@ static int apple_nvme_adopt(struct udevice *dev)
 	 * queues may still be live) before touching any queue register.
 	 */
 	if (cc & NVME_CC_ENABLE) {
-		/*
-		 * Retire the previous owner's I/O queue addresses first, as our
-		 * own handoff does: the disable must not meet a controller that
-		 * still advertises live I/O queues.
-		 */
-		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
-		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
-		writel(cc & ~NVME_CC_ENABLE, &priv->ndev.bar->cc);
-		if (apple_nvme_wait_disabled(priv, &csts)) {
-			dev_err(dev, "inherited controller did not disable (CSTS %#x)\n",
-				csts);
-			return -ETIMEDOUT;
-		}
+		ret = apple_nvme_disable_post_m4(priv);
+		if (ret)
+			return ret;
 	}
 
-	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
-	if (!(readl(priv->base + ANS_LINEAR_SQ_CTRL) & ANS_LINEAR_SQ_CTRL_EN)) {
-		dev_err(dev, "failed to enable linear submission queues\n");
-		return -EIO;
-	}
-
-	/*
-	 * On post-M4 this register is IOQA: both fields hold the zero-based
-	 * I/O queue size, like AQA.  Programming the entry count instead makes
-	 * the firmware reject the CQ head once the queue wraps.
-	 */
-	ioqa = (ANS_MAX_QUEUE_DEPTH - 1) | ((ANS_MAX_QUEUE_DEPTH - 1) << 16);
-	writel(ioqa, priv->base + ANS_MAX_PEND_CMDS_CTRL);
-	if (readl(priv->base + ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
-		dev_err(dev, "failed to program the I/O queue aperture\n");
-		return -EIO;
-	}
-
-	writel(ANS_MAX_QUEUE_DEPTH - 1, priv->nvmmu + ANS_NVMMU_NUM);
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
 	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/*
+ * Recover from a command that never completed.  Post-M4 firmware cannot be
+ * restarted, but stopping the controller gives up its commands and stops
+ * their DMA, as Linux does on a timeout.  Then set up the controller as
+ * when adopting it.  U-Boot never resets the session it starts on older
+ * controllers, so their stuck queue stays stuck.
+ */
+static int apple_nvme_reset_ctrl(struct nvme_dev *ndev)
+{
+	struct apple_nvme_priv *priv =
+		container_of(ndev, struct apple_nvme_priv, ndev);
+	int qid, ret;
+
+	if (!priv->hw->post_m4)
+		return -EOPNOTSUPP;
+
+	ret = apple_nvme_disable_post_m4(priv);
+	if (ret)
+		return ret;
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+
+	/* The commands the TCBs describe are gone. */
+	for (qid = 0; qid < NVME_Q_NUM; qid++) {
+		if (!priv->tcbs[qid])
+			continue;
+		memset(priv->tcbs[qid], 0, ANS_NVMMU_TCB_SIZE);
+		flush_dcache_range((ulong)priv->tcbs[qid],
+				   (ulong)priv->tcbs[qid] + ANS_NVMMU_TCB_SIZE);
+	}
+	nvme_writeq((ulong)priv->tcbs[NVME_ADMIN_Q],
+		    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
+	nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+		    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
 
 	return 0;
 }
@@ -618,6 +685,7 @@ static const struct nvme_ops apple_nvme_ops = {
 	.complete_cmd = apple_nvme_complete_cmd,
 	.queue_created = apple_nvme_queue_created,
 	.poll = apple_nvme_poll,
+	.reset_ctrl = apple_nvme_reset_ctrl,
 };
 
 static const struct udevice_id apple_nvme_ids[] = {

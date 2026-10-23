@@ -636,6 +636,8 @@ struct nvme_dev {
 	 * dead: every command fails at once instead of timing out.
 	 */
 	bool failed;
+	/* The controller is being reset (see nvme_ops.reset_ctrl) */
+	bool resetting;
 };
 
 /* Admin queue and a single I/O queue. */
@@ -730,6 +732,22 @@ struct nvme_ops {
 	 *         commands
 	 */
 	int (*poll)(struct nvme_dev *dev);
+	/**
+	 * reset_ctrl - Stop the controller so that it can be set up again
+	 *
+	 * Called to recover from a command that never completes: disable
+	 * the controller, which gives up every command it holds and stops
+	 * their DMA, and leave it ready for its admin queue to be set up.
+	 * The queues are then created again, empty.  Without this operation
+	 * a queue with a command that never completes stays unusable; if it
+	 * fails, the controller is marked failed.
+	 *
+	 * @dev:   NVM Express device
+	 * Return: 0 if OK, -EOPNOTSUPP if this controller cannot be reset
+	 *         (it is then left as without the operation), other -ve
+	 *         value on error
+	 */
+	int (*reset_ctrl)(struct nvme_dev *dev);
 };
 
 /**
@@ -744,7 +762,8 @@ int nvme_init(struct udevice *udev);
  *
  * For handing a controller to a next stage that takes it over without a
  * reset: only the admin queue is left, idle.  A command that timed out is
- * waited for first, for a bounded time.
+ * waited for first, for a bounded time, and if it does not complete the
+ * controller is reset where its driver supports that.
  *
  * @udev:	The NVM Express device
  * Return: 0 if OK, -ve on error

@@ -626,6 +626,18 @@ struct nvme_dev {
 	u64 *prp_pool;
 	u32 prp_entry_num;
 	u32 nn;
+	/*
+	 * Highest namespace ID to create a block device for, 0 for all.
+	 * Controller drivers may set this before calling nvme_init().
+	 */
+	u32 max_ns_id;
+	/*
+	 * The controller stopped completing commands, or its driver found it
+	 * dead: every command fails at once instead of timing out.
+	 */
+	bool failed;
+	/* The controller is being reset (see nvme_ops.reset_ctrl) */
+	bool resetting;
 };
 
 /* Admin queue and a single I/O queue. */
@@ -708,6 +720,34 @@ struct nvme_ops {
 	 * Return: 0 if OK, -ve on error
 	 */
 	int (*queue_created)(struct nvme_queue *nvmeq);
+	/**
+	 * poll - Controller-specific work while waiting for the controller
+	 *
+	 * Called repeatedly while a command, or a change of the controller
+	 * state, is outstanding, for controllers whose firmware needs the
+	 * host's attention to make progress.
+	 *
+	 * @dev:   NVM Express device
+	 * Return: 0 if OK, -ve if the controller can no longer complete
+	 *         commands
+	 */
+	int (*poll)(struct nvme_dev *dev);
+	/**
+	 * reset_ctrl - Stop the controller so that it can be set up again
+	 *
+	 * Called to recover from a command that never completes: disable
+	 * the controller, which gives up every command it holds and stops
+	 * their DMA, and leave it ready for its admin queue to be set up.
+	 * The queues are then created again, empty.  Without this operation
+	 * a queue with a command that never completes stays unusable; if it
+	 * fails, the controller is marked failed.
+	 *
+	 * @dev:   NVM Express device
+	 * Return: 0 if OK, -EOPNOTSUPP if this controller cannot be reset
+	 *         (it is then left as without the operation), other -ve
+	 *         value on error
+	 */
+	int (*reset_ctrl)(struct nvme_dev *dev);
 };
 
 /**
@@ -722,7 +762,8 @@ int nvme_init(struct udevice *udev);
  *
  * For handing a controller to a next stage that takes it over without a
  * reset: only the admin queue is left, idle.  A command that timed out is
- * waited for first, for a bounded time.
+ * waited for first, for a bounded time, and if it does not complete the
+ * controller is reset where its driver supports that.
  *
  * @udev:	The NVM Express device
  * Return: 0 if OK, -ve on error

@@ -81,6 +81,8 @@ enum video_format {
  * @vidconsole_drv_name:	Driver to use for the text console, NULL to
  *		select automatically
  * @font_size:	Font size in pixels (0 to use a default value)
+ * @width_mm:	Physical width of the display in millimetres, 0 if unknown
+ * @height_mm:	Physical height of the display in millimetres, 0 if unknown
  * @fb:		Frame buffer
  * @fb_size:	Frame buffer size
  * @copy_fb:	Copy of the frame buffer to keep up to date; see struct
@@ -111,6 +113,8 @@ struct video_priv {
 	enum video_format format;
 	const char *vidconsole_drv_name;
 	int font_size;
+	ushort width_mm;
+	ushort height_mm;
 
 	/*
 	 * Things that are private to the uclass: don't use these in the
@@ -374,6 +378,20 @@ void video_set_default_colors(struct udevice *dev, bool invert);
  * @white_on_black: true to use white-on-black, false for black-on-white
  */
 void video_set_white_on_black(struct udevice *dev, bool white_on_black);
+
+/**
+ * video_is_hidpi() - Check whether a display wants text at twice the size
+ *
+ * With its physical size known, a display is HiDPI when it has more than 192
+ * pixels per inch both ways and at least 1200 rows, the rule with which
+ * Plymouth 24 scales its splash by two.  Otherwise its resolution decides,
+ * as in Plymouth's guess: at least 2880x1620, or 1800x1200 for a 3:2
+ * display.
+ *
+ * @priv:	video device's uclass data
+ * Return: true if the display is HiDPI
+ */
+bool video_is_hidpi(const struct video_priv *priv);
 
 /**
  * video_default_font_height() - Get the default font height

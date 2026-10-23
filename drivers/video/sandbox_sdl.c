@@ -39,6 +39,8 @@ static int sandbox_sdl_probe(struct udevice *dev)
 	uc_priv->rot = plat->rot;
 	uc_priv->vidconsole_drv_name = plat->vidconsole_drv_name;
 	uc_priv->font_size = plat->font_size;
+	uc_priv->width_mm = plat->width_mm;
+	uc_priv->height_mm = plat->height_mm;
 	if (IS_ENABLED(CONFIG_VIDEO_COPY))
 		uc_plat->copy_base = uc_plat->base + uc_plat->size / 2;
 

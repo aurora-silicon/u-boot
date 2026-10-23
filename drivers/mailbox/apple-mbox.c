@@ -8,6 +8,7 @@
 #include <asm/io.h>
 #include <linux/apple-mailbox.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 
 #define REG_A2I_STAT	0x110
 #define  REG_A2I_STAT_EMPTY	BIT(17)
@@ -19,6 +20,9 @@
 #define REG_A2I_MSG1	0x808
 #define REG_I2A_MSG0	0x830
 #define REG_I2A_MSG1	0x838
+
+/* How long the coprocessor may leave the A2I FIFO full */
+#define APPLE_MBOX_TX_TIMEOUT_US	1000000
 
 struct apple_mbox_priv {
 	void *base;
@@ -37,13 +41,18 @@ static int apple_mbox_send(struct mbox_chan *chan, const void *data)
 {
 	struct apple_mbox_priv *priv = dev_get_priv(chan->dev);
 	const struct apple_mbox_msg *msg = data;
+	u32 stat;
 
 	writeq(msg->msg0, priv->base + REG_A2I_MSG0);
 	writeq(msg->msg1, priv->base + REG_A2I_MSG1);
-	while (readl(priv->base + REG_A2I_STAT) & REG_A2I_STAT_FULL)
-		udelay(1);
 
-	return 0;
+	/*
+	 * Wait for room for the next message, but not forever: a coprocessor
+	 * that has stopped taking messages must not hang its caller.
+	 */
+	return readl_poll_sleep_timeout(priv->base + REG_A2I_STAT, stat,
+					!(stat & REG_A2I_STAT_FULL), 1,
+					APPLE_MBOX_TX_TIMEOUT_US);
 }
 
 static int apple_mbox_recv(struct mbox_chan *chan, void *data)

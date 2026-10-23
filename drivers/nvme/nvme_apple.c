@@ -8,11 +8,15 @@
 #include <mapmem.h>
 #include "nvme.h"
 #include <reset.h>
+#include <time.h>
 #include <dm/device_compat.h>
 
 #include <asm/io.h>
 #include <asm/arch/rtkit.h>
 #include <asm/arch/sart.h>
+#include <linux/apple-mailbox.h>
+#include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
 
@@ -42,6 +46,19 @@
 
 #define ANS_NVMMU_TCB_SIZE	0x4000
 #define ANS_NVMMU_TCB_PITCH	0x80
+
+/*
+ * RTKit messages that a post-M4 ANS sends while U-Boot drives it.  The
+ * session belongs to the boot loader that started the firmware and passes
+ * on to the OS; U-Boot only answers what the firmware waits for, as an OS
+ * does for a session it adopts.
+ */
+#define ANS_RTKIT_EP_CRASHLOG	1
+#define ANS_RTKIT_EP_SYSLOG	2
+#define ANS_RTKIT_EP_IOREPORT	4
+#define ANS_RTKIT_MSG_TYPE	GENMASK_ULL(59, 52)
+#define  ANS_RTKIT_SYSLOG_LOG	5
+#define ANS_MBOX_POLL_MAX	16
 
 /*
  * The Apple NVMe controller includes an IOMMU known as NVMMU.  The
@@ -76,6 +93,8 @@ struct ans_nvmmu_tcb {
  */
 struct apple_nvme_hw {
 	bool post_m4;
+	/* Highest namespace ID to expose, 0 for all */
+	u32 max_ns_id;
 };
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
@@ -89,6 +108,15 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
  */
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.post_m4 = true,
+	/*
+	 * Only namespace 1 holds anything a boot loader can use.  The others
+	 * (2 to 4 on the A18 Pro) are small system namespaces that the
+	 * firmware handles specially: a Flush to one of them is fatal to it.
+	 * Without block devices for them, nothing in U-Boot or a boot loader
+	 * on top of it (GRUB searching every disk for a file system, say)
+	 * sends them commands.
+	 */
+	.max_ns_id = 1,
 };
 
 struct apple_nvme_priv {
@@ -99,6 +127,7 @@ struct apple_nvme_priv {
 	void *asc;		/* ASC registers */
 	struct reset_ctl_bulk resets; /* ASC reset */
 	struct mbox_chan chan;
+	bool adopted_mbox;	/* chan carries an adopted RTKit session */
 	struct apple_sart *sart;
 	struct apple_rtkit *rtk;
 	struct ans_nvmmu_tcb *tcbs[NVME_Q_NUM]; /* Submission queue TCBs */
@@ -251,6 +280,84 @@ static int apple_nvme_queue_created(struct nvme_queue *nvmeq)
 	return 0;
 }
 
+/*
+ * Answer the firmware of an adopted session while commands are outstanding.
+ * It writes log records to a ring that its previous owner set up, and once
+ * every record is waiting for an acknowledgment it stops processing
+ * commands.  Acknowledge them unread.
+ */
+static int apple_nvme_poll(struct nvme_dev *ndev)
+{
+	struct apple_nvme_priv *priv =
+		container_of(ndev, struct apple_nvme_priv, ndev);
+	struct apple_mbox_msg msg;
+	bool ack;
+	u64 type;
+	int i;
+
+	if (!priv->adopted_mbox)
+		return 0;
+
+	/* Take what has arrived; the FIFO holds only a few messages. */
+	for (i = 0; i < ANS_MBOX_POLL_MAX; i++) {
+		if (mbox_recv(&priv->chan, &msg, 0))
+			return 0;
+
+		type = FIELD_GET(ANS_RTKIT_MSG_TYPE, msg.msg0);
+		switch (msg.msg1) {
+		case ANS_RTKIT_EP_CRASHLOG:
+			/* Its buffer was set up long ago: this is a crash. */
+			printf("%s: ANS firmware crashed (%#llx)\n",
+			       ndev->udev->name, msg.msg0);
+			priv->adopted_mbox = false;
+			return -EIO;
+		case ANS_RTKIT_EP_SYSLOG:
+			ack = type == ANS_RTKIT_SYSLOG_LOG;
+			break;
+		case ANS_RTKIT_EP_IOREPORT:
+			/* Two notifications that must be acknowledged */
+			ack = type == 0x8 || type == 0xc;
+			break;
+		default:
+			/* Nothing else waits for an answer from us. */
+			ack = false;
+			break;
+		}
+
+		if (ack && mbox_send(&priv->chan, &msg)) {
+			printf("%s: ANS does not take messages\n",
+			       ndev->udev->name);
+			priv->adopted_mbox = false;
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Wait for a controller whose CC.EN was cleared to stop, answering its
+ * firmware meanwhile.  Only then has it given up every command and stopped
+ * its DMA.
+ */
+static int apple_nvme_wait_disabled(struct apple_nvme_priv *priv, u32 *csts)
+{
+	/* CAP.TO is in 500 ms units */
+	ulong timeout = NVME_CAP_TIMEOUT(nvme_readq(&priv->ndev.bar->cap)) * 500;
+	ulong start = get_timer(0);
+
+	for (;;) {
+		*csts = readl(&priv->ndev.bar->csts);
+		if (!(*csts & NVME_CSTS_RDY))
+			return 0;
+		if (apple_nvme_poll(&priv->ndev))
+			return -EIO;
+		if (get_timer(start) >= (timeout ?: 500))
+			return -ETIMEDOUT;
+		udelay(100);
+	}
+}
+
 static bool apple_nvme_ans_running(struct apple_nvme_priv *priv)
 {
 	return (readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN) &&
@@ -258,58 +365,33 @@ static bool apple_nvme_ans_running(struct apple_nvme_priv *priv)
 }
 
 /*
- * Post-M4: take over the ANS session the previous boot stage left running.
- * HELLO and the endpoint map are one-time messages of an RTKit session, so
- * the firmware is left alone entirely -- no RTKit, no SART, no reset -- and
- * only the NVMe controller and its queues are reprogrammed.  An enabled
- * controller is disabled first, exactly as Linux does when it adopts the
- * session.
+ * Stop a post-M4 controller: only a completed disable stops its DMA and
+ * gives up the commands it holds.  Retire the I/O queue addresses first,
+ * as for a handoff: the disable must not meet a controller that still
+ * advertises live I/O queues.
  */
-static int apple_nvme_adopt(struct udevice *dev)
+static int apple_nvme_disable_post_m4(struct apple_nvme_priv *priv)
 {
-	struct apple_nvme_priv *priv = dev_get_priv(dev);
-	u32 ioqa, csts, cc, timeout;
+	u32 csts;
 
-	if (!apple_nvme_ans_running(priv)) {
-		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x): post-M4 ANS can only be adopted from the boot loader\n",
-			readl(priv->asc + REG_CPU_CTRL),
-			readl(priv->base + ANS_BOOT_STATUS));
-		return -ENODEV;
+	nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
+	nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
+	writel(readl(&priv->ndev.bar->cc) & ~NVME_CC_ENABLE,
+	       &priv->ndev.bar->cc);
+	if (apple_nvme_wait_disabled(priv, &csts)) {
+		printf("%s: controller did not disable (CSTS %#x)\n",
+		       priv->ndev.udev->name, csts);
+		return -ETIMEDOUT;
 	}
 
-	csts = readl(&priv->ndev.bar->csts);
-	if (csts & NVME_CSTS_CFS) {
-		dev_err(dev, "inherited controller is in a fatal state (CSTS %#x)\n",
-			csts);
-		return -EIO;
-	}
+	return 0;
+}
 
-	cc = readl(&priv->ndev.bar->cc);
-	printf("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
-	       dev->name, cc, csts);
-
-	/*
-	 * Like Linux, disable an enabled controller (the previous owner's
-	 * queues may still be live) before touching any queue register.
-	 */
-	if (cc & NVME_CC_ENABLE) {
-		/*
-		 * Retire the previous owner's I/O queue addresses first, as our
-		 * own handoff does: the disable must not meet a controller that
-		 * still advertises live I/O queues.
-		 */
-		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
-		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
-		writel(cc & ~NVME_CC_ENABLE, &priv->ndev.bar->cc);
-		timeout = NVME_CAP_TIMEOUT(nvme_readq(&priv->ndev.bar->cap)) * 500;
-		if (readl_poll_sleep_timeout(&priv->ndev.bar->csts, csts,
-					     !(csts & NVME_CSTS_RDY), 100,
-					     (timeout ?: 500) * 1000)) {
-			dev_err(dev, "inherited controller did not disable (CSTS %#x)\n",
-				csts);
-			return -ETIMEDOUT;
-		}
-	}
+/* Program a disabled post-M4 controller for our queues. */
+static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
+{
+	struct udevice *dev = priv->ndev.udev;
+	u32 ioqa;
 
 	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
 	if (!(readl(priv->base + ANS_LINEAR_SQ_CTRL) & ANS_LINEAR_SQ_CTRL_EN)) {
@@ -330,7 +412,102 @@ static int apple_nvme_adopt(struct udevice *dev)
 	}
 
 	writel(ANS_MAX_QUEUE_DEPTH - 1, priv->nvmmu + ANS_NVMMU_NUM);
+
+	return 0;
+}
+
+/*
+ * Post-M4: take over the ANS session the previous boot stage left running.
+ * HELLO and the endpoint map are one-time messages of an RTKit session, so
+ * the firmware is left alone -- no RTKit handshake, no SART, no reset; we
+ * only answer what it waits for -- and only the NVMe controller and its
+ * queues are reprogrammed.  An enabled controller is disabled first,
+ * exactly as Linux does when it adopts the session.
+ */
+static int apple_nvme_adopt(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 csts, cc;
+	int ret;
+
+	if (!apple_nvme_ans_running(priv)) {
+		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x): post-M4 ANS can only be adopted from the boot loader\n",
+			readl(priv->asc + REG_CPU_CTRL),
+			readl(priv->base + ANS_BOOT_STATUS));
+		return -ENODEV;
+	}
+
+	csts = readl(&priv->ndev.bar->csts);
+	if (csts & NVME_CSTS_CFS) {
+		dev_err(dev, "inherited controller is in a fatal state (CSTS %#x)\n",
+			csts);
+		return -EIO;
+	}
+
+	cc = readl(&priv->ndev.bar->cc);
+	printf("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
+	       dev->name, cc, csts);
+
+	/* Only answers to the firmware; the session itself is left alone. */
+	if (mbox_get_by_index(dev, 0, &priv->chan))
+		dev_warn(dev, "no ANS mailbox: firmware messages go unanswered\n");
+	else
+		priv->adopted_mbox = true;
+
+	/*
+	 * Like Linux, disable an enabled controller (the previous owner's
+	 * queues may still be live) before touching any queue register.
+	 */
+	if (cc & NVME_CC_ENABLE) {
+		ret = apple_nvme_disable_post_m4(priv);
+		if (ret)
+			return ret;
+	}
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
 	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/*
+ * Recover from a command that never completed.  Post-M4 firmware cannot be
+ * restarted, but stopping the controller gives up its commands and stops
+ * their DMA, as Linux does on a timeout.  Then set up the controller as
+ * when adopting it.  U-Boot never resets the session it starts on older
+ * controllers, so their stuck queue stays stuck.
+ */
+static int apple_nvme_reset_ctrl(struct nvme_dev *ndev)
+{
+	struct apple_nvme_priv *priv =
+		container_of(ndev, struct apple_nvme_priv, ndev);
+	int qid, ret;
+
+	if (!priv->hw->post_m4)
+		return -EOPNOTSUPP;
+
+	ret = apple_nvme_disable_post_m4(priv);
+	if (ret)
+		return ret;
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+
+	/* The commands the TCBs describe are gone. */
+	for (qid = 0; qid < NVME_Q_NUM; qid++) {
+		if (!priv->tcbs[qid])
+			continue;
+		memset(priv->tcbs[qid], 0, ANS_NVMMU_TCB_SIZE);
+		flush_dcache_range((ulong)priv->tcbs[qid],
+				   (ulong)priv->tcbs[qid] + ANS_NVMMU_TCB_SIZE);
+	}
+	nvme_writeq((ulong)priv->tcbs[NVME_ADMIN_Q],
+		    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
+	nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+		    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
 
 	return 0;
 }
@@ -430,6 +607,7 @@ static int apple_nvme_probe(struct udevice *dev)
 		priv->nvmmu = priv->base;
 	}
 	priv->ndev.bar = priv->base;
+	priv->ndev.udev = dev;
 
 	if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);
@@ -442,6 +620,7 @@ static int apple_nvme_probe(struct udevice *dev)
 	}
 
 	strcpy(priv->ndev.vendor, "Apple");
+	priv->ndev.max_ns_id = priv->hw->max_ns_id;
 
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
@@ -505,6 +684,8 @@ static const struct nvme_ops apple_nvme_ops = {
 	.submit_cmd = apple_nvme_submit_cmd,
 	.complete_cmd = apple_nvme_complete_cmd,
 	.queue_created = apple_nvme_queue_created,
+	.poll = apple_nvme_poll,
+	.reset_ctrl = apple_nvme_reset_ctrl,
 };
 
 static const struct udevice_id apple_nvme_ids[] = {

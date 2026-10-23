@@ -157,6 +157,8 @@ extern struct unit_test_state global_dm_test_state;
  *	2=upside down, 3=90 degree counterclockwise)
  * @vidconsole_drv_name: Name of video console driver (set by tests)
  * @font_size: Console font size to select (set by tests)
+ * @width_mm: Physical width of the display in millimetres (set by tests)
+ * @height_mm: Physical height of the display in millimetres (set by tests)
  */
 struct sandbox_sdl_plat {
 	int xres;
@@ -165,6 +167,8 @@ struct sandbox_sdl_plat {
 	int rot;
 	const char *vidconsole_drv_name;
 	int font_size;
+	int width_mm;
+	int height_mm;
 };
 
 /**

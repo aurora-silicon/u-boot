@@ -610,6 +610,35 @@ static int show_splash(struct udevice *dev)
 	return 0;
 }
 
+bool video_is_hidpi(const struct video_priv *priv)
+{
+	uint width = priv->xsize, height = priv->ysize;
+	uint width_mm = priv->width_mm, height_mm = priv->height_mm;
+
+	/* Some EDIDs hold the aspect ratio instead of the physical size. */
+	if ((width_mm == 160 && (height_mm == 90 || height_mm == 100)) ||
+	    (width_mm == 16 && (height_mm == 9 || height_mm == 10)))
+		width_mm = 0;
+
+	if (width_mm && height_mm) {
+		/* More than 192 dpi is more than 1920 pixels per 254 mm. */
+		return (priv->rot % 2 ? width : height) >= 1200 &&
+		       width * 254 > 1920 * width_mm &&
+		       height * 254 > 1920 * height_mm;
+	}
+
+	if (height > width) {
+		uint tmp = width;
+
+		width = height;
+		height = tmp;
+	}
+	if (width * 2 == height * 3)
+		return width >= 1800 && height >= 1200;
+
+	return width >= 2880 && height >= 1620;
+}
+
 int video_default_font_height(struct udevice *dev)
 {
 	struct vidconsole_priv *vc_priv = dev_get_uclass_priv(dev);

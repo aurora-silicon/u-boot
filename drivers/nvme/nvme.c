@@ -972,7 +972,13 @@ static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 	uintptr_t temp_buffer = (uintptr_t)buffer;
 
 	u64 slba = blknr;
-	u16 lbas = 1 << (dev->max_transfer_shift - ns->lba_shift);
+	/*
+	 * MDTS may allow more blocks than the 16-bit, zero-based Number of
+	 * Logical Blocks field of a command can carry, on a namespace whose
+	 * blocks are small.
+	 */
+	u32 lbas = 1U << min_t(int, dev->max_transfer_shift - ns->lba_shift,
+			       16);
 	u64 total_lbas = blkcnt;
 
 	flush_dcache_range((unsigned long)buffer,
@@ -990,7 +996,7 @@ static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
 
 	while (total_lbas) {
 		if (total_lbas < lbas) {
-			lbas = (u16)total_lbas;
+			lbas = (u32)total_lbas;
 			total_lbas = 0;
 		} else {
 			total_lbas -= lbas;

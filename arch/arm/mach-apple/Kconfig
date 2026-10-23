@@ -28,4 +28,13 @@ config SYS_MALLOC_F_LEN
 config LNX_KRNL_IMG_TEXT_OFFSET_BASE
 	default TEXT_BASE
 
+config APPLE_J713_FDT
+	bool "Support J713 per-kernel device-tree handoff"
+	depends on OF_BOARD_SETUP && APPLE_MTP_KEYB
+	help
+	  Import the live J713 firmware resources into an explicitly selected
+	  kernel device tree. This requires the retained MTP helper and at least
+	  144 KiB of SYS_FDT_PAD. Enable this for the shared Apple boot image;
+	  other Apple configurations can keep their existing FDT allocation.
+
 endif

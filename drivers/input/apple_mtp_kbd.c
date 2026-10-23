@@ -7,9 +7,11 @@
 #include <dm/simple_bus.h>
 #include <dm/device_compat.h>
 #include <dm/device-internal.h>
+#include <dm/uclass-internal.h>
 #include <mailbox.h>
 #include <keyboard.h>
 #include <stdio_dev.h>
+#include <vsprintf.h>
 #include <iomux.h>
 #include <asm/arch/rtkit.h>
 #include <asm/io.h>
@@ -36,6 +38,9 @@ struct apple_mtp_kbd_priv {
 	 * the keyboard interface.
 	 */
 	bool announce;
+	bool j713;
+	bool retained_handoff;
+	int handoff_error;
 	int kbd_iface;
 	u8 tx_seq;
 	u8 *pkt;
@@ -233,6 +238,14 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 	}
 }
 
+static int apple_mtp_kbd_handoff_error(struct apple_mtp_kbd_priv *priv, int error)
+{
+	priv->handoff_error = error;
+	if (priv->helper)
+		apple_rtkit_helper_input_failed(priv->helper);
+	return error;
+}
+
 /* Announcing firmware: read and check a whole packet, then dispatch it. */
 static int apple_mtp_kbd_check_announce(struct input_config *input,
 					struct dchid_hdr *hdr)
@@ -246,34 +259,45 @@ static int apple_mtp_kbd_check_announce(struct input_config *input,
 
 	ret = dockchannel_read(dev, priv->pkt, length + 4);
 	if (ret < 0)
-		return ret;
+		return priv->j713 ? apple_mtp_kbd_handoff_error(priv, ret) : ret;
 
 	if (hdr->hdr_len != sizeof(*hdr) ||
 	    dchid_sum(hdr, sizeof(*hdr)) + dchid_sum(priv->pkt, length + 4) !=
 	    0xffffffff) {
 		dev_err(dev, "bad packet (iface %d, channel %#x)\n",
 			hdr->iface, hdr->channel);
+		if (priv->j713)
+			return apple_mtp_kbd_handoff_error(priv, -EBADMSG);
 		return 0;
 	}
-	if (length < sizeof(*sub))
-		return 0;
 	if (hdr->channel != DCHID_CHANNEL_REPORT)
 		return 0;
+	if (length < sizeof(*sub))
+		return priv->j713 ? apple_mtp_kbd_handoff_error(priv, -EBADMSG) : 0;
 
 	plen = le16_to_cpu(sub->length);
 	if (plen + sizeof(*sub) > length)
-		return 0;
+		return priv->j713 ? apple_mtp_kbd_handoff_error(priv, -EBADMSG) : 0;
 
 	if (hdr->iface == DCHID_IFACE_COMM) {
-		/* Keep the complete INIT packet for Linux's DockChannel probe. */
-		if (plen && priv->pkt[sizeof(*sub)] == DCHID_EVENT_INIT) {
+		/* Linux must see discovery followed by the keyboard's original READY.
+		 * Enabling an already enabled interface need not emit READY again.
+		 */
+		if (plen && (priv->pkt[sizeof(*sub)] == DCHID_EVENT_INIT ||
+		    (priv->j713 && plen >= 2 &&
+		     priv->pkt[sizeof(*sub)] == DCHID_EVENT_READY &&
+		     priv->pkt[sizeof(*sub) + 1] == priv->kbd_iface))) {
 			u32 need = sizeof(*hdr) + length + 4;
 
 			if (!IS_ALIGNED(need, sizeof(u32))) {
-				dev_err(dev, "unaligned init packet (%u bytes)\n", need);
+				dev_err(dev, "unaligned startup packet (%u bytes)\n", need);
+				if (priv->j713)
+					return apple_mtp_kbd_handoff_error(priv, -EBADMSG);
 			} else if (need > priv->fifo_size - priv->init_size) {
 				dev_err(dev, "out of init buffer space (%u > %u)\n",
 					need, priv->fifo_size - priv->init_size);
+				if (priv->j713)
+					return apple_mtp_kbd_handoff_error(priv, -ENOSPC);
 			} else {
 				u8 *p = priv->init_data + priv->init_size;
 
@@ -303,8 +327,8 @@ static int apple_mtp_kbd_check(struct input_config *input)
 	int ret;
 
 	/* Poll for syslogs if RTKit is up */
-	if (priv->helper)
-		apple_rtkit_helper_poll(priv->helper, 0);
+	if (priv->helper && apple_rtkit_helper_poll(priv->helper, 0) == -ENODEV)
+		return 0;
 
 	pending = readl(priv->local + DATA_RX_COUNT);
 	if (pending < 8)
@@ -372,6 +396,13 @@ static int get_rtkit_helper(struct udevice *dev)
 		return ret;
 
 	of_mtp = ofnode_get_by_phandle(phandle);
+	if (of_machine_is_compatible("apple,j713")) {
+		/* Never retry an unprepared or failed J713 coprocessor boot. */
+		ret = uclass_find_device_by_ofnode(UCLASS_MISC, of_mtp, &priv->helper);
+		if (ret)
+			return ret;
+		return apple_rtkit_helper_input_prepared(priv->helper) ? 0 : -ENODEV;
+	}
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, of_mtp, &priv->helper);
 	if (ret < 0)
 		return ret;
@@ -390,12 +421,17 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * J813's MTP firmware cold-boots correctly, but restarting it after
-	 * U-Boot's RTKit shutdown crashes while restoring its logging state.
-	 * Leave the helper and its FIFOs untouched so Linux owns the first boot.
+	 * J813 cannot restart MTP after U-Boot shuts it down. J713 retains its
+	 * running helper and replays discovery packets to Linux at OS handoff.
 	 */
 	if (of_machine_is_compatible("apple,j813"))
 		return -ENODEV;
+	priv->j713 = of_machine_is_compatible("apple,j713");
+	if (priv->j713) {
+		ret = get_rtkit_helper(dev);
+		if (ret)
+			return ret;
+	}
 
 	reg = dev_read_addr_name(dev, "data");
 	if (reg == FDT_ADDR_T_NONE) {
@@ -439,11 +475,13 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	writel(sizeof(struct dchid_hdr), priv->config + DCHID_RX_THRESH);
 	writel(priv->rx_irq_mask, priv->irq_base + DCHID_IRQ_MASK);
 
-	ret = get_rtkit_helper(dev);
-	if (ret < 0) {
-		dev_err(dev, "Failed to get helper device (%d)\n", ret);
-		writel(0, priv->irq_base + DCHID_IRQ_MASK);
-		return ret;
+	if (!priv->j713) {
+		ret = get_rtkit_helper(dev);
+		if (ret < 0) {
+			dev_err(dev, "Failed to get helper device (%d)\n", ret);
+			writel(0, priv->irq_base + DCHID_IRQ_MASK);
+			return ret;
+		}
 	}
 
 	priv->init_data = malloc(priv->fifo_size);
@@ -451,7 +489,12 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 		return -ENOMEM;
 
 	priv->kbd_iface = -1;
-	priv->announce = dev_read_bool(dev, "apple,no-stm");
+	/* J713 has STM, but its keyboard also needs explicit interface enable.
+	 * Discovery framing is independent of the optional STM identity service.
+	 * Preserve every INIT packet for Linux, including STM and trackpad.
+	 */
+	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
+			 of_machine_is_compatible("apple,j713");
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {
@@ -468,14 +511,55 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	return input_stdio_register(sdev);
 }
 
-static int apple_mtp_kbd_remove(struct udevice *dev)
+/* Refuse observed concurrent writes while restoring complete startup frames. */
+static int apple_mtp_kbd_replay_count(struct apple_mtp_kbd_priv *priv,
+				    u32 expected, ulong start)
+{
+	for (;;) {
+		u32 count = readl(priv->local + DATA_RX_COUNT);
+
+		if (count > expected)
+			return -EAGAIN;
+		if (count == expected)
+			return 0;
+		if (get_timer(start) >= 100)
+			return -ETIME;
+	}
+}
+
+static int apple_mtp_kbd_replay_j713(struct apple_mtp_kbd_priv *priv)
+{
+	ulong start = get_timer(0);
+	u32 offset;
+	int ret;
+
+	while (readl(priv->rmt + DATA_TX_FREE) < priv->init_size) {
+		if (get_timer(start) >= 100)
+			return -ETIME;
+	}
+	for (offset = 0; offset < priv->init_size; offset += sizeof(u32)) {
+		ret = apple_mtp_kbd_replay_count(priv, offset, start);
+		if (ret)
+			return ret;
+		if (readl(priv->rmt + DATA_TX_FREE) < sizeof(u32))
+			return -ENOSPC;
+		writel(get_unaligned_le32(priv->init_data + offset),
+		       priv->rmt + DATA_TX32);
+	}
+	return apple_mtp_kbd_replay_count(priv, priv->init_size, start);
+}
+
+static int apple_mtp_kbd_handoff(struct udevice *dev)
 {
 	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
 	struct keyboard_priv *uc_priv = dev_get_uclass_priv(dev);
 	struct input_config *input = &uc_priv->input;
+	ulong start;
 	int i, ret;
 
 	if (priv->helper) {
+		if (priv->j713)
+			priv->retained_handoff = apple_rtkit_helper_input_retained(priv->helper);
 		ret = device_remove(priv->helper, DM_REMOVE_NORMAL);
 		if (ret)
 			return ret;
@@ -484,16 +568,34 @@ static int apple_mtp_kbd_remove(struct udevice *dev)
 	writel(0, priv->irq_base + DCHID_IRQ_MASK);
 	writel(priv->rx_irq_mask, priv->irq_base + DCHID_IRQ_FLAG);
 
-	/* Drain the FIFO */
+	/* Optional startup failure disabled the outgoing input nodes. There
+	 * is no running session to replay, and a partial FIFO may never grow. */
+	if (priv->j713 && !priv->retained_handoff)
+		goto free_cache;
+	if (priv->j713 && priv->handoff_error)
+		return priv->handoff_error;
+
+	/* A stopped producer may leave a partial header that never grows. */
+	start = get_timer(0);
 	while (readl(priv->local + DATA_RX_COUNT)) {
-		if (apple_mtp_kbd_check(input) < 0) {
+		if (priv->j713 && get_timer(start) >= 100)
+			return -ETIME;
+		ret = apple_mtp_kbd_check(input);
+		if (ret < 0) {
 			dev_err(dev, "Failed to drain FIFO\n");
+			if (priv->j713)
+				return ret;
 			break;
 		}
 	}
 
-	/* Stuff init messages back into FIFO for the next stage to find */
-	if (priv->announce) {
+	/* Replay the validated discovery and keyboard READY in their wire order. */
+	if (priv->j713) {
+		ret = apple_mtp_kbd_replay_j713(priv);
+		if (ret)
+			return ret;
+		printf("mtpkbd: replayed %u startup bytes for Linux\n", priv->init_size);
+	} else if (priv->announce) {
 		/* T8140 aborts byte writes to DATA_TX8. */
 		for (i = 0; i < priv->init_size; i += sizeof(u32))
 			writel(get_unaligned_le32(priv->init_data + i),
@@ -502,10 +604,23 @@ static int apple_mtp_kbd_remove(struct udevice *dev)
 		for (i = 0; i < priv->init_size; i++)
 			writel(priv->init_data[i], priv->rmt + DATA_TX8);
 	}
+free_cache:
 	free(priv->pkt);
 	free(priv->init_data);
 
 	return 0;
+}
+
+static int apple_mtp_kbd_remove(struct udevice *dev)
+{
+	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
+	int ret = apple_mtp_kbd_handoff(dev);
+
+	/* EFI and booti discard device-remove errors. A published session
+	 * must not enter Linux with missing or interleaved startup packets. */
+	if (ret && priv->j713)
+		panic("J713: refusing OS entry after MTP handoff error %d", ret);
+	return ret;
 }
 
 static int apple_mtp_kbd_bind(struct udevice *dev)
@@ -557,7 +672,6 @@ U_BOOT_DRIVER(dockchannel) = {
 #include <command.h>
 #include <env.h>
 #include <dm/lists.h>
-#include <dm/uclass-internal.h>
 
 /* Bind (if needed) and probe the device for @node under its parent */
 static int mtpkbd_bind_node(ofnode node, struct udevice **devp)

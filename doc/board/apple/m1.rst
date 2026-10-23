@@ -51,6 +51,74 @@ This initial J813 path does not qualify storage, USB host devices, input,
 networking, native GPU/display drivers or SMP. The existing M1/M2 hardware
 support list above does not apply to J813.
 
+M4 J713 boot
+------------
+
+J713/T8132 uses ``apple_m1_defconfig`` and ``u-boot-nodtb.bin``. The control
+DT used for building is not the runtime DT: m1n1 supplies the J713 tree,
+its usable DRAM banks, firmware reservations and inherited framebuffer.
+The T8132 map includes the ANS/NVMMU, PCIe and both ATC apertures; every
+incoming DRAM bank is mapped before EFI can allocate from it.
+
+This is the bootloader companion to the basic Linux support in
+https://github.com/aurora-silicon/linux/pull/366 and the m1n1 review
+branch at https://github.com/aurora-silicon/m1n1/tree/m4/pr1-basic-bringup.
+The firmware resource handoff supports the basic framebuffer boot and
+later native graphics without activating a GPU or DCP driver here.
+
+J713 uses the shared internal-ESP EFI boot flow: the ESP UUID supplied by
+m1n1 selects ``EFI/BOOT/BOOTAA64.EFI``, with the prepared runtime FDT.
+Saved environment overrides remain effective.
+
+The shared post-M4 NVMe driver adopts the live ANS firmware session and
+keeps it running at OS handoff. Do not reset that coprocessor or reclaim
+its firmware buffers between m1n1, U-Boot and Linux. Native GPU and DCP
+firmware mappings remain owned by the OS drivers.
+
+Initialize J713's RTKit helper, retain its buffers and bypass stream, and
+publish the inherited-session marker for Linux. U-Boot enables only the keyboard
+interface and saves complete DockChannel INIT packets plus the keyboard READY event
+for Linux to discover all interfaces and adopt the already enabled keyboard.
+Late mailbox startup must finish until a HID
+header is pending before publishing that marker. Firmware DRAM buffers are
+described by no-map reserved-memory nodes, consumed by both the EFI memory map
+and Linux. The helper's ``memory-region`` references these DRAM reservations.
+``apple,rtkit-buffers`` contains five-cell tuples: endpoint, address high/low,
+exact protocol byte size and the original request's ``is_mapped`` flag. The
+last flag records whether firmware supplied the address; SRAM placement is
+validated independently. The ``mtp-live-v1`` marker permits Linux to preload
+that inventory before receiving RTKit traffic. The legacy inherited marker
+remains for stable kernels that preserve the session without servicing it.
+If optional input initialization or handoff fails, stop the helper
+before freeing its buffers, disable its outgoing DT nodes and continue booting.
+This retained input contract applies only to J713. Its built-in keyboard is
+registered as ``mtpkbd`` alongside the other console inputs, including EFI
+ConIn. Keyboard setup uses the announcement parser even though J713 has an STM
+interface: STM identity discovery remains Linux's responsibility. Before OS
+entry, U-Boot drains reports and replays the saved INIT packets and the original
+keyboard READY in their wire order, using word-wide FIFO writes while leaving
+the helper, buffers and DART bypass live.
+Replay waits for FIFO space, bounds draining, and refuses observed concurrent
+writes; this shared FIFO has no established packet-atomic producer lock. The
+trackpad is configured by Linux after that replay. J813 remains excluded from
+this keyboard transport.
+
+A failed J713 startup is not retried by keyboard probing. The helper stops
+accepting buffer requests after publishing its OS inventory. A stopped helper
+is no longer polled. An incomplete startup cache disables a first optional
+input handoff; if a session was already published, cache or replay errors
+panic before OS entry without revoking its live reservations. EFI and direct
+boot discard driver removal errors, so returning an error would not protect
+that contract. That session requires a reboot before retrying input
+initialization. Physical typing at the handoff
+boundary remains a separate hardware test.
+
+The per-UKI ``u-boot,j713-dtb-imported`` marker reports runtime import only;
+optional input may still be disabled. Input qualification must separately check
+``apple,rtkit-handoff = "mtp-live-v1"``, its buffer inventory and reservations,
+the running ASC, and physical keyboard/trackpad response. A marker alone does
+not establish that the coprocessor is live.
+
 Building U-Boot
 ---------------
 
@@ -79,6 +147,61 @@ can be found here:
 
 This uses ``u-boot-nodtb.bin`` as the device tree is passed to U-Boot
 by m1n1 after making some adjustments.
+
+Per-kernel J713 device trees
+----------------------------
+
+J713 may boot an OS-supplied DTB through ``EFI_DT_FIXUP_PROTOCOL``, including
+the ``.dtb`` section of a systemd-stub unified kernel image. This lets a new
+kernel use its own platform descriptions while older fallback kernels keep
+the original DTB bundled with m1n1.
+
+The shared ``apple_m1_defconfig`` enables ``APPLE_J713_FDT`` with the retained
+MTP helper. Configurations for other Apple systems may omit this option and
+keep their existing FDT padding and input configuration.
+
+The OS tree opts in by supplying ``/chosen/u-boot,j713-dtb-source`` as a
+NUL-terminated string containing its 40 lowercase hexadecimal source commit
+characters. Both trees must identify J713 and T8132. U-Boot imports this boot's
+CPU release slots, firmware memory reservations, ANS/SPMI resources, firmware
+identities, PMP tunables, calibration, framebuffer and native graphics handoff.
+References to reserved memory and display devices are translated to the OS
+tree's phandles. PMGR ownership, power domains, pinctrl, clocks and all other
+static topology remain the OS tree's descriptions.
+
+The import is bounded to source trees and used OS-tree data of at most 128 KiB;
+``SYS_FDT_PAD`` provides 256 KiB for the runtime additions. Unsupported address
+cell layouts, missing CPU release slots, incomplete resource descriptions and
+unknown reserved-memory properties cause refusal before the live input helper
+is touched. The currently supported DMA-parent layout is the J713 structural
+parent, without a ``dma-mem`` interconnect. A basic platform DTB may omit the
+GPU and display devices; their firmware carveouts remain reserved without
+references to the omitted devices. CPU configurations that differ from m1n1's
+available set need explicit support rather than invented release addresses.
+
+Import validation and allocation use a scratch tree. A failed import changes
+neither the OS tree nor m1n1's control tree. The existing RTKit helper then
+publishes its actual current input session, including explicit disabled input
+if that optional initialization failed. After those fixups U-Boot publishes
+``/chosen/u-boot,j713-dtb-imported = <1>``. Repeated preparation of the same
+session is supported.
+
+If a later candidate cannot describe an already-published input session,
+its fixup fails so EFI can keep the prior device tree and live session.
+
+systemd-stub may continue with its original firmware DTB if an embedded tree's
+fixups fail. Qualification must therefore inspect both marker properties in
+the running flattened device tree and inspect the new platform descriptions;
+a successful kernel boot alone does not establish use of the new DTB.
+The unmarked legacy path does not use this import.
+
+J713 peripheral calibration export requires ``atcphy0`` and ``atcphy1``
+aliases to the ``apple,t8132-atcphy`` nodes in m1n1's control DTB, and a
+``bluetooth0`` alias to the ``pci14e4,5f72`` endpoint. Without matching
+source nodes and calibration, Bluetooth remains disabled and no USB3
+calibration is imported. An explicitly USB2-only OS port stays USB2;
+calibration never adds registers or changes power ownership. Malformed
+supplied calibration refuses the candidate transactionally.
 
 Image installation
 ------------------

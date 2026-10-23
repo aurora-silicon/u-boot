@@ -11,7 +11,9 @@
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <time.h>
 #include <linux/ioport.h>
+#include <linux/delay.h>
 #include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
@@ -19,6 +21,7 @@
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
+#include <asm/arch/j713_fdt.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -849,6 +852,76 @@ static struct mm_region t6030_mem_map[] = {
 	}
 };
 
+/* Apple M4 */
+
+static struct mm_region t8132_mem_map[CONFIG_NR_DRAM_BANKS + 10] = {
+	{
+		/* SoC I/O, including PMGR, WD1, MTP, AIC and UART */
+		.virt = 0x380000000,
+		.phys = 0x380000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* USB DWC3, PHY and DART aperture */
+		.virt = 0x400000000,
+		.phys = 0x400000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ANS/NVMe and NVMMU aperture */
+		.virt = 0x480000000,
+		.phys = 0x480000000,
+		.size = SZ_2G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* J713 APCIE ECAM, from its runtime DT (config reg). */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* J713 APCIE endpoint windows (both DT ranges). */
+		.virt = 0xb80000000,
+		.phys = 0xb80000000,
+		.size = SZ_1G + SZ_512M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* GPU and DCP register aperture. */
+		.virt = 0x300000000,
+		.phys = 0x300000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ATC0 I/O */
+		.virt = 0x700000000,
+		.phys = 0x700000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ATC1 I/O */
+		.virt = 0xb00000000,
+		.phys = 0xb00000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
 /* Apple A18 Pro (T8140) */
 
 static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
@@ -977,6 +1050,8 @@ void build_mem_map(void)
 		 of_machine_is_compatible("apple,t6031") ||
 		 of_machine_is_compatible("apple,t6034"))
 		mem_map = t6030_mem_map;
+	else if (of_machine_is_compatible("apple,t8132"))
+		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
@@ -987,7 +1062,9 @@ void build_mem_map(void)
 	else
 		panic("Unsupported SoC\n");
 
-	if (mem_map == t8140_mem_map) {
+	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map) {
+		int ram_slot = mem_map == t8132_mem_map ? 8 : 1;
+
 		/* LMB and EFI see every bank, so the MMU must map every bank. */
 		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
 			base = gd->bd->bi_dram[bank].start;
@@ -996,13 +1073,13 @@ void build_mem_map(void)
 				break;
 			size += base - ALIGN_DOWN(base, SZ_4K);
 			base = ALIGN_DOWN(base, SZ_4K);
-			mem_map[bank + 1].virt = base;
-			mem_map[bank + 1].phys = base;
-			mem_map[bank + 1].size = ALIGN(size, SZ_4K);
-			mem_map[bank + 1].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+			mem_map[bank + ram_slot].virt = base;
+			mem_map[bank + ram_slot].phys = base;
+			mem_map[bank + ram_slot].size = ALIGN(size, SZ_4K);
+			mem_map[bank + ram_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
 						  PTE_BLOCK_INNER_SHARE;
 		}
-		fb_slot = bank + 1;
+		fb_slot = bank + ram_slot;
 		mem_map[fb_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
 					 PTE_BLOCK_INNER_SHARE |
 					 PTE_BLOCK_PXN | PTE_BLOCK_UXN;
@@ -1130,11 +1207,11 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
+ * Aurora Silicon boot flow for J700 (T8140) and J713 (T8132).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
- * path from the internal ESP: shim then loads Fedora GRUB and its BLS entries.
+ * path from the internal ESP, which selects the installed EFI boot manager.
  * If that fails, boot the kernel and initramfs named by /chosen fallback
  * properties, then try generic bootflow.  Both direct and EFI boot pass
  * m1n1's devicetree (${fdtcontroladdr}).  With no
@@ -1143,7 +1220,7 @@ char *env_fat_get_dev_part(void)
  * Nothing here is set if the variable already exists, so a saved
  * uboot.env on the ESP can override any of it.
  */
-static const char * const t8140_env[][2] = {
+static const char * const apple_efi_env[][2] = {
 	{ "aurora_boot",
 	  "echo AURORA_UBOOT_BOOT: EFI on internal ESP; run aurora_efi; "
 	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
@@ -1153,7 +1230,7 @@ static const char * const t8140_env[][2] = {
 	  "if test -n \"${fw_dev_part}\"; then "
 	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
 	  "bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi" },
-	/* Keep MTP untouched even when every boot path fails. */
+	/* Do not restart the HID transport from a failed EFI boot path. */
 	{ "aurora_rescue",
 	  "echo; echo Nothing could be booted. Use the serial console or reset." },
 	{ "aurora_fallback",
@@ -1176,7 +1253,7 @@ static const char * const t8140_env[][2] = {
 };
 
 /* The initramfs the boot loader placed in memory, as "start:size" */
-static void t8140_loader_initrd(ofnode chosen)
+static void apple_loader_initrd(ofnode chosen)
 {
 	u64 start, end;
 	char buf[40];
@@ -1190,15 +1267,15 @@ static void t8140_loader_initrd(ofnode chosen)
 	env_set("aurora_loader_initrd", buf);
 }
 
-static void t8140_late_init(void)
+static void apple_efi_late_init(bool start_keyboard)
 {
 	const char *str;
 	ofnode chosen;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(t8140_env); i++) {
-		if (!env_get(t8140_env[i][0]))
-			env_set(t8140_env[i][0], t8140_env[i][1]);
+	for (i = 0; i < ARRAY_SIZE(apple_efi_env); i++) {
+		if (!env_get(apple_efi_env[i][0]))
+			env_set(apple_efi_env[i][0], apple_efi_env[i][1]);
 	}
 
 	/*
@@ -1218,7 +1295,8 @@ static void t8140_late_init(void)
 		env_set("bootdelay", "1");
 
 	/* EFI ConIn uses the active stdin; keep serial input available. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) && IS_ENABLED(CONFIG_CMDLINE))
+	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    IS_ENABLED(CONFIG_CMDLINE))
 		run_command("mtpkbd start", 0);
 
 	chosen = ofnode_path("/chosen");
@@ -1232,19 +1310,76 @@ static void t8140_late_init(void)
 	if (str && !env_get("aurora_fallback_initrd"))
 		env_set("aurora_fallback_initrd", str);
 
-	t8140_loader_initrd(chosen);
+	apple_loader_initrd(chosen);
+}
+
+/* Prepare the live helper before the keyboard console consumes discovery. */
+static int j713_prepare_input(void)
+{
+	ofnode node, input;
+	struct udevice *helper;
+	fdt_addr_t data;
+	ulong start;
+	int ret, index;
+
+	node = ofnode_by_compatible(ofnode_null(), "apple,t8132-rtk-helper-asc4");
+	if (!ofnode_valid(node))
+		return -ENODEV;
+	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
+	if (ret) {
+		printf("J713: failed to initialize input helper (%d)\n", ret);
+		return ret;
+	}
+	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
+	if (!ofnode_valid(input))
+		return -ENODEV;
+	index = ofnode_stringlist_search(input, "reg-names", "data");
+	if (index < 0)
+		return index;
+	data = ofnode_get_addr_index(input, index);
+	if (data == FDT_ADDR_T_NONE)
+		return -EINVAL;
+
+	/* AP power ON can precede IOReport/buffer requests. Finish those
+	 * startup exchanges before Linux inherits a mailbox it will not poll.
+	 * Observe the first HID header without consuming any FIFO bytes. */
+	start = get_timer(0);
+	while (readl((void *)(data + 0x2c)) < 8 && get_timer(start) < 2000) {
+		ret = apple_rtkit_helper_poll(helper, 0);
+		if (ret && ret != -ETIMEDOUT) {
+			printf("J713: input startup mailbox error %d\n", ret);
+			return ret;
+		}
+		udelay(50);
+	}
+	printf("J713: input discovery FIFO has %u bytes at handoff\n",
+	       readl((void *)(data + 0x2c)));
+	if (readl((void *)(data + 0x2c)) < 8)
+		return -ETIMEDOUT;
+	apple_rtkit_helper_input_ready(helper);
+	return 0;
 }
 
 int board_late_init(void)
 {
+	bool start_keyboard = true;
 	u32 status = 0;
 	phys_addr_t addr;
 
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
 
-	if (of_machine_is_compatible("apple,t8140"))
-		t8140_late_init();
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    of_machine_is_compatible("apple,j713")) {
+		int ret = j713_prepare_input();
+
+		start_keyboard = !ret;
+		if (ret)
+			printf("J713: input unavailable (%d); continuing boot\n", ret);
+	}
+	if (of_machine_is_compatible("apple,t8140") ||
+	    of_machine_is_compatible("apple,t8132"))
+		apple_efi_late_init(start_keyboard);
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M
@@ -1275,11 +1410,28 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	struct udevice *dev;
 	const char *stdoutname;
-	int node, ret;
+	int node, ret, imported;
+
+	imported = 0;
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT))
+		imported = apple_j713_import_fdt(blob, gd->fdt_blob);
+	if (imported < 0) {
+		printf("J713: refused OS devicetree runtime import (%d)\n", imported);
+		return imported;
+	}
 
 	/* Coprocessors handed over running must be described in every case. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
-		apple_rtkit_helper_fdt_fixup(blob);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT) && imported) {
+		ret = apple_j713_complete_fdt(blob);
+		if (ret)
+			return ret;
+		printf("J713: OS devicetree runtime import complete\n");
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

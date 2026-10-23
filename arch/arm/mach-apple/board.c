@@ -1423,8 +1423,15 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	/* Coprocessors handed over running must be described in every case. */
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
 		ret = apple_rtkit_helper_fdt_fixup(blob);
-		if (ret)
+		/*
+		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
+		 * fixup only costs the OS the running session: keep booting.
+		 */
+		if (ret && of_machine_is_compatible("apple,j713"))
 			return ret;
+		if (ret)
+			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",
+			       ret);
 	}
 	if (IS_ENABLED(CONFIG_APPLE_J713_FDT) && imported) {
 		ret = apple_j713_complete_fdt(blob);

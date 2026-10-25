@@ -169,7 +169,7 @@ References to reserved memory and display devices are translated to the OS
 tree's phandles. PMGR ownership, power domains, pinctrl, clocks and all other
 static topology remain the OS tree's descriptions.
 
-The import is bounded to source trees and used OS-tree data of at most 128 KiB;
+The import is bounded to source trees and used OS-tree data of at most 192 KiB;
 ``SYS_FDT_PAD`` provides 256 KiB for the runtime additions. Unsupported address
 cell layouts, missing CPU release slots, incomplete resource descriptions and
 unknown reserved-memory properties cause refusal before the live input helper

@@ -34,7 +34,7 @@ config APPLE_J713_FDT
 	help
 	  Import the live J713 firmware resources into an explicitly selected
 	  kernel device tree. This requires the retained MTP helper and at least
-	  144 KiB of SYS_FDT_PAD. Enable this for the shared Apple boot image;
+	  208 KiB of SYS_FDT_PAD. Enable this for the shared Apple boot image;
 	  other Apple configurations can keep their existing FDT allocation.
 
 endif

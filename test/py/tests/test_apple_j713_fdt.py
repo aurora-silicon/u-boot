@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 
 
-def fixture_tree(runtime, graphics=True, peripherals=False):
+def fixture_tree(runtime, graphics=True, peripherals=False, aop=False):
     shift = 0 if runtime else 1000
     aliases = {
         'ans': '/soc/nvme', 'ans-mbox': '/soc/mailbox', 'sart-ans': '/soc/sart',
@@ -46,6 +46,17 @@ def fixture_tree(runtime, graphics=True, peripherals=False):
                      'iommu-addresses = <10 1 0 0 0x4000>, <11 1 0 0 0x4000>; };'
                      'flash@900080000 { phandle = <301>; reg = <9 0x80000 0 0x4000>;'
                      'compatible = "phram"; label = "adt"; };')
+    if runtime and aop:
+        reserved += ('asc-firmware@9000c0000 { phandle = <310>; reg = <9 0xc0000 0 0x18000>;'
+                     'compatible = "apple,asc-mem"; no-map;'
+                     'iommu-addresses = <50 0x100 0 0 0x18000>; };'
+                     'asc-mmio@388020000 { phandle = <311>; reg = <3 0x88020000 0 0x8000>;'
+                     'compatible = "apple,asc-mmio"; no-map;'
+                     'iommu-addresses = <50 3 0x88020000 0 0x8000>; };')
+    aop_node = ''
+    if aop:
+        aop_node = (f'aop@390600000 {{ compatible = "apple,t8132-aop"; phandle = <{50 if runtime else 1050}>;'
+                    + ('memory-region = <310 311>;' if runtime else '') + '};')
     graphics_nodes = ''
     if graphics:
         gpu_props = ('apple,g16-handoff-version = <1>; apple,firmware-segment-vas = <1 0 1 0x4000>;'
@@ -118,6 +129,7 @@ def fixture_tree(runtime, graphics=True, peripherals=False):
            {'apple,firmware-owned;' if not runtime else ''} }};
         {graphics_nodes}
         {peripheral_nodes}
+        {aop_node}
       }};
     }};'''
 
@@ -271,6 +283,29 @@ int main(int argc, char **argv)
    assert(!fdt_setprop(source, node, "apple,tunable-usb3-axi2af", tuple,
                        fault == 25 ? 8 : sizeof(tuple)));
   }
+  if (fault >= 35 && fault <= 39) {
+   int node = fdt_node_offset_by_compatible(source, -1, "apple,t8132-aop");
+   assert(node >= 0);
+   if (fault == 35) assert(!fdt_setprop_string(source, node, "status", "disabled"));
+   if (fault == 36) {
+    /* m1n1 without the handoff: no AOP in its tree and no reservations. */
+    const char *names[] = {"asc-firmware@9000c0000", "asc-mmio@388020000"};
+    assert(!fdt_del_node(source, node));
+    for (unsigned i = 0; i < 2; i++) {
+     int resv = fdt_subnode_offset(source, fdt_path_offset(source, "/reserved-memory"), names[i]);
+     assert(resv >= 0 && !fdt_del_node(source, resv));
+    }
+   }
+   if (fault == 37) assert(!fdt_setprop_u32(source, node, "memory-region", 0xdead));
+   if (fault == 39) {
+    node = fdt_node_offset_by_compatible(target, -1, "apple,t8132-aop");
+    assert(!fdt_set_name(target, node, "aop@1"));
+   }
+   if (fault == 38) {
+    node = fdt_node_offset_by_compatible(target, -1, "apple,t8132-aop");
+    assert(!fdt_setprop_u32(target, node, "memory-region", 1040));
+   }
+  }
   if (fault == 26 || fault == 28) {
    int node = fdt_path_offset(target, "atcphy0");
    const char names[] = "usb2phy\0pipehandler";
@@ -306,7 +341,7 @@ int main(int argc, char **argv)
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
-  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -323,6 +358,27 @@ int main(int argc, char **argv)
   const char *s = fdt_getprop(target, fdt_path_offset(target, "/soc/pcie@1cb0000000"), "status", NULL);
   assert(s && !strcmp(s, "disabled"));
  }
+  int aop = fdt_node_offset_by_compatible(target, -1, "apple,t8132-aop");
+  if (aop >= 0) {
+   const char *status = fdt_getprop(target, aop, "status", NULL);
+   const fdt32_t *region = fdt_getprop(target, aop, "memory-region", &len);
+   if (fault == 35 || fault == 36 || fault == 39) {
+    assert(status && !strcmp(status, "disabled") && !region);
+   } else if (fault == 38) {
+    assert(!status && region && len == 4 && fdt32_to_cpu(*region) == 1040);
+   } else {
+    /* m1n1's reservations, owned by the OS tree's AOP. */
+    const char *names[] = {"asc-firmware@9000c0000", "asc-mmio@388020000"};
+    u32 phandle = fdt_get_phandle(target, aop);
+    assert(!status && region && len == 8 && phandle);
+    for (unsigned i = 0; i < 2; i++) {
+     int n = fdt_node_offset_by_phandle(target, fdt32_to_cpu(region[i])), ilen;
+     assert(n >= 0 && !strcmp(fdt_get_name(target, n, NULL), names[i]));
+     const fdt32_t *tuple = fdt_getprop(target, n, "iommu-addresses", &ilen);
+     assert(tuple && ilen == 20 && fdt32_to_cpu(tuple[0]) == phandle);
+    }
+   }
+  }
   int bt = fdt_path_offset(target, "bluetooth0");
   if (bt >= 0) {
    const char *status = fdt_getprop(target, bt, "status", NULL);
@@ -443,6 +499,20 @@ def test_j713_optional_multifunction_calibration(tmp_path):
     # Missing AUX preserves USB; malformed AUX refuses without publishing changes.
     for fault in range(29, 35):
         subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+
+
+def test_j713_aop_handoff(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, aop=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, aop=True))
+    # Handed off, refused by m1n1, absent from the control tree, a malformed
+    # reference (refused transactionally), an OS tree with its own regions and
+    # an OS tree whose AOP is not the control tree's.
+    for fault in [0, 35, 36, 37, 38, 39]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without an AOP is untouched by a control tree with one.
+    plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
+    subprocess.run([str(binary), str(source), str(plain), '0'], check=True)
 
 
 def test_j713_fdt_padding_guard():

@@ -724,6 +724,41 @@ static int j713_devices(void *dst, const void *src)
 	return 0;
 }
 
+/* m1n1 publishes this boot's local-policy and iBoot manifests on the node its
+ * sep alias names; the SEP driver refuses to attach without them. An OS tree
+ * without the SEP imports as before. A manifest this boot did not publish,
+ * including from a source tree without the SEP, is removed from the OS tree,
+ * so an older copy never survives.
+ */
+static int j713_sep(void *dst, const void *src)
+{
+	static const char * const names[] = {
+		"local-policy-manifest", "iboot-manifest",
+	};
+	int sn = j713_alias_node(src, "sep"), dn = j713_alias_node(dst, "sep");
+	unsigned int i;
+	int ret;
+
+	if (dn == -FDT_ERR_NOTFOUND)
+		return 0;
+	if (dn < 0 || fdt_node_check_compatible(dst, dn, "apple,sep"))
+		return -EINVAL;
+	if (sn != -FDT_ERR_NOTFOUND &&
+	    (sn < 0 || fdt_node_check_compatible(src, sn, "apple,sep")))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = sn < 0 ? -ENOENT : j713_copy_prop(dst, dn, src, sn, names[i], -1);
+		if (ret == -ENOENT) {
+			ret = fdt_delprop(dst, dn, names[i]);
+			if (ret == -FDT_ERR_NOTFOUND)
+				ret = 0;
+		}
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int j713_display_refs(void *dst, const void *src)
 {
 	static const char * const aliases[] = { "dcp", "disp0", "disp0_piodma" };
@@ -946,6 +981,7 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = j713_reservations(scratch, source);
 	ret = ret ?: j713_cpus(scratch, source);
 	ret = ret ?: j713_devices(scratch, source);
+	ret = ret ?: j713_sep(scratch, source);
 	ret = ret ?: j713_bluetooth(scratch, source);
 	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy0");
 	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy1");

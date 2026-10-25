@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 
 
-def fixture_tree(runtime, graphics=True, peripherals=False, aop=False):
+def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False):
     shift = 0 if runtime else 1000
     aliases = {
         'ans': '/soc/nvme', 'ans-mbox': '/soc/mailbox', 'sart-ans': '/soc/sart',
@@ -23,6 +23,8 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False):
     if peripherals:
         aliases.update(bluetooth0='/soc/bluetooth', atcphy0='/soc/phy0',
                        atcphy1='/soc/phy1')
+    if sep:
+        aliases.update(sep='/soc/sep')
     strings = ['asahi,iboot1-version', 'asahi,iboot2-version', 'asahi,system-fw-version',
                'asahi,os-fw-version', 'asahi,m1n1-stage1-version',
                'asahi,m1n1-stage2-version', 'asahi,efi-system-partition',
@@ -77,6 +79,14 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False):
             display {{ phandle = <{11 + shift}>; iommus = <{30 + shift} 0>; {frontend} }};
         '''
     tunables = 'apple,tunable-test = [01 02 03 04];' if runtime else ''
+    sep_node = ''
+    if sep:
+        # The OS tree carries stale copies, which this boot's must replace.
+        manifests = ('local-policy-manifest = [30 0b 16 04 49 4d 34 4d 02 01 00 31 00];'
+                     'iboot-manifest = [30 0c 16 04 49 4d 34 4d 02 01 00 31 01 00];'
+                     if runtime else
+                     'local-policy-manifest = [de ad]; iboot-manifest = [be ef];')
+        sep_node = f'sep {{ compatible = "apple,sep"; {manifests} status = "disabled"; }};'
     peripheral_nodes = ''
     if peripherals:
         bt = ('local-bd-address = [01 02 03 04 05 06];'
@@ -130,6 +140,7 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False):
         {graphics_nodes}
         {peripheral_nodes}
         {aop_node}
+        {sep_node}
       }};
     }};'''
 
@@ -328,6 +339,14 @@ int main(int argc, char **argv)
    int node = fdt_path_offset(source, "atcphy0");
    assert(!fdt_delprop(source, node, "apple,tunable-usb3-dp"));
   }
+  if (fault == 40 || fault == 43) {
+   int node = fdt_path_offset(source, "sep");
+   assert(!fdt_delprop(source, node, fault == 40 ? "local-policy-manifest" : "iboot-manifest"));
+  }
+  if (fault == 41 || fault == 42) {
+   void *tree = fault == 41 ? target : source;
+   assert(!fdt_setprop_string(tree, fdt_path_offset(tree, "sep"), "compatible", "apple,other"));
+  }
   if (fault >= 30 && fault <= 34) {
    int node = fdt_path_offset(source, "atcphy0");
    fdt32_t tuple[] = {cpu_to_fdt32(fault == 30 ? 0x24000 :
@@ -341,7 +360,7 @@ int main(int argc, char **argv)
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
-  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -377,6 +396,18 @@ int main(int argc, char **argv)
      const fdt32_t *tuple = fdt_getprop(target, n, "iommu-addresses", &ilen);
      assert(tuple && ilen == 20 && fdt32_to_cpu(tuple[0]) == phandle);
     }
+   }
+  }
+  int sep = fdt_path_offset(target, "sep");
+  if (sep >= 0) {
+   const char *names[] = {"local-policy-manifest", "iboot-manifest"};
+   int sn = fdt_path_offset(source, "sep");
+   for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    int expected_len;
+    const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
+    const void *actual = fdt_getprop(target, sep, names[i], &len);
+    if (!expected) assert(!actual);
+    else assert(actual && len == expected_len && !memcmp(expected, actual, len));
    }
   }
   int bt = fdt_path_offset(target, "bluetooth0");
@@ -513,6 +544,22 @@ def test_j713_aop_handoff(tmp_path):
     # An OS tree without an AOP is untouched by a control tree with one.
     plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
     subprocess.run([str(binary), str(source), str(plain), '0'], check=True)
+
+
+def test_j713_sep_manifests(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, sep=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, sep=True))
+    # Both manifests replace stale OS copies; a missing one removes its stale
+    # copy; the OS or the source node not the SEP refuses.
+    for fault in [0, 40, 43, 41, 42]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without the SEP imports as before; a source without it
+    # removes the OS tree's stale copies.
+    basic = compile_tree(tmp_path, 'basic', fixture_tree(False))
+    older = compile_tree(tmp_path, 'older', fixture_tree(True))
+    subprocess.run([str(binary), str(source), str(basic), '0'], check=True)
+    subprocess.run([str(binary), str(older), str(target), '0'], check=True)
 
 
 def test_j713_fdt_padding_guard():

@@ -941,11 +941,11 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 /*
  * Apple M4 Pro (T6040; its blocks carry T6041 compatibles).  Every register
  * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
- * 0x6_0000_0000, apart from the APCIE ECAM, which U-Boot does not use.  The
- * RAM banks and the framebuffer are filled in from the m1n1-prepared FDT,
- * as on T8140.
+ * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
+ * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
+ * T8140.
  */
-static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
+static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 5] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -953,6 +953,22 @@ static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 		.size = 16UL * SZ_1G,
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE ECAM (the DT's config reg) */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE endpoint windows (both DT ranges) */
+		.virt = 0xb80000000,
+		.phys = 0xb80000000,
+		.size = SZ_1G + SZ_512M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
 	}
 };
@@ -1087,7 +1103,8 @@ void build_mem_map(void)
 
 	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
 	    mem_map == t6040_mem_map) {
-		int ram_slot = mem_map == t8132_mem_map ? 8 : 1;
+		int ram_slot = mem_map == t8132_mem_map ? 8 :
+			       mem_map == t6040_mem_map ? 3 : 1;
 
 		/* LMB and EFI see every bank, so the MMU must map every bank. */
 		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {

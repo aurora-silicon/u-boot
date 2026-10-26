@@ -8,6 +8,8 @@
 #include <command.h>
 #include <efi_loader.h>
 #include <env.h>
+#include <fs.h>
+#include <u-boot/uuid.h>
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
@@ -1151,12 +1153,38 @@ u64 get_page_table_size(void)
 	return SZ_256K;
 }
 
+/*
+ * The ESP U-Boot boots from, as "dev:part".  It is the ESP that the boot
+ * loader names in /chosen/asahi,efi-system-partition.  Where that ESP holds
+ * no EFI boot loader but another ESP on the same disk does, the other one is
+ * used: on a Mac whose stub ESP (where Stage 1 finds Stage 2) is not the
+ * ESP of the installed OS, the loader's ESP is the OS's.  The OS is then
+ * told that ESP (see ft_board_setup()), since its firmware and boot files
+ * live there.
+ */
+#define ASAHI_EFI_LOADER	"EFI/BOOT/BOOTAA64.EFI"
+
+static char asahi_esp_uuid[UUID_STR_LEN + 1];
+static bool asahi_esp_moved;
+
+static bool asahi_esp_has_loader(struct blk_desc *desc, int part)
+{
+	if (fs_set_blk_dev_with_part(desc, part))
+		return false;
+
+	return fs_exists(ASAHI_EFI_LOADER);
+}
+
 static char *asahi_esp_devpart(void)
 {
 	struct disk_partition info;
 	struct blk_desc *nvme_blk;
 	const char *uuid = NULL;
-	int devnum, len, p, part, ret;
+	int devnum, len, p, part, named, first, loader;
+	bool named_loader;
+	char named_uuid[UUID_STR_LEN + 1] = "";
+	char loader_uuid[UUID_STR_LEN + 1] = "";
+	char first_uuid[UUID_STR_LEN + 1] = "";
 	static char devpart[64];
 	struct udevice *dev;
 	ofnode node;
@@ -1186,19 +1214,42 @@ static char *asahi_esp_devpart(void)
 		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
 			continue;
 
+		named = first = loader = 0;
+		named_loader = false;
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
-			ret = part_get_info(nvme_blk, p, &info);
-			if (ret < 0)
+			if (part_get_info(nvme_blk, p, &info) < 0)
 				break;
+			if (!(info.bootable & PART_EFI_SYSTEM_PARTITION))
+				continue;
 
-			if (info.bootable & PART_EFI_SYSTEM_PARTITION) {
-				if (uuid && strcasecmp(uuid, info.uuid) == 0) {
-					part = p;
-					break;
-				}
-				if (part == 0)
-					part = p;
+			if (!first) {
+				first = p;
+				strlcpy(first_uuid, info.uuid, sizeof(first_uuid));
 			}
+			if (!named && uuid && !strcasecmp(uuid, info.uuid)) {
+				named = p;
+				strlcpy(named_uuid, info.uuid, sizeof(named_uuid));
+				named_loader = asahi_esp_has_loader(nvme_blk, p);
+				continue;
+			}
+			if (!loader && asahi_esp_has_loader(nvme_blk, p)) {
+				loader = p;
+				strlcpy(loader_uuid, info.uuid, sizeof(loader_uuid));
+			}
+		}
+
+		if (named && (named_loader || !loader)) {
+			part = named;
+			strlcpy(asahi_esp_uuid, named_uuid, sizeof(asahi_esp_uuid));
+		} else if (loader) {
+			part = loader;
+			strlcpy(asahi_esp_uuid, loader_uuid, sizeof(asahi_esp_uuid));
+			asahi_esp_moved = true;
+			printf("ESP: partition %d has the EFI boot loader; the %s ESP (%d) has none\n",
+			       loader, named ? "named" : "first", named ?: first);
+		} else if (first) {
+			part = first;
+			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
 		}
 
 		if (part > 0)
@@ -1465,6 +1516,14 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		if (ret)
 			return ret;
 		printf("J713: OS devicetree runtime import complete\n");
+	}
+
+	/* The OS finds its firmware on the ESP it was booted from. */
+	if (asahi_esp_moved) {
+		node = fdt_path_offset(blob, "/chosen");
+		if (node >= 0)
+			fdt_setprop_string(blob, node, "asahi,efi-system-partition",
+					   asahi_esp_uuid);
 	}
 
 	/*

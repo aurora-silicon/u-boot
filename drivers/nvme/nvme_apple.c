@@ -93,6 +93,12 @@ struct ans_nvmmu_tcb {
  */
 struct apple_nvme_hw {
 	bool post_m4;
+	/*
+	 * LINEAR_SQ_CTRL and the linear submission queue doorbells sit in the
+	 * NVMMU block (at the same offsets), and the firmware has enabled the
+	 * linear queues itself.
+	 */
+	bool lsq_in_nvmmu;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -119,6 +125,19 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.max_ns_id = 1,
 };
 
+/*
+ * T6040 (M4 Pro) with the 26.x ANS firmware: the post-M4 controller, but its
+ * "nvme" register block ends at 0x10000 and the linear submission queue
+ * registers are in the NVMMU block, as in m1n1 (0d2ded8b, "nvme: use the
+ * NVMMU block for the T6040 linear queue registers") and Linux's
+ * apple,t6041-nvme-ans2 entry.
+ */
+static const struct apple_nvme_hw apple_nvme_t6040_hw = {
+	.post_m4 = true,
+	.lsq_in_nvmmu = true,
+	.max_ns_id = 1,
+};
+
 struct apple_nvme_priv {
 	struct nvme_dev ndev;
 	const struct apple_nvme_hw *hw;
@@ -134,11 +153,16 @@ struct apple_nvme_priv {
 	u32 __iomem *q_db[NVME_Q_NUM]; /* Submission queue doorbell */
 };
 
+/* The block holding LINEAR_SQ_CTRL and the linear SQ doorbells */
+static void __iomem *apple_nvme_lsq(struct apple_nvme_priv *priv)
+{
+	return priv->hw->lsq_in_nvmmu ? priv->nvmmu : priv->base;
+}
+
 static int apple_nvme_setup_queue(struct nvme_queue *nvmeq)
 {
 	struct apple_nvme_priv *priv =
 		container_of(nvmeq->dev, struct apple_nvme_priv, ndev);
-	struct nvme_dev *dev = nvmeq->dev;
 
 	switch (nvmeq->qid) {
 	case NVME_ADMIN_Q:
@@ -156,14 +180,12 @@ static int apple_nvme_setup_queue(struct nvme_queue *nvmeq)
 
 	switch (nvmeq->qid) {
 	case NVME_ADMIN_Q:
-		priv->q_db[nvmeq->qid] =
-			((void __iomem *)dev->bar) + ANS_ASQ_DB;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_ASQ_DB;
 		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
 			    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
 		break;
 	case NVME_IO_Q:
-		priv->q_db[nvmeq->qid] =
-			((void __iomem *)dev->bar) + ANS_IOSQ_DB;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_IOSQ_DB;
 		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
 			    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
 		break;
@@ -393,8 +415,10 @@ static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
 	struct udevice *dev = priv->ndev.udev;
 	u32 ioqa;
 
-	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
-	if (!(readl(priv->base + ANS_LINEAR_SQ_CTRL) & ANS_LINEAR_SQ_CTRL_EN)) {
+	if (!priv->hw->lsq_in_nvmmu)
+		writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
+	if (!(readl(apple_nvme_lsq(priv) + ANS_LINEAR_SQ_CTRL) &
+	      ANS_LINEAR_SQ_CTRL_EN)) {
 		dev_err(dev, "failed to enable linear submission queues\n");
 		return -EIO;
 	}
@@ -689,6 +713,8 @@ static const struct nvme_ops apple_nvme_ops = {
 };
 
 static const struct udevice_id apple_nvme_ids[] = {
+	{ .compatible = "apple,t6041-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t6040_hw },
 	{ .compatible = "apple,t8103-nvme-ans2",
 	  .data = (ulong)&apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2",

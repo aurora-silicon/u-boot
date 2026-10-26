@@ -24,6 +24,7 @@
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
 #include <asm/arch/j713_fdt.h>
+#include <asm/arch/nvme_apple.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -1533,6 +1534,13 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		if (ret)
 			return ret;
 		printf("J713: OS devicetree runtime import complete\n");
+	}
+
+	/* RTKit buffers of an ANS session handed on live stay the firmware's. */
+	ret = apple_nvme_fdt_fixup(blob);
+	if (ret) {
+		printf("ANS: cannot reserve its RTKit buffers for the OS (%d)\n", ret);
+		return ret;
 	}
 
 	/* The OS finds its firmware on the ESP it was booted from. */

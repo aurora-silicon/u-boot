@@ -4,8 +4,11 @@
  */
 
 #include <dm.h>
-#include <mailbox.h>
+#include <fdt_support.h>
+#include <lmb.h>
 #include <mapmem.h>
+#include <asm/arch/nvme_apple.h>
+#include <mailbox.h>
 #include "nvme.h"
 #include <reset.h>
 #include <time.h>
@@ -100,9 +103,9 @@ struct apple_nvme_hw {
 	 */
 	bool lsq_in_nvmmu;
 	/*
-	 * A session handed over with the controller disabled sleeps: wake it
-	 * with an RTKit handshake (IOP power state INIT) instead of adopting
-	 * it, as Linux does, and put it back to sleep at handoff.
+	 * The boot loader hands the ANS over before the OS-side RTKit
+	 * handshake, with the controller disabled: run that (one-time)
+	 * handshake here, then hand the live session on as on adoption.
 	 */
 	bool wake_disabled;
 	/* Highest namespace ID to expose, 0 for all */
@@ -268,6 +271,87 @@ static void apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
 	if (++tail == nvmeq->q_depth)
 		tail = 0;
 	nvmeq->sq_tail = tail;
+}
+
+/*
+ * RTKit buffers of a session that U-Boot started and hands on live (see
+ * apple_nvme_wake()).  The firmware keeps writing them after U-Boot exits,
+ * so they come from LMB, never return to it, and are published to the OS
+ * as no-map reserved memory by apple_nvme_fdt_fixup().
+ */
+#define ANS_HANDOFF_MAX_BUFS	8
+
+static struct {
+	phys_addr_t addr;
+	phys_size_t size;
+} ans_handoff_bufs[ANS_HANDOFF_MAX_BUFS];
+static int ans_handoff_nbufs;
+
+static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
+{
+	struct apple_nvme_priv *priv = (struct apple_nvme_priv *)cookie;
+	phys_size_t size;
+	phys_addr_t addr;
+
+	if (!buf || buf->dva || !buf->size ||
+	    ans_handoff_nbufs >= ANS_HANDOFF_MAX_BUFS)
+		return -1;
+
+	size = ALIGN(buf->size, SZ_16K);
+	if (lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_16K, &addr, size,
+			  LMB_NOOVERWRITE))
+		return -ENOMEM;
+	buf->buffer = map_sysmem(addr, size);
+	memset(buf->buffer, 0, size);
+	flush_dcache_range((ulong)buf->buffer, (ulong)buf->buffer + size);
+
+	if (!sart_add_allowed_region(priv->sart, buf->buffer, buf->size)) {
+		lmb_free(addr, size, LMB_NOOVERWRITE);
+		buf->buffer = NULL;
+		return -1;
+	}
+
+	buf->dva = addr;
+	ans_handoff_bufs[ans_handoff_nbufs].addr = addr;
+	ans_handoff_bufs[ans_handoff_nbufs].size = size;
+	ans_handoff_nbufs++;
+
+	return 0;
+}
+
+int apple_nvme_fdt_fixup(void *blob)
+{
+	int resv, sub, i, ret;
+	char name[40];
+	fdt64_t reg[2];
+
+	if (!ans_handoff_nbufs)
+		return 0;
+
+	resv = fdt_path_offset(blob, "/reserved-memory");
+	if (resv < 0)
+		return resv;
+	if (fdt_address_cells(blob, resv) != 2 || fdt_size_cells(blob, resv) != 2)
+		return -EINVAL;
+
+	for (i = 0; i < ans_handoff_nbufs; i++) {
+		snprintf(name, sizeof(name), "ans-rtkit@%llx",
+			 (unsigned long long)ans_handoff_bufs[i].addr);
+		resv = fdt_path_offset(blob, "/reserved-memory");
+		sub = fdt_subnode_offset(blob, resv, name);
+		if (sub == -FDT_ERR_NOTFOUND)
+			sub = fdt_add_subnode(blob, resv, name);
+		if (sub < 0)
+			return sub;
+		reg[0] = cpu_to_fdt64(ans_handoff_bufs[i].addr);
+		reg[1] = cpu_to_fdt64(ans_handoff_bufs[i].size);
+		ret = fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
+		ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int nvme_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
@@ -523,12 +607,17 @@ static int apple_nvme_adopt(struct udevice *dev)
 }
 
 /*
- * Post-M4, T6040: the previous stage handed the ANS over running but with
- * the controller disabled and its RTKit session asleep; the controller never
- * becomes ready until the firmware is woken.  Wake it the way Linux does
- * (apple_rtkit_wake(): IOP power state INIT, then the boot handshake), with
- * RTKit buffers of our own behind the SART.  The coprocessor is never reset
- * or restarted.  apple_nvme_remove() puts it back to sleep.
+ * Post-M4, T6040: the boot loader hands the ANS over running, with the
+ * controller disabled and before the OS-side RTKit handshake (Linux in the
+ * same chain logs "RTKit: Initializing" and a cold "boot: mode normal").
+ * The controller never becomes ready until that handshake has run, and the
+ * firmware takes it once per run: after U-Boot it can neither be repeated
+ * nor be undone by sleeping or stopping the IOP.  So run it here the way
+ * Linux would (IOP power state INIT, then the boot handshake), with buffers
+ * that stay reserved for the firmware, and hand the live session on as on
+ * adoption: apple_nvme_remove() leaves the controller enabled and ready for
+ * Linux to adopt, and apple_nvme_fdt_fixup() reserves the buffers.  The
+ * coprocessor is never reset or restarted.
  */
 static int apple_nvme_wake(struct udevice *dev)
 {
@@ -559,17 +648,17 @@ static int apple_nvme_wake(struct udevice *dev)
 	if (!priv->sart)
 		return -EINVAL;
 
-	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup,
-				     nvme_shmem_destroy);
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup,
+				     NULL);
 	if (!priv->rtk)
 		return -ENOMEM;
 
-	printf("%s: waking the sleeping ANS session (CC %#x CSTS %#x)\n",
+	printf("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
 	       dev->name, readl(&priv->ndev.bar->cc),
 	       readl(&priv->ndev.bar->csts));
 	ret = apple_rtkit_boot(priv->rtk);
 	if (ret < 0) {
-		printf("%s: ANS did not wake (%d)\n", dev->name, ret);
+		printf("%s: ANS RTKit handshake failed (%d)\n", dev->name, ret);
 		return ret;
 	}
 	priv->woken = true;
@@ -577,7 +666,7 @@ static int apple_nvme_wake(struct udevice *dev)
 	ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
 				       stat == ANS_BOOT_STATUS_OK, 100, 500000);
 	if (ret < 0) {
-		printf("%s: ANS did not report ready after waking\n", dev->name);
+		printf("%s: ANS did not report ready after the handshake\n", dev->name);
 		return -ETIMEDOUT;
 	}
 
@@ -756,30 +845,6 @@ static int apple_nvme_remove(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
-
-	if (priv->woken) {
-		/*
-		 * Leave the ANS as we found it: controller shut down and
-		 * disabled, RTKit asleep, CPU running.  Linux wakes it with its
-		 * own handshake and buffers, as it does after the boot loader.
-		 */
-		if (nvme_retire_io_queues(dev))
-			printf("%s: could not delete the I/O queues\n", dev->name);
-		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
-		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
-		nvme_shutdown(dev);
-		priv->adopted_mbox = false;
-		if (apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_SLEEP))
-			printf("%s: ANS did not go back to sleep\n", dev->name);
-		apple_rtkit_free(priv->rtk);
-		priv->rtk = NULL;
-		sart_free(priv->sart);
-		priv->sart = NULL;
-		printf("%s: ANS put back to sleep for the OS (CC %#x CSTS %#x)\n",
-		       dev->name, readl(&priv->ndev.bar->cc),
-		       readl(&priv->ndev.bar->csts));
-		return 0;
-	}
 
 	if (priv->hw->post_m4) {
 		/*

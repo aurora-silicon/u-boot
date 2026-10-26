@@ -88,14 +88,16 @@ static int apple_dc_serial_of_to_plat(struct udevice *dev)
 	u32 channel;
 
 	/*
-	 * Linux-style DTs describe the channel's data window explicitly.  The
-	 * compact m1n1 smoke DT instead supplies the shared config window and an
-	 * apple,channel selector.  Normalize both forms to the data window so the
-	 * handoff can stay on the firmware-selected DockChannel.
+	 * Linux-style DTs describe the channel's data window explicitly; their
+	 * apple,channel only selects the channel's bits in the shared interrupt
+	 * registers, which U-Boot does not use.  The compact m1n1 smoke DT
+	 * instead supplies the shared config window and an apple,channel
+	 * selector.  Normalize both forms to the data window so the handoff can
+	 * stay on the firmware-selected DockChannel.
 	 */
 	addr = dev_read_addr_name(dev, "data");
 	if (addr != FDT_ADDR_T_NONE) {
-		channel = dev_read_u32_default(dev, "apple,channel", 0);
+		channel = 0;
 	} else {
 		addr = dev_read_addr(dev);
 		if (addr == FDT_ADDR_T_NONE)

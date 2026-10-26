@@ -936,6 +936,25 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 	}
 };
 
+/*
+ * Apple M4 Pro (T6040; its blocks carry T6041 compatibles).  Every register
+ * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
+ * 0x6_0000_0000, apart from the APCIE ECAM, which U-Boot does not use.  The
+ * RAM banks and the framebuffer are filled in from the m1n1-prepared FDT,
+ * as on T8140.
+ */
+static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
+	{
+		/* I/O */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
 /* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
  * RAM and framebuffer entries are populated from the m1n1-patched FDT.
  */
@@ -1054,6 +1073,8 @@ void build_mem_map(void)
 		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
+	else if (of_machine_is_compatible("apple,t6040"))
+		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
 	else if (of_machine_is_compatible("apple,t8152") &&
@@ -1062,7 +1083,8 @@ void build_mem_map(void)
 	else
 		panic("Unsupported SoC\n");
 
-	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map) {
+	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
+	    mem_map == t6040_mem_map) {
 		int ram_slot = mem_map == t8132_mem_map ? 8 : 1;
 
 		/* LMB and EFI see every bank, so the MMU must map every bank. */
@@ -1160,7 +1182,8 @@ static char *asahi_esp_devpart(void)
 
 		dev = dev_get_parent(nvme_blk->bdev);
 		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t8132-nvme-ans2"))
+		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
 			continue;
 
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
@@ -1207,7 +1230,7 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for J700 (T8140) and J713 (T8132).
+ * Aurora Silicon boot flow for J700 (T8140), J713 (T8132) and J616s (T6040).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
@@ -1377,8 +1400,12 @@ int board_late_init(void)
 		if (ret)
 			printf("J713: input unavailable (%d); continuing boot\n", ret);
 	}
+	/* T6040: the MTP stays with Linux (apple_rtkit_helper_allowed()). */
+	if (of_machine_is_compatible("apple,t6040"))
+		start_keyboard = false;
 	if (of_machine_is_compatible("apple,t8140") ||
-	    of_machine_is_compatible("apple,t8132"))
+	    of_machine_is_compatible("apple,t8132") ||
+	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);
 
 	/* somewhat based on the Linux Kernel boot requirements:

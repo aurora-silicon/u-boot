@@ -159,6 +159,21 @@ static void __iomem *apple_nvme_lsq(struct apple_nvme_priv *priv)
 	return priv->hw->lsq_in_nvmmu ? priv->nvmmu : priv->base;
 }
 
+/* A queue's TCB array, allocated once; NVMMU wants it 16 KiB aligned. */
+static void *apple_nvme_tcbs(struct apple_nvme_priv *priv, u16 qid)
+{
+	if (!priv->tcbs[qid]) {
+		priv->tcbs[qid] = memalign(SZ_16K, ANS_NVMMU_TCB_SIZE);
+		if (!priv->tcbs[qid])
+			return NULL;
+		memset(priv->tcbs[qid], 0, ANS_NVMMU_TCB_SIZE);
+		flush_dcache_range((ulong)priv->tcbs[qid],
+				   (ulong)priv->tcbs[qid] + ANS_NVMMU_TCB_SIZE);
+	}
+
+	return priv->tcbs[qid];
+}
+
 static int apple_nvme_setup_queue(struct nvme_queue *nvmeq)
 {
 	struct apple_nvme_priv *priv =
@@ -166,29 +181,32 @@ static int apple_nvme_setup_queue(struct nvme_queue *nvmeq)
 
 	switch (nvmeq->qid) {
 	case NVME_ADMIN_Q:
+		if (!apple_nvme_tcbs(priv, NVME_ADMIN_Q))
+			return -ENOMEM;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_ASQ_DB;
+		nvme_writeq((ulong)priv->tcbs[NVME_ADMIN_Q],
+			    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
+		/*
+		 * Post-M4 firmware takes both TCB arrays before the controller
+		 * is enabled, as m1n1 and Linux program them; the T6040 does
+		 * not become ready without the I/O one.
+		 */
+		if (priv->hw->post_m4) {
+			if (!apple_nvme_tcbs(priv, NVME_IO_Q))
+				return -ENOMEM;
+			nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+				    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
+		}
+		break;
 	case NVME_IO_Q:
+		if (!apple_nvme_tcbs(priv, NVME_IO_Q))
+			return -ENOMEM;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_IOSQ_DB;
+		nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+			    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
 		break;
 	default:
 		return -EINVAL;
-	}
-
-	priv->tcbs[nvmeq->qid] = (void *)memalign(4096, ANS_NVMMU_TCB_SIZE);
-	if (!priv->tcbs[nvmeq->qid])
-		return -ENOMEM;
-
-	memset((void *)priv->tcbs[nvmeq->qid], 0, ANS_NVMMU_TCB_SIZE);
-
-	switch (nvmeq->qid) {
-	case NVME_ADMIN_Q:
-		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_ASQ_DB;
-		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
-			    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
-		break;
-	case NVME_IO_Q:
-		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_IOSQ_DB;
-		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
-			    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
-		break;
 	}
 
 	return 0;

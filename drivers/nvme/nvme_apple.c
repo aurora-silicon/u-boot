@@ -99,6 +99,12 @@ struct apple_nvme_hw {
 	 * linear queues itself.
 	 */
 	bool lsq_in_nvmmu;
+	/*
+	 * A session handed over with the controller disabled sleeps: wake it
+	 * with an RTKit handshake (IOP power state INIT) instead of adopting
+	 * it, as Linux does, and put it back to sleep at handoff.
+	 */
+	bool wake_disabled;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -135,6 +141,7 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.post_m4 = true,
 	.lsq_in_nvmmu = true,
+	.wake_disabled = true,
 	.max_ns_id = 1,
 };
 
@@ -147,6 +154,7 @@ struct apple_nvme_priv {
 	struct reset_ctl_bulk resets; /* ASC reset */
 	struct mbox_chan chan;
 	bool adopted_mbox;	/* chan carries an adopted RTKit session */
+	bool woken;		/* we woke the session with a handshake */
 	struct apple_sart *sart;
 	struct apple_rtkit *rtk;
 	struct ans_nvmmu_tcb *tcbs[NVME_Q_NUM]; /* Submission queue TCBs */
@@ -515,6 +523,76 @@ static int apple_nvme_adopt(struct udevice *dev)
 }
 
 /*
+ * Post-M4, T6040: the previous stage handed the ANS over running but with
+ * the controller disabled and its RTKit session asleep; the controller never
+ * becomes ready until the firmware is woken.  Wake it the way Linux does
+ * (apple_rtkit_wake(): IOP power state INIT, then the boot handshake), with
+ * RTKit buffers of our own behind the SART.  The coprocessor is never reset
+ * or restarted.  apple_nvme_remove() puts it back to sleep.
+ */
+static int apple_nvme_wake(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	ofnode of_sart;
+	u32 phandle, stat;
+	int ret;
+
+	if (!apple_nvme_ans_running(priv)) {
+		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x)\n",
+			readl(priv->asc + REG_CPU_CTRL),
+			readl(priv->base + ANS_BOOT_STATUS));
+		return -ENODEV;
+	}
+	if (readl(&priv->ndev.bar->csts) & NVME_CSTS_CFS) {
+		dev_err(dev, "inherited controller is in a fatal state\n");
+		return -EIO;
+	}
+
+	ret = mbox_get_by_index(dev, 0, &priv->chan);
+	if (ret < 0)
+		return ret;
+	ret = dev_read_u32(dev, "apple,sart", &phandle);
+	if (ret < 0)
+		return ret;
+	of_sart = ofnode_get_by_phandle(phandle);
+	priv->sart = sart_init(of_sart);
+	if (!priv->sart)
+		return -EINVAL;
+
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup,
+				     nvme_shmem_destroy);
+	if (!priv->rtk)
+		return -ENOMEM;
+
+	printf("%s: waking the sleeping ANS session (CC %#x CSTS %#x)\n",
+	       dev->name, readl(&priv->ndev.bar->cc),
+	       readl(&priv->ndev.bar->csts));
+	ret = apple_rtkit_boot(priv->rtk);
+	if (ret < 0) {
+		printf("%s: ANS did not wake (%d)\n", dev->name, ret);
+		return ret;
+	}
+	priv->woken = true;
+
+	ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+				       stat == ANS_BOOT_STATUS_OK, 100, 500000);
+	if (ret < 0) {
+		printf("%s: ANS did not report ready after waking\n", dev->name);
+		return -ETIMEDOUT;
+	}
+
+	/* Answer its log traffic while commands are outstanding. */
+	priv->adopted_mbox = true;
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/*
  * Recover from a command that never completed.  Post-M4 firmware cannot be
  * restarted, but stopping the controller gives up its commands and stops
  * their DMA, as Linux does on a timeout.  Then set up the controller as
@@ -651,7 +729,10 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.bar = priv->base;
 	priv->ndev.udev = dev;
 
-	if (priv->hw->post_m4)
+	if (priv->hw->post_m4 && priv->hw->wake_disabled &&
+	    !(readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+		ret = apple_nvme_wake(dev);
+	else if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);
 	else
 		ret = apple_nvme_boot(dev);
@@ -675,6 +756,30 @@ static int apple_nvme_remove(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
+
+	if (priv->woken) {
+		/*
+		 * Leave the ANS as we found it: controller shut down and
+		 * disabled, RTKit asleep, CPU running.  Linux wakes it with its
+		 * own handshake and buffers, as it does after the boot loader.
+		 */
+		if (nvme_retire_io_queues(dev))
+			printf("%s: could not delete the I/O queues\n", dev->name);
+		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
+		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
+		nvme_shutdown(dev);
+		priv->adopted_mbox = false;
+		if (apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_SLEEP))
+			printf("%s: ANS did not go back to sleep\n", dev->name);
+		apple_rtkit_free(priv->rtk);
+		priv->rtk = NULL;
+		sart_free(priv->sart);
+		priv->sart = NULL;
+		printf("%s: ANS put back to sleep for the OS (CC %#x CSTS %#x)\n",
+		       dev->name, readl(&priv->ndev.bar->cc),
+		       readl(&priv->ndev.bar->csts));
+		return 0;
+	}
 
 	if (priv->hw->post_m4) {
 		/*

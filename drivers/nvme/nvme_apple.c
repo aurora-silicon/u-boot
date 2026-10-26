@@ -103,9 +103,9 @@ struct apple_nvme_hw {
 	 */
 	bool lsq_in_nvmmu;
 	/*
-	 * The boot loader hands the ANS over before the OS-side RTKit
-	 * handshake, with the controller disabled: run that (one-time)
-	 * handshake here, then hand the live session on as on adoption.
+	 * The ANS may arrive straight from iBoot, before any OS-side RTKit
+	 * handshake: run that (one-time) handshake here, then hand the live
+	 * session on as on adoption.  See apple_nvme_needs_handshake().
 	 */
 	bool wake_disabled;
 	/* Highest namespace ID to expose, 0 for all */
@@ -607,6 +607,24 @@ static int apple_nvme_adopt(struct udevice *dev)
 }
 
 /*
+ * T6040: the firmware takes the OS-side RTKit handshake once per boot; every
+ * later owner must adopt the live session.  An m1n1 stage that ran the
+ * handshake leaves the controller disabled but programmed (NVMMU TCB bases,
+ * I/O queue aperture); straight from iBoot (a chain whose m1n1 stages never
+ * used NVMe) both read zero and the controller will not become ready until
+ * someone runs the handshake.
+ */
+static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
+{
+	if (!priv->hw->wake_disabled ||
+	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+		return false;
+
+	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
+	       !readl(priv->base + ANS_MAX_PEND_CMDS_CTRL);
+}
+
+/*
  * Post-M4, T6040: the boot loader hands the ANS over running, with the
  * controller disabled and before the OS-side RTKit handshake (Linux in the
  * same chain logs "RTKit: Initializing" and a cold "boot: mode normal").
@@ -818,8 +836,7 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.bar = priv->base;
 	priv->ndev.udev = dev;
 
-	if (priv->hw->post_m4 && priv->hw->wake_disabled &&
-	    !(readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+	if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
 		ret = apple_nvme_wake(dev);
 	else if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);

@@ -600,14 +600,41 @@ void *video_get_u_boot_logo(void)
 	return SPLASH_START(u_boot_logo);
 }
 
+/* The logo sits this far below the top of the display */
+#define SPLASH_Y	4
+
 static int show_splash(struct udevice *dev)
 {
 	u8 *data = SPLASH_START(u_boot_logo);
 	int ret;
 
-	ret = video_bmp_display(dev, map_to_sysmem(data), -4, 4, true);
+	ret = video_bmp_display(dev, map_to_sysmem(data), -4, SPLASH_Y, true);
 
 	return 0;
+}
+
+/**
+ * console_below_splash() - Start the console on the first row below the logo
+ *
+ * The logo is drawn over the top of the console area. Lines that are
+ * rewritten in place (the autoboot countdown, the bootflow scan) clear the
+ * rest of their row, which would blank the part of the logo sharing that
+ * row, so begin the text below the logo instead.
+ *
+ * @cons: Console device of the video device showing the logo
+ */
+static void console_below_splash(struct udevice *cons)
+{
+	struct vidconsole_priv *vc_priv = dev_get_uclass_priv(cons);
+	ulong width, height;
+	uint bpix;
+
+	if (!vc_priv->y_charsize)
+		return;
+	video_bmp_get_info(SPLASH_START(u_boot_logo), &width, &height, &bpix);
+	vidconsole_position_cursor(cons, 0,
+				   DIV_ROUND_UP(SPLASH_Y + height,
+						vc_priv->y_charsize));
 }
 
 bool video_is_hidpi(const struct video_priv *priv)
@@ -763,6 +790,7 @@ static int video_post_probe(struct udevice *dev)
 			log_debug("Cannot show splash screen\n");
 			return ret;
 		}
+		console_below_splash(cons);
 	}
 
 	/* register cyclic as soon as the first video device is probed */

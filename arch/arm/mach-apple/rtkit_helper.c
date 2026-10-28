@@ -194,9 +194,16 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 		free(buf->buffer);
 }
 
-/* Keep T8140 MTP and its DART untouched in the default build. */
+/*
+ * Keep T8140 MTP and its DART untouched in the default build.  Never touch
+ * the T6040 MTP: Linux starts it itself, and a U-Boot keyboard there would
+ * leave Linux an MTP it has not been shown to take over.
+ */
 bool apple_rtkit_helper_allowed(ofnode node)
 {
+	if (ofnode_device_is_compatible(node, "apple,t6041-rtk-helper-asc4"))
+		return false;
+
 	return !ofnode_device_is_compatible(node, "apple,t8140-rtk-helper-asc4") ||
 	       IS_ENABLED(CONFIG_APPLE_MTP_KEYB);
 }

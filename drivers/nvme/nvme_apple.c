@@ -4,8 +4,11 @@
  */
 
 #include <dm.h>
-#include <mailbox.h>
+#include <fdt_support.h>
+#include <lmb.h>
 #include <mapmem.h>
+#include <asm/arch/nvme_apple.h>
+#include <mailbox.h>
 #include "nvme.h"
 #include <reset.h>
 #include <time.h>
@@ -93,6 +96,18 @@ struct ans_nvmmu_tcb {
  */
 struct apple_nvme_hw {
 	bool post_m4;
+	/*
+	 * LINEAR_SQ_CTRL and the linear submission queue doorbells sit in the
+	 * NVMMU block (at the same offsets), and the firmware has enabled the
+	 * linear queues itself.
+	 */
+	bool lsq_in_nvmmu;
+	/*
+	 * The ANS may arrive straight from iBoot, before any OS-side RTKit
+	 * handshake: run that (one-time) handshake here, then hand the live
+	 * session on as on adoption.  See apple_nvme_needs_handshake().
+	 */
+	bool wake_disabled;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -119,6 +134,20 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.max_ns_id = 1,
 };
 
+/*
+ * T6040 (M4 Pro) with the 26.x ANS firmware: the post-M4 controller, but its
+ * "nvme" register block ends at 0x10000 and the linear submission queue
+ * registers are in the NVMMU block, as in m1n1 (0d2ded8b, "nvme: use the
+ * NVMMU block for the T6040 linear queue registers") and Linux's
+ * apple,t6041-nvme-ans2 entry.
+ */
+static const struct apple_nvme_hw apple_nvme_t6040_hw = {
+	.post_m4 = true,
+	.lsq_in_nvmmu = true,
+	.wake_disabled = true,
+	.max_ns_id = 1,
+};
+
 struct apple_nvme_priv {
 	struct nvme_dev ndev;
 	const struct apple_nvme_hw *hw;
@@ -128,45 +157,67 @@ struct apple_nvme_priv {
 	struct reset_ctl_bulk resets; /* ASC reset */
 	struct mbox_chan chan;
 	bool adopted_mbox;	/* chan carries an adopted RTKit session */
+	bool woken;		/* we woke the session with a handshake */
 	struct apple_sart *sart;
 	struct apple_rtkit *rtk;
 	struct ans_nvmmu_tcb *tcbs[NVME_Q_NUM]; /* Submission queue TCBs */
 	u32 __iomem *q_db[NVME_Q_NUM]; /* Submission queue doorbell */
 };
 
+/* The block holding LINEAR_SQ_CTRL and the linear SQ doorbells */
+static void __iomem *apple_nvme_lsq(struct apple_nvme_priv *priv)
+{
+	return priv->hw->lsq_in_nvmmu ? priv->nvmmu : priv->base;
+}
+
+/* A queue's TCB array, allocated once; NVMMU wants it 16 KiB aligned. */
+static void *apple_nvme_tcbs(struct apple_nvme_priv *priv, u16 qid)
+{
+	if (!priv->tcbs[qid]) {
+		priv->tcbs[qid] = memalign(SZ_16K, ANS_NVMMU_TCB_SIZE);
+		if (!priv->tcbs[qid])
+			return NULL;
+		memset(priv->tcbs[qid], 0, ANS_NVMMU_TCB_SIZE);
+		flush_dcache_range((ulong)priv->tcbs[qid],
+				   (ulong)priv->tcbs[qid] + ANS_NVMMU_TCB_SIZE);
+	}
+
+	return priv->tcbs[qid];
+}
+
 static int apple_nvme_setup_queue(struct nvme_queue *nvmeq)
 {
 	struct apple_nvme_priv *priv =
 		container_of(nvmeq->dev, struct apple_nvme_priv, ndev);
-	struct nvme_dev *dev = nvmeq->dev;
 
 	switch (nvmeq->qid) {
 	case NVME_ADMIN_Q:
+		if (!apple_nvme_tcbs(priv, NVME_ADMIN_Q))
+			return -ENOMEM;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_ASQ_DB;
+		nvme_writeq((ulong)priv->tcbs[NVME_ADMIN_Q],
+			    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
+		/*
+		 * Post-M4 firmware takes both TCB arrays before the controller
+		 * is enabled, as m1n1 and Linux program them; the T6040 does
+		 * not become ready without the I/O one.
+		 */
+		if (priv->hw->post_m4) {
+			if (!apple_nvme_tcbs(priv, NVME_IO_Q))
+				return -ENOMEM;
+			nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+				    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
+		}
+		break;
 	case NVME_IO_Q:
+		if (!apple_nvme_tcbs(priv, NVME_IO_Q))
+			return -ENOMEM;
+		priv->q_db[nvmeq->qid] = apple_nvme_lsq(priv) + ANS_IOSQ_DB;
+		nvme_writeq((ulong)priv->tcbs[NVME_IO_Q],
+			    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
 		break;
 	default:
 		return -EINVAL;
-	}
-
-	priv->tcbs[nvmeq->qid] = (void *)memalign(4096, ANS_NVMMU_TCB_SIZE);
-	if (!priv->tcbs[nvmeq->qid])
-		return -ENOMEM;
-
-	memset((void *)priv->tcbs[nvmeq->qid], 0, ANS_NVMMU_TCB_SIZE);
-
-	switch (nvmeq->qid) {
-	case NVME_ADMIN_Q:
-		priv->q_db[nvmeq->qid] =
-			((void __iomem *)dev->bar) + ANS_ASQ_DB;
-		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
-			    priv->nvmmu + ANS_NVMMU_BASE_ASQ);
-		break;
-	case NVME_IO_Q:
-		priv->q_db[nvmeq->qid] =
-			((void __iomem *)dev->bar) + ANS_IOSQ_DB;
-		nvme_writeq((ulong)priv->tcbs[nvmeq->qid],
-			    priv->nvmmu + ANS_NVMMU_BASE_IOSQ);
-		break;
 	}
 
 	return 0;
@@ -220,6 +271,87 @@ static void apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
 	if (++tail == nvmeq->q_depth)
 		tail = 0;
 	nvmeq->sq_tail = tail;
+}
+
+/*
+ * RTKit buffers of a session that U-Boot started and hands on live (see
+ * apple_nvme_wake()).  The firmware keeps writing them after U-Boot exits,
+ * so they come from LMB, never return to it, and are published to the OS
+ * as no-map reserved memory by apple_nvme_fdt_fixup().
+ */
+#define ANS_HANDOFF_MAX_BUFS	8
+
+static struct {
+	phys_addr_t addr;
+	phys_size_t size;
+} ans_handoff_bufs[ANS_HANDOFF_MAX_BUFS];
+static int ans_handoff_nbufs;
+
+static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
+{
+	struct apple_nvme_priv *priv = (struct apple_nvme_priv *)cookie;
+	phys_size_t size;
+	phys_addr_t addr;
+
+	if (!buf || buf->dva || !buf->size ||
+	    ans_handoff_nbufs >= ANS_HANDOFF_MAX_BUFS)
+		return -1;
+
+	size = ALIGN(buf->size, SZ_16K);
+	if (lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_16K, &addr, size,
+			  LMB_NOOVERWRITE))
+		return -ENOMEM;
+	buf->buffer = map_sysmem(addr, size);
+	memset(buf->buffer, 0, size);
+	flush_dcache_range((ulong)buf->buffer, (ulong)buf->buffer + size);
+
+	if (!sart_add_allowed_region(priv->sart, buf->buffer, buf->size)) {
+		lmb_free(addr, size, LMB_NOOVERWRITE);
+		buf->buffer = NULL;
+		return -1;
+	}
+
+	buf->dva = addr;
+	ans_handoff_bufs[ans_handoff_nbufs].addr = addr;
+	ans_handoff_bufs[ans_handoff_nbufs].size = size;
+	ans_handoff_nbufs++;
+
+	return 0;
+}
+
+int apple_nvme_fdt_fixup(void *blob)
+{
+	int resv, sub, i, ret;
+	char name[40];
+	fdt64_t reg[2];
+
+	if (!ans_handoff_nbufs)
+		return 0;
+
+	resv = fdt_path_offset(blob, "/reserved-memory");
+	if (resv < 0)
+		return resv;
+	if (fdt_address_cells(blob, resv) != 2 || fdt_size_cells(blob, resv) != 2)
+		return -EINVAL;
+
+	for (i = 0; i < ans_handoff_nbufs; i++) {
+		snprintf(name, sizeof(name), "ans-rtkit@%llx",
+			 (unsigned long long)ans_handoff_bufs[i].addr);
+		resv = fdt_path_offset(blob, "/reserved-memory");
+		sub = fdt_subnode_offset(blob, resv, name);
+		if (sub == -FDT_ERR_NOTFOUND)
+			sub = fdt_add_subnode(blob, resv, name);
+		if (sub < 0)
+			return sub;
+		reg[0] = cpu_to_fdt64(ans_handoff_bufs[i].addr);
+		reg[1] = cpu_to_fdt64(ans_handoff_bufs[i].size);
+		ret = fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
+		ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int nvme_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
@@ -393,8 +525,10 @@ static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
 	struct udevice *dev = priv->ndev.udev;
 	u32 ioqa;
 
-	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
-	if (!(readl(priv->base + ANS_LINEAR_SQ_CTRL) & ANS_LINEAR_SQ_CTRL_EN)) {
+	if (!priv->hw->lsq_in_nvmmu)
+		writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
+	if (!(readl(apple_nvme_lsq(priv) + ANS_LINEAR_SQ_CTRL) &
+	      ANS_LINEAR_SQ_CTRL_EN)) {
 		dev_err(dev, "failed to enable linear submission queues\n");
 		return -EIO;
 	}
@@ -463,6 +597,99 @@ static int apple_nvme_adopt(struct udevice *dev)
 		if (ret)
 			return ret;
 	}
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/*
+ * T6040: the firmware takes the OS-side RTKit handshake once per boot; every
+ * later owner must adopt the live session.  An m1n1 stage that ran the
+ * handshake leaves the controller disabled but programmed (NVMMU TCB bases,
+ * I/O queue aperture); straight from iBoot (a chain whose m1n1 stages never
+ * used NVMe) both read zero and the controller will not become ready until
+ * someone runs the handshake.
+ */
+static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
+{
+	if (!priv->hw->wake_disabled ||
+	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+		return false;
+
+	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
+	       !readl(priv->base + ANS_MAX_PEND_CMDS_CTRL);
+}
+
+/*
+ * Post-M4, T6040: the boot loader hands the ANS over running, with the
+ * controller disabled and before the OS-side RTKit handshake (Linux in the
+ * same chain logs "RTKit: Initializing" and a cold "boot: mode normal").
+ * The controller never becomes ready until that handshake has run, and the
+ * firmware takes it once per run: after U-Boot it can neither be repeated
+ * nor be undone by sleeping or stopping the IOP.  So run it here the way
+ * Linux would (IOP power state INIT, then the boot handshake), with buffers
+ * that stay reserved for the firmware, and hand the live session on as on
+ * adoption: apple_nvme_remove() leaves the controller enabled and ready for
+ * Linux to adopt, and apple_nvme_fdt_fixup() reserves the buffers.  The
+ * coprocessor is never reset or restarted.
+ */
+static int apple_nvme_wake(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	ofnode of_sart;
+	u32 phandle, stat;
+	int ret;
+
+	if (!apple_nvme_ans_running(priv)) {
+		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x)\n",
+			readl(priv->asc + REG_CPU_CTRL),
+			readl(priv->base + ANS_BOOT_STATUS));
+		return -ENODEV;
+	}
+	if (readl(&priv->ndev.bar->csts) & NVME_CSTS_CFS) {
+		dev_err(dev, "inherited controller is in a fatal state\n");
+		return -EIO;
+	}
+
+	ret = mbox_get_by_index(dev, 0, &priv->chan);
+	if (ret < 0)
+		return ret;
+	ret = dev_read_u32(dev, "apple,sart", &phandle);
+	if (ret < 0)
+		return ret;
+	of_sart = ofnode_get_by_phandle(phandle);
+	priv->sart = sart_init(of_sart);
+	if (!priv->sart)
+		return -EINVAL;
+
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup,
+				     NULL);
+	if (!priv->rtk)
+		return -ENOMEM;
+
+	printf("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
+	       dev->name, readl(&priv->ndev.bar->cc),
+	       readl(&priv->ndev.bar->csts));
+	ret = apple_rtkit_boot(priv->rtk);
+	if (ret < 0) {
+		printf("%s: ANS RTKit handshake failed (%d)\n", dev->name, ret);
+		return ret;
+	}
+	priv->woken = true;
+
+	ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+				       stat == ANS_BOOT_STATUS_OK, 100, 500000);
+	if (ret < 0) {
+		printf("%s: ANS did not report ready after the handshake\n", dev->name);
+		return -ETIMEDOUT;
+	}
+
+	/* Answer its log traffic while commands are outstanding. */
+	priv->adopted_mbox = true;
 
 	ret = apple_nvme_setup_post_m4(priv);
 	if (ret)
@@ -609,7 +836,9 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.bar = priv->base;
 	priv->ndev.udev = dev;
 
-	if (priv->hw->post_m4)
+	if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
+		ret = apple_nvme_wake(dev);
+	else if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);
 	else
 		ret = apple_nvme_boot(dev);
@@ -689,6 +918,8 @@ static const struct nvme_ops apple_nvme_ops = {
 };
 
 static const struct udevice_id apple_nvme_ids[] = {
+	{ .compatible = "apple,t6041-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t6040_hw },
 	{ .compatible = "apple,t8103-nvme-ans2",
 	  .data = (ulong)&apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2",

@@ -45,6 +45,8 @@ struct apple_mtp_kbd_priv {
 	u8 tx_seq;
 	u8 *pkt;
 	bool ready;
+	bool enable_pending;
+	ulong last_rx;
 };
 
 /*
@@ -70,6 +72,16 @@ struct dchid_subhdr {
 #define DCHID_EVENT_INIT	0xf0
 #define DCHID_EVENT_READY	0xf1
 #define DCHID_CMD_ENABLE_IFACE	0xb4
+
+/*
+ * The MTP announces its interfaces one after another. An enable sent before
+ * the last announcement is acknowledged, but the keyboard then never sends a
+ * report, so wait until the announcements have stopped for this long.
+ */
+#define MTP_ENUM_QUIET_MS	50
+
+/* How long "mtpkbd start" services a starting MTP until its keyboard is ready. */
+#define MTP_STARTUP_WAIT_MS	1000
 
 struct dchid_init_hdr {
 	u8 type;
@@ -209,7 +221,6 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 {
 	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
 	const struct dchid_init_hdr *init = (const void *)p;
-	u8 msg[2];
 
 	if (!len)
 		return;
@@ -223,11 +234,8 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 		priv->kbd_iface = init->iface;
 		if (init->more_packets)
 			return;
-		msg[0] = DCHID_CMD_ENABLE_IFACE;
-		msg[1] = init->iface;
-		if (dchid_comm_set_report(priv, msg, sizeof(msg)))
-			dev_err(dev, "failed to enable keyboard interface %d\n",
-				init->iface);
+		/* Sent from apple_mtp_kbd_check() once the MTP goes quiet */
+		priv->enable_pending = true;
 		break;
 	case DCHID_EVENT_READY:
 		if (len >= 2 && p[1] == priv->kbd_iface && !priv->ready) {
@@ -331,8 +339,19 @@ static int apple_mtp_kbd_check(struct input_config *input)
 		return 0;
 
 	pending = readl(priv->local + DATA_RX_COUNT);
-	if (pending < 8)
+	if (pending < 8) {
+		if (priv->enable_pending &&
+		    get_timer(priv->last_rx) >= MTP_ENUM_QUIET_MS) {
+			u8 msg[2] = { DCHID_CMD_ENABLE_IFACE, priv->kbd_iface };
+
+			priv->enable_pending = false;
+			if (dchid_comm_set_report(priv, msg, sizeof(msg)))
+				dev_err(dev, "failed to enable keyboard interface %d\n",
+					priv->kbd_iface);
+		}
 		return 0;
+	}
+	priv->last_rx = get_timer(0);
 
 	ret = dockchannel_read(dev, &hdr, sizeof(hdr));
 	if (ret < 0) {
@@ -761,6 +780,24 @@ static int do_mtpkbd(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (ret) {
 		printf("mtpkbd: cannot update stdin (%d)\n", ret);
 		return CMD_RET_FAILURE;
+	}
+
+	/*
+	 * The MTP only finishes starting while something services it. Autoboot
+	 * without a countdown goes straight to the boot scan, so service it here
+	 * until the keyboard is ready: then a key can stop autoboot, GRUB gets
+	 * the keyboard, and the startup packets are captured for Linux.
+	 */
+	{
+		struct apple_mtp_kbd_priv *priv = dev_get_priv(kbd);
+		struct keyboard_priv *uc_priv = dev_get_uclass_priv(kbd);
+		ulong start = get_timer(0);
+
+		while (!priv->ready && get_timer(start) < MTP_STARTUP_WAIT_MS)
+			apple_mtp_kbd_check(&uc_priv->input);
+		if (!priv->ready)
+			printf("mtpkbd: keyboard not ready after %u ms\n",
+			       MTP_STARTUP_WAIT_MS);
 	}
 
 	return CMD_RET_SUCCESS;

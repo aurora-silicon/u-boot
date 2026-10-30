@@ -25,6 +25,7 @@
 #include <asm/arch/rtkit.h>
 #include <asm/arch/j713_fdt.h>
 #include <asm/arch/nvme_apple.h>
+#include <asm/arch/apif.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -927,7 +928,7 @@ static struct mm_region t8132_mem_map[CONFIG_NR_DRAM_BANKS + 10] = {
 
 /* Apple A18 Pro (T8140) */
 
-static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
+static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 4] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -1122,6 +1123,21 @@ void build_mem_map(void)
 						  PTE_BLOCK_INNER_SHARE;
 		}
 		fb_slot = bank + ram_slot;
+		/* Aura's EL1 guest uses a separate low IPA aperture for ordinary
+		 * device registers and the generic APIF doorbell. The stage-2
+		 * mappings remain the monitor's responsibility.
+		 */
+		node = ofnode_by_compatible(ofnode_null(), "aurora,apif-mmio");
+		if (mem_map == t8140_mem_map && ofnode_valid(node)) {
+			mem_map[fb_slot++] = (struct mm_region) {
+				.virt = 0x60000000,
+				.phys = 0x60000000,
+				.size = 0x08000000,
+				.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+					 PTE_BLOCK_NON_SHARE |
+					 PTE_BLOCK_PXN | PTE_BLOCK_UXN,
+			};
+		}
 		mem_map[fb_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
 					 PTE_BLOCK_INNER_SHARE |
 					 PTE_BLOCK_PXN | PTE_BLOCK_UXN;
@@ -1386,8 +1402,10 @@ static void apple_efi_late_init(bool start_keyboard)
 	 * Boot without a countdown.  With bootdelay 0 autoboot still polls
 	 * the console once, so a key held on the serial console (or on the
 	 * internal keyboard where U-Boot drives it) stops at the prompt.
+	 * An Aura APIF guest keeps its configured delay.
 	 */
-	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
+	if (!apple_apif_present() &&
+	    !strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
 		env_set("bootdelay", "0");
 
 	/* EFI ConIn uses the active stdin; keep serial input available. */

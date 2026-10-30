@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
+#include <linux/time.h>
 
 /* ASC registers */
 #define REG_CPU_CTRL		0x0044
@@ -739,11 +740,86 @@ static int apple_nvme_reset_ctrl(struct nvme_dev *ndev)
 	return 0;
 }
 
+/*
+ * How long a pre-M4 ANS may take to finish a power transition.  Sleep
+ * includes the firmware's own shutdown when the controller was not shut down
+ * first (saveCtx alone took 274 to 544 ms on the M2, more with a GC rebuild
+ * in flight); m1n1 and Linux give the NVMe normal shutdown 5 s.
+ */
+#define ANS_PWR_TIMEOUT_US	(5 * USEC_PER_SEC)
+
+/* Drop what the coprocessor sent to an owner that has gone. */
+static void apple_nvme_drain(struct apple_nvme_priv *priv)
+{
+	struct apple_mbox_msg msg;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		if (mbox_recv(&priv->chan, &msg, 0))
+			break;
+}
+
+/*
+ * The previous stage left the ANS awake with its own session: end that
+ * session the way Linux does before it restarts the coprocessor.  Shut the
+ * controller down so the firmware commits its state, have the firmware
+ * acknowledge sleep, and only then stop the CPU and reset the block.  A CPU
+ * stopped or reset before it has acknowledged sleep does not boot again
+ * until iBoot loads its firmware afresh, so without the acknowledgment it is
+ * left running.
+ */
+static int apple_nvme_restart_awake(struct apple_nvme_priv *priv)
+{
+	struct udevice *dev = priv->ndev.udev;
+	u32 cc = readl(&priv->ndev.bar->cc), csts;
+	int ret;
+
+	if (cc & NVME_CC_ENABLE) {
+		writel((cc & ~NVME_CC_SHN_MASK) | NVME_CC_SHN_NORMAL,
+		       &priv->ndev.bar->cc);
+		ret = readl_poll_sleep_timeout(&priv->ndev.bar->csts, csts,
+					       (csts & NVME_CSTS_SHST_MASK) ==
+					       NVME_CSTS_SHST_CMPLT, 100,
+					       ANS_PWR_TIMEOUT_US);
+		if (ret < 0)
+			printf("%s: controller shutdown did not complete (CSTS %#x)\n",
+			       dev->name, csts);
+		writel(readl(&priv->ndev.bar->cc) & ~NVME_CC_ENABLE,
+		       &priv->ndev.bar->cc);
+		if (apple_nvme_wait_disabled(priv, &csts))
+			printf("%s: controller did not disable (CSTS %#x)\n",
+			       dev->name, csts);
+	}
+
+	ret = apple_rtkit_sleep_inherited(priv->rtk, ANS_PWR_TIMEOUT_US);
+	if (ret < 0) {
+		printf("%s: ANS did not go to sleep (%d), leaving it running\n",
+		       dev->name, ret);
+		return ret;
+	}
+
+	clrbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	apple_nvme_drain(priv);
+	reset_assert_bulk(&priv->resets);
+	udelay(10);
+	reset_deassert_bulk(&priv->resets);
+
+	apple_rtkit_free(priv->rtk);
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup,
+				     nvme_shmem_destroy);
+	if (!priv->rtk)
+		return -ENOMEM;
+	setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+
+	return apple_rtkit_boot_inherited(priv->rtk, ANS_PWR_TIMEOUT_US);
+}
+
 static int apple_nvme_boot(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	ofnode of_sart;
-	u32 ctrl, stat, phandle;
+	u32 stat, phandle;
+	bool running;
 	int ret;
 
 	ret = reset_get_bulk(dev, &priv->resets);
@@ -763,16 +839,34 @@ static int apple_nvme_boot(struct udevice *dev)
 	if (!priv->sart)
 		return -EINVAL;
 
-	ctrl = readl(priv->asc + REG_CPU_CTRL);
-	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
+	/*
+	 * A previous stage that completed its sleep request stopped the CPU,
+	 * and anything still queued is stale.  One whose request timed out
+	 * left RUN set while the firmware finishes that sleep (its own NVMe
+	 * shutdown and saveCtx), and iBoot hands the ANS over asleep with RUN
+	 * set.  Either way the firmware answers INIT with HELLO once it is
+	 * asleep, so leave the CPU alone and wait long enough.  Stopping it
+	 * here instead catches it mid-saveCtx, and then it never boots again.
+	 */
+	running = readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN;
+	if (!running) {
+		apple_nvme_drain(priv);
+		setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	}
 
 	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup, nvme_shmem_destroy);
 	if (!priv->rtk)
 		return -ENOMEM;
 
-	ret = apple_rtkit_boot(priv->rtk);
+	ret = apple_rtkit_boot_inherited(priv->rtk, ANS_PWR_TIMEOUT_US);
+	if (ret == -EBUSY) {
+		printf("%s: ANS is awake with the previous stage's session, restarting it\n",
+		       dev->name);
+		ret = apple_nvme_restart_awake(priv);
+	}
 	if (ret < 0) {
-		printf("%s: NVMe apple_rtkit_boot returned: %d\n", __func__, ret);
+		printf("%s: ANS did not start (%d, CPU was %s)\n", dev->name, ret,
+		       running ? "running" : "stopped");
 		return ret;
 	}
 
@@ -800,10 +894,11 @@ static int apple_nvme_boot(struct udevice *dev)
 
 /*
  * A post-M4 session that could not be adopted will not become adoptable by
- * trying again, and each attempt can wait for controller timeouts.  Every
- * block device scan probes again, so remember the failure.
+ * trying again, and a pre-M4 ANS that did not start in apple_nvme_boot()'s
+ * time budget will not start on a later try either.  Each attempt waits for
+ * timeouts and every block device scan probes again, so remember the failure.
  */
-static bool apple_nvme_adopt_failed;
+static bool apple_nvme_start_failed;
 
 static int apple_nvme_probe(struct udevice *dev)
 {
@@ -811,7 +906,7 @@ static int apple_nvme_probe(struct udevice *dev)
 	fdt_addr_t addr;
 	int ret;
 
-	if (apple_nvme_adopt_failed)
+	if (apple_nvme_start_failed)
 		return -ENODEV;
 
 	priv->hw = (const struct apple_nvme_hw *)dev_get_driver_data(dev);
@@ -843,8 +938,7 @@ static int apple_nvme_probe(struct udevice *dev)
 	else
 		ret = apple_nvme_boot(dev);
 	if (ret < 0) {
-		if (priv->hw->post_m4)
-			apple_nvme_adopt_failed = true;
+		apple_nvme_start_failed = true;
 		return ret;
 	}
 
@@ -853,7 +947,7 @@ static int apple_nvme_probe(struct udevice *dev)
 
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
-		apple_nvme_adopt_failed = true;
+		apple_nvme_start_failed = true;
 
 	return ret;
 }

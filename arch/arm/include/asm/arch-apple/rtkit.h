@@ -34,6 +34,15 @@ int apple_rtkit_get_buffers(struct apple_rtkit *rtk,
 			   struct apple_rtkit_buffer *buffers, size_t count);
 int apple_rtkit_boot(struct apple_rtkit *rtk);
 int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps);
+/*
+ * Boot an IOP that a previous owner handed over without saying in what state:
+ * running, stopped, or still finishing a sleep it was asked for.  Waits up to
+ * timeout_us for HELLO and drops what arrives before it.  -EBUSY: the IOP is
+ * awake with the previous owner's session and will not say HELLO.
+ */
+int apple_rtkit_boot_inherited(struct apple_rtkit *rtk, ulong timeout_us);
+/* Put an IOP with someone else's live session to sleep (quiesce, then sleep). */
+int apple_rtkit_sleep_inherited(struct apple_rtkit *rtk, ulong timeout_us);
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate);
 int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout);
 int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);

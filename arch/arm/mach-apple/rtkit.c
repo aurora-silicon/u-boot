@@ -15,6 +15,7 @@
 #include <linux/errno.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
+#include <time.h>
 
 #define APPLE_RTKIT_EP_MGMT 0
 #define APPLE_RTKIT_EP_CRASHLOG	1
@@ -319,7 +320,58 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
-int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
+/*
+ * Wait for the HELLO of an IOP that a previous owner handed over in a state
+ * nobody recorded.  It may still be finishing a sleep that owner asked for,
+ * so everything that arrives before HELLO was meant for that owner: the late
+ * answer to its sleep request, log traffic.  Drop it.  An IOP that answers our
+ * INIT as awake and never says HELLO still holds the previous owner's
+ * session; report that as -EBUSY so the caller can end it properly.
+ */
+static int rtkit_wait_inherited_hello(struct apple_rtkit *rtk,
+				      struct apple_mbox_msg *msg,
+				      ulong timeout_us)
+{
+	ulong start = timer_get_us(), elapsed;
+	bool awake = false;
+	int dropped = 0;
+	int msgtype, ret;
+
+	for (;;) {
+		elapsed = timer_get_us() - start;
+		if (elapsed >= timeout_us)
+			break;
+		ret = mbox_recv(rtk->chan, msg, timeout_us - elapsed);
+		if (ret == -ETIMEDOUT)
+			break;
+		if (ret < 0)
+			return ret;
+
+		msgtype = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg->msg0);
+		if (msg->msg1 == APPLE_RTKIT_EP_MGMT) {
+			if (msgtype == APPLE_RTKIT_MGMT_HELLO) {
+				if (dropped)
+					printf("rtkit: dropped %d message(s) for the previous owner\n",
+					       dropped);
+				return 0;
+			}
+			if (msgtype == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK &&
+			    FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg->msg0) !=
+			    APPLE_RTKIT_PWR_STATE_SLEEP && !awake) {
+				/* A HELLO would follow at once; wait only briefly. */
+				awake = true;
+				start = timer_get_us();
+				timeout_us = min_t(ulong, timeout_us, TIMEOUT_1SEC_US);
+			}
+		}
+		dropped++;
+	}
+
+	return awake ? -EBUSY : -ETIMEDOUT;
+}
+
+static int rtkit_boot(struct apple_rtkit *rtk, u32 system_eps,
+		      ulong inherited_timeout_us)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -344,7 +396,10 @@ int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 		return ret;
 
 	/* Wait for protocol version negotiation message. */
-	ret = mbox_recv(rtk->chan, &msg, TIMEOUT_1SEC_US);
+	if (inherited_timeout_us)
+		ret = rtkit_wait_inherited_hello(rtk, &msg, inherited_timeout_us);
+	else
+		ret = mbox_recv(rtk->chan, &msg, TIMEOUT_1SEC_US);
 	if (ret < 0)
 		return ret;
 
@@ -456,9 +511,69 @@ wait_epmap:
 	return 0;
 }
 
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
+{
+	return rtkit_boot(rtk, system_eps, 0);
+}
+
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {
 	return apple_rtkit_boot_with_sys_ep_mask(rtk, ~0U);
+}
+
+int apple_rtkit_boot_inherited(struct apple_rtkit *rtk, ulong timeout_us)
+{
+	return rtkit_boot(rtk, ~0U, timeout_us ?: TIMEOUT_1SEC_US);
+}
+
+int apple_rtkit_sleep_inherited(struct apple_rtkit *rtk, ulong timeout_us)
+{
+	struct apple_mbox_msg msg;
+	ulong start, elapsed;
+	int endpoint, msgtype, ret;
+
+	/* The order of apple_rtkit_shutdown(): AP quiesced, then IOP sleep. */
+	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_QUIESCED);
+	msg.msg1 = APPLE_RTKIT_EP_MGMT;
+	ret = mbox_send(rtk->chan, &msg);
+	if (ret < 0)
+		return ret;
+	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_SLEEP);
+	msg.msg1 = APPLE_RTKIT_EP_MGMT;
+	ret = mbox_send(rtk->chan, &msg);
+	if (ret < 0)
+		return ret;
+
+	start = timer_get_us();
+	for (;;) {
+		elapsed = timer_get_us() - start;
+		if (elapsed >= timeout_us)
+			return -ETIMEDOUT;
+		ret = mbox_recv(rtk->chan, &msg, timeout_us - elapsed);
+		if (ret < 0)
+			return ret;
+
+		endpoint = msg.msg1;
+		msgtype = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg.msg0);
+		if (endpoint == APPLE_RTKIT_EP_MGMT &&
+		    msgtype == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK &&
+		    FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg.msg0) ==
+		    APPLE_RTKIT_PWR_STATE_SLEEP) {
+			rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
+			return 0;
+		}
+
+		/* Keep its logging moving until it gets there, as on boot. */
+		if ((endpoint == APPLE_RTKIT_EP_SYSLOG && msgtype == 0x5) ||
+		    (endpoint == APPLE_RTKIT_EP_IOREPORT &&
+		     (msgtype == 0x8 || msgtype == 0xc))) {
+			ret = mbox_send(rtk->chan, &msg);
+			if (ret < 0)
+				return ret;
+		}
+	}
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)

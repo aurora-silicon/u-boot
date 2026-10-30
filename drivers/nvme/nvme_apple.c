@@ -739,11 +739,69 @@ static int apple_nvme_reset_ctrl(struct nvme_dev *ndev)
 	return 0;
 }
 
+/* Drop what the coprocessor sent to an owner that has gone. */
+static void apple_nvme_drain(struct apple_nvme_priv *priv)
+{
+	struct apple_mbox_msg msg;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		if (mbox_recv(&priv->chan, &msg, 0))
+			break;
+}
+
+/*
+ * Leave a pre-M4 ANS the way a completed sleep leaves it: CPU stopped, no
+ * stale messages and the block reset.  Setting RUN then boots the firmware
+ * afresh, and its first message is HELLO.
+ */
+static void apple_nvme_stop_ans(struct apple_nvme_priv *priv)
+{
+	apple_nvme_drain(priv);
+	clrbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	/* Let a late answer to the old owner land before it is dropped. */
+	mdelay(1);
+	apple_nvme_drain(priv);
+	reset_assert_bulk(&priv->resets);
+	udelay(10);
+	reset_deassert_bulk(&priv->resets);
+}
+
+/* Start a stopped pre-M4 ANS and run the RTKit boot handshake. */
+static int apple_nvme_start_ans(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 stat;
+	int ret;
+
+	setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup, nvme_shmem_destroy);
+	if (!priv->rtk)
+		return -ENOMEM;
+
+	ret = apple_rtkit_boot(priv->rtk);
+	if (ret < 0) {
+		printf("%s: NVMe apple_rtkit_boot returned: %d\n", __func__, ret);
+		return ret;
+	}
+
+	ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+				       (stat == ANS_BOOT_STATUS_OK), 100,
+				       500000);
+	if (ret < 0) {
+		printf("%s: NVMe firmware didn't boot\n", __func__);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
 static int apple_nvme_boot(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	ofnode of_sart;
-	u32 ctrl, stat, phandle;
+	u32 phandle;
 	int ret;
 
 	ret = reset_get_bulk(dev, &priv->resets);
@@ -763,25 +821,32 @@ static int apple_nvme_boot(struct udevice *dev)
 	if (!priv->sart)
 		return -EINVAL;
 
-	ctrl = readl(priv->asc + REG_CPU_CTRL);
-	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
-
-	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_shmem_setup, nvme_shmem_destroy);
-	if (!priv->rtk)
-		return -ENOMEM;
-
-	ret = apple_rtkit_boot(priv->rtk);
-	if (ret < 0) {
-		printf("%s: NVMe apple_rtkit_boot returned: %d\n", __func__, ret);
-		return ret;
+	/*
+	 * The previous stage puts the ANS to sleep, stops it and resets it.
+	 * One whose sleep request timed out hands it over still running,
+	 * possibly with that request's answer in the mailbox; setting RUN and
+	 * asking for INIT then never gets a HELLO.  Finish the stop it could
+	 * not, as Linux does before it restarts the coprocessor.
+	 */
+	if (readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN) {
+		printf("%s: ANS was left running, restarting it\n", dev->name);
+		apple_nvme_stop_ans(priv);
+	} else {
+		apple_nvme_drain(priv);
 	}
 
-	ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
-				       (stat == ANS_BOOT_STATUS_OK), 100,
-				       500000);
+	ret = apple_nvme_start_ans(dev);
 	if (ret < 0) {
-		printf("%s: NVMe firmware didn't boot\n", __func__);
-		return -ETIMEDOUT;
+		/* Once more from a clean stop, then give up on the drive. */
+		printf("%s: ANS did not start (%d), restarting it\n", dev->name, ret);
+		if (priv->rtk) {
+			apple_rtkit_free(priv->rtk);
+			priv->rtk = NULL;
+		}
+		apple_nvme_stop_ans(priv);
+		ret = apple_nvme_start_ans(dev);
+		if (ret < 0)
+			return ret;
 	}
 
 	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);

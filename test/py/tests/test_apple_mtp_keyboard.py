@@ -67,12 +67,13 @@ static u32 get_unaligned_le32(const void *p) { u32 v;memcpy(&v,p,4);return v; }
 static u8 local[64], config[64], remote[64], irq[64];
 static u8 wire[65540];static size_t wire_size;
 static u8 tx[256], replay[2048];static size_t tx_size,replay_size;
-static ulong ticks;static int remove_error,expected_error;static unsigned helper_removes,stalled_reads;
+static u32 rx_pending;static bool hdr_queued;static struct dchid_hdr queued_hdr;
+static ulong ticks,rx_at;static int remove_error,expected_error;static unsigned helper_removes,stalled_reads;
 static u32 pending_bytes,producer_extra,producer_at,lag_reads;static bool inject_lag;static u32 remote_space=2048;
 static ulong get_timer(ulong base) { return ++ticks-base; }
 static u32 readl(const void *p) {
     if(p==local+DATA_TX_FREE)return 64;
-    if(p==local+DATA_RX_COUNT){if(lag_reads&&!producer_extra){lag_reads--;return replay_size-4;}return replay_size+pending_bytes+producer_extra;}
+    if(p==local+DATA_RX_COUNT){if(lag_reads&&!producer_extra){lag_reads--;return replay_size-4;}return rx_pending+replay_size+pending_bytes+producer_extra;}
     if(p==remote+DATA_TX_FREE)return remote_space-replay_size;
     assert(false);return 0;
 }
@@ -82,8 +83,14 @@ static void writel(u32 v, void *p) {
     else assert(p==irq+DCHID_IRQ_MASK || p==irq+DCHID_IRQ_FLAG);
 }
 static int dockchannel_read(struct udevice *dev,void *p,size_t size) {
-    (void)dev;assert(size==wire_size);memcpy(p,wire,size);return size;
+    (void)dev;
+    if(hdr_queued) {
+        assert(size==sizeof(queued_hdr)&&rx_pending>=size);
+        memcpy(p,&queued_hdr,size);hdr_queued=false;rx_pending-=size;return size;
+    }
+    assert(size==wire_size);memcpy(p,wire,size);rx_pending-=rx_pending ? size : 0;return size;
 }
+static int apple_rtkit_helper_poll(struct udevice *d,int timeout) { assert(d&&!timeout);return 0; }
 static unsigned invalidations;
 static void apple_rtkit_helper_input_failed(struct udevice *d) { assert(d);invalidations++; }
 static bool apple_rtkit_helper_input_retained(struct udevice *d) { return d->retained; }
@@ -97,6 +104,9 @@ static int apple_mtp_kbd_check(struct input_config *input) {
     for name in ('dockchannel_write', 'dchid_sum', 'dchid_comm_set_report',
                  'dchid_handle_event', 'apple_mtp_kbd_handoff_error', 'apple_mtp_kbd_check_announce', 'apple_mtp_kbd_replay_count', 'apple_mtp_kbd_replay_j713', 'apple_mtp_kbd_handoff'):
         unit += function(text, name)
+    # The real poll loop, renamed so the drain stub above stays in place.
+    live = function(text, 'apple_mtp_kbd_check')
+    unit += live.replace('apple_mtp_kbd_check(', 'mtp_kbd_check_live(', 1)
     unit += r'''
 static u8 expected[2048];static size_t expected_size;
 static void deliver(struct input_config *input,u8 iface,const void *data,size_t size,bool preserve,bool corrupt) {
@@ -113,8 +123,16 @@ static void deliver(struct input_config *input,u8 iface,const void *data,size_t 
         memcpy(expected+expected_size,&hdr,sizeof(hdr));expected_size+=sizeof(hdr);
         memcpy(expected+expected_size,wire,wire_size);expected_size+=wire_size;
     }
-    int ret=apple_mtp_kbd_check_announce(input,&hdr);
+    /* Arrive through the FIFO 10 ms after the previous event, as on hardware. */
+    ticks+=10;queued_hdr=hdr;hdr_queued=true;rx_pending=sizeof(hdr)+wire_size;
+    int ret=mtp_kbd_check_live(input);rx_at=ticks;
+    assert(!hdr_queued&&!rx_pending);
     assert(expected_error ? ret==expected_error : ret>=0);expected_error=0;
+}
+/* Poll an empty FIFO exactly ms after the poll that received the last packet. */
+static void poll_quiet(struct input_config *input,ulong ms) {
+    assert(ms&&rx_at+ms-1>=ticks);ticks=rx_at+ms-1;
+    assert(!mtp_kbd_check_live(input));
 }
 static void announce(struct input_config *input,const char *name,u8 iface,bool more,bool corrupt) {
     struct dchid_init_hdr init={.type=DCHID_EVENT_INIT,.iface=iface,.more_packets=more};
@@ -126,13 +144,23 @@ int main(void) {
     struct keyboard_priv uc={0};struct udevice helper={.retained=true},dev={.priv=&priv,.uc=&uc};
     priv.helper=&helper;priv.init_data=malloc(priv.fifo_size);priv.pkt=malloc(DCHID_MAX_PKT);
     assert(priv.init_data&&priv.pkt);uc.input.dev=&dev;
+    /* As on the J700, the keyboard is not the last interface announced. */
     announce(&uc.input,"stm",1,false,false);assert(tx_size==0);
+    announce(&uc.input,"keyboard",3,true,false);assert(tx_size==0&&!priv.enable_pending);
+    announce(&uc.input,"keyboard",3,false,false);assert(tx_size==0&&priv.enable_pending);
+    assert(priv.kbd_iface==3);
+    /* No enable while announcements still arrive inside the quiet window. */
+    poll_quiet(&uc.input,1);assert(tx_size==0);
+    poll_quiet(&uc.input,40);assert(tx_size==0);
     announce(&uc.input,"multi-touch",2,false,false);assert(tx_size==0);
-    announce(&uc.input,"keyboard",3,true,false);assert(tx_size==0);
-    announce(&uc.input,"keyboard",3,false,false);
+    /* The window restarts at the last packet, not at the keyboard INIT. */
+    poll_quiet(&uc.input,49);assert(tx_size==0&&priv.enable_pending);
+    /* Quiet for 50 ms: enable the keyboard interface exactly once. */
+    poll_quiet(&uc.input,50);
     static const u8 enable[]={8,0x11,12,0,0,0,0,0,0x80,0,2,0,0,0,0,0,0xb4,3,0,0,0xc3,0xea,0xf1,0xff};
     assert(tx_size==sizeof(enable)&&!memcmp(tx,enable,sizeof(enable)));
-    assert(priv.kbd_iface==3&&!priv.ready);
+    assert(!priv.enable_pending&&priv.kbd_iface==3&&!priv.ready);
+    poll_quiet(&uc.input,100);poll_quiet(&uc.input,1000);assert(tx_size==sizeof(enable));
     u8 ready[]={DCHID_EVENT_READY,2};deliver(&uc.input,0,ready,2,false,false);assert(!priv.ready);
     ready[1]=3;deliver(&uc.input,0,ready,2,true,false);assert(priv.ready);
     struct apple_kbd_report key={.reportid=1,.keycode={4}};

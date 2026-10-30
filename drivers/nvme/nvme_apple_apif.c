@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+
 /* ANS queues and DMA ownership through Aura's native SPTM interface. */
 #include <cpu_func.h>
+#include <apple_apif_nvme.h>
+#include <asm/global_data.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 #include <dm.h>
 #include <dm/device_compat.h>
+#include <dm/device-internal.h>
+#include <dm/uclass.h>
 #include <dm/ofnode.h>
 #include <malloc.h>
 #include <mailbox.h>
@@ -301,35 +307,15 @@ static int ans_complete_cmd(struct nvme_queue *q, struct nvme_command *cmd)
 
 static int ans_read_queues(struct udevice *dev, struct apple_nvme_apif *priv)
 {
-	static const char *const names[] = { "admin-sq", "admin-cq", "io-sq", "io-cq" };
+	int ret = apple_apif_queue_pages(gd->fdt_blob, dev_of_offset(dev), priv->queue);
 
-	if (!dev_read_bool(dev, "asahi,rtkit-quiesced") ||
-	    !dev_read_bool(dev, "dma-coherent") ||
-	    dev_read_size(dev, "memory-region") != 4 * sizeof(u32) ||
-	    dev_read_string_count(dev, "memory-region-names") != 4)
-		return -EINVAL;
+	if (ret != 1)
+		return ret < 0 ? ret : -EINVAL;
 	priv->firmware_entries = dev_read_u32_default(dev, "apple,nvme-queue-entries", 253);
 	if (priv->firmware_entries < ANS_QUEUE_DEPTH || priv->firmware_entries > 0xfff)
 		return -EINVAL;
-	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
-		int index = dev_read_stringlist_search(dev, "memory-region-names", names[i]);
-		ofnode node;
-		struct resource res;
-		int ret;
-
-		if (index < 0)
-			return index;
-		node = ofnode_parse_phandle(dev_ofnode(dev), "memory-region", index);
-		if (!ofnode_valid(node) || !ofnode_read_bool(node, "no-map"))
-			return -EINVAL;
-		ret = ofnode_read_resource(node, 0, &res);
-		if (ret || resource_size(&res) != SZ_16K || !IS_ALIGNED(res.start, SZ_16K))
-			return -EINVAL;
-		priv->queue[i] = res.start;
-		for (unsigned int j = 0; j < i; j++)
-			if (priv->queue[j] == priv->queue[i])
-				return -EINVAL;
-		ret = ans_identity(res.start, SZ_16K);
+	for (unsigned int i = 0; i < ARRAY_SIZE(priv->queue); i++) {
+		ret = ans_identity(priv->queue[i], SZ_16K);
 		if (ret)
 			return ret;
 	}
@@ -437,6 +423,59 @@ static int ans_remove(struct udevice *dev)
 	}
 	printf("%s: native SPTM ANS quiesced for Linux\n", dev->name);
 	return 0;
+}
+
+/* Validate the retained queue contract in the outgoing DT. The EFI stub
+ * copies this DT before ExitBootServices, so do not defer a property update
+ * until after that copy. The final board guard makes quiescence a condition
+ * of successful handoff, even if GRUB performs more disk I/O after fixup. */
+int apple_nvme_apif_handoff_fdt(void *blob)
+{
+	struct uclass *uc;
+	struct udevice *dev;
+	int ret = uclass_get(UCLASS_NVME, &uc);
+
+	if (ret || ans_probe_failed)
+		return ret ?: -EIO;
+	uclass_foreach_dev(dev, uc) {
+		struct apple_nvme_apif *priv;
+		u64 pages[4];
+		int node;
+
+		if (!device_active(dev) || strcmp(dev->driver->name, "apple_nvme_apif"))
+			continue;
+		priv = dev_get_priv(dev);
+		if (priv->failed || priv->ndev.queue_count != NVME_Q_NUM)
+			return -EIO;
+		node = fdt_node_offset_by_compatible(blob, -1, APPLE_APIF_NVME_COMPAT);
+		if (node < 0 || apple_apif_queue_pages(blob, node, pages) != 1 ||
+		    memcmp(pages, priv->queue, sizeof(pages)))
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/* Generic DM teardown discards remove errors. The M5 board's OS-boundary
+ * hook must not hand Linux a live/uncertain DMA owner as quiesced. */
+void apple_nvme_apif_quiesce(void)
+{
+	struct uclass *uc;
+	struct udevice *dev;
+	int ret;
+
+	if (ans_probe_failed)
+		panic("ANS APIF: incomplete probe prevents OS handoff\n");
+	ret = uclass_get(UCLASS_NVME, &uc);
+	if (ret)
+		panic("ANS APIF: cannot inspect OS handoff ownership\n");
+	uclass_foreach_dev(dev, uc) {
+		if (!device_active(dev) || strcmp(dev->driver->name, "apple_nvme_apif"))
+			continue;
+		ret = device_remove(dev, DM_REMOVE_NORMAL);
+		if (ret)
+			panic("ANS APIF: quiesce failed (%d); OS handoff stopped\n", ret);
+	}
+
 }
 
 static int ans_poll(struct nvme_dev *dev)

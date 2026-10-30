@@ -1023,6 +1023,16 @@ static struct mm_region t8152_mem_map[] = {
 
 struct mm_region *mem_map;
 
+#include "m5_apif_memmap.h"
+
+static bool m5_apif_guest(void)
+{
+	ofnode provider = ofnode_by_compatible(ofnode_null(), "aurora,apif-mmio");
+
+	return of_machine_is_compatible("apple,t6050") &&
+	       ofnode_valid(provider) && ofnode_is_enabled(provider);
+}
+
 int board_init(void)
 {
 	return 0;
@@ -1069,6 +1079,11 @@ void build_mem_map(void)
 	fdt_addr_t base;
 	fdt_size_t size;
 	int i, bank, fb_slot;
+
+	if (m5_apif_guest()) {
+		build_m5_apif_mem_map();
+		return;
+	}
 
 	if (of_machine_is_compatible("apple,t8103") ||
 	    of_machine_is_compatible("apple,t8112"))
@@ -1184,6 +1199,8 @@ void enable_caches(void)
 
 u64 get_page_table_size(void)
 {
+	if (m5_apif_guest())
+		return SZ_1M;
 	return SZ_256K;
 }
 
@@ -1244,6 +1261,7 @@ static char *asahi_esp_devpart(void)
 
 		dev = dev_get_parent(nvme_blk->bdev);
 		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,nvme-apif") &&
 		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
 		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
 			continue;
@@ -1524,6 +1542,12 @@ int board_late_init(void)
 	return 0;
 }
 
+void board_quiesce_devices(void)
+{
+	if (m5_apif_guest())
+		apple_nvme_apif_quiesce();
+}
+
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	struct udevice *dev;
@@ -1536,6 +1560,12 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	if (imported < 0) {
 		printf("J713: refused OS devicetree runtime import (%d)\n", imported);
 		return imported;
+	}
+
+	if (m5_apif_guest()) {
+		ret = apple_nvme_apif_handoff_fdt(blob);
+		if (ret)
+			return ret;
 	}
 
 	/* Coprocessors handed over running must be described in every case. */

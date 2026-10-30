@@ -1027,29 +1027,150 @@ int board_init(void)
 	return 0;
 }
 
+/*
+ * dram_init() and dram_init_banksize() run before relocation with the data
+ * cache off, where a walk of the flattened device tree is slow: about 60 ms
+ * on the J700, whose 128 KiB tree has the memory node near its end.
+ * ofnode_read_resource() walks the tree up to the node twice for every reg
+ * entry (parent lookup and address translation), which cost about 4 s for
+ * the twelve J700 DRAM ranges. Walk the tree once in dram_init() instead
+ * and keep the result for dram_init_banksize().
+ *
+ * The result is what fdtdec_setup_mem_size_base() and
+ * fdtdec_setup_memory_banksize() give: the same banks in the same order
+ * and the same errors. Before relocation the control tree is always flat.
+ *
+ * In .data because .bss is not usable before relocation.
+ */
+static struct {
+	int ret;	/* for dram_init_banksize() */
+	int ranges;	/* reg entries over all memory nodes */
+	int banks;
+	struct {
+		phys_addr_t start;
+		phys_size_t size;
+	} bank[CONFIG_NR_DRAM_BANKS];
+} apple_dram __section(".data");
+
+/*
+ * Entry @index of the reg property of @node, as ofnode_read_resource()
+ * returns it. For a child of the root that is a plain decode: the cell
+ * counts are the root's and the address translation is an identity.
+ * Anything else takes the generic path.
+ */
+static int apple_dram_entry(const void *fdt, int node, int depth, int index,
+			    phys_addr_t *start, phys_size_t *size)
+{
+	const fdt32_t *reg;
+	struct resource res;
+	int na, ns, len;
+
+	na = fdt_address_cells(fdt, 0);
+	ns = fdt_size_cells(fdt, 0);
+	if (depth != 1 || na < 1 || na > 2 || ns < 1 || ns > 2) {
+		if (ofnode_read_resource(offset_to_ofnode(node), index, &res))
+			return -EINVAL;
+		*start = res.start;
+		*size = res.end - res.start + 1;
+		return 0;
+	}
+
+	reg = fdt_getprop(fdt, node, "reg", &len);
+	if (!reg || index >= len / (int)sizeof(*reg) / (na + ns))
+		return -EINVAL;
+	reg += index * (na + ns);
+	*start = fdt_read_number(reg, na);
+	*size = fdt_read_number(reg + na, ns);
+
+	return 0;
+}
+
+static bool apple_dram_is_memory(const void *fdt, int node)
+{
+	const char *type;
+	int len;
+
+	type = fdt_getprop(fdt, node, "device_type", &len);
+
+	return type && len == sizeof("memory") &&
+	       !memcmp(type, "memory", sizeof("memory")) &&
+	       ofnode_is_enabled(offset_to_ofnode(node));
+}
+
+/* Matches what fdt_path_offset(fdt, "/memory") finds. */
+static bool apple_dram_is_path(const void *fdt, int node)
+{
+	const char *name = fdt_get_name(fdt, node, NULL);
+
+	return name && !strncmp(name, "memory", 6) &&
+	       (!name[6] || name[6] == '@');
+}
+
 int dram_init(void)
 {
-	return fdtdec_setup_mem_size_base();
+	const void *fdt = gd->fdt_blob;
+	phys_addr_t start;
+	phys_size_t size;
+	int node, depth = -1, path = -1, nodes = 0, i;
+	bool fill = true;
+
+	apple_dram.ret = -EINVAL;
+	apple_dram.ranges = 0;
+	apple_dram.banks = 0;
+
+	for (node = fdt_next_node(fdt, -1, &depth); node >= 0 && depth >= 0;
+	     node = fdt_next_node(fdt, node, &depth)) {
+		if (path < 0 && depth == 1 && apple_dram_is_path(fdt, node))
+			path = node;
+		if (!apple_dram_is_memory(fdt, node))
+			continue;
+
+		/* fdtdec_setup_memory_banksize() needs the first node only. */
+		if (!nodes++)
+			apple_dram.ret = 0;
+		for (i = 0; !apple_dram_entry(fdt, node, depth, i, &start, &size); i++) {
+			apple_dram.ranges++;
+			if (!fill || apple_dram.banks == CONFIG_NR_DRAM_BANKS)
+				continue;
+			apple_dram.bank[apple_dram.banks].start = start;
+			apple_dram.bank[apple_dram.banks].size = size;
+			apple_dram.banks++;
+		}
+		/* ... and stops at the first empty node after that one. */
+		if (!i && nodes > 1)
+			fill = false;
+	}
+
+	if (apple_dram.ranges > CONFIG_NR_DRAM_BANKS)
+		apple_dram.ret = -E2BIG;
+
+	if (path < 0 || apple_dram_entry(fdt, path, 1, 0, &start, &size)) {
+		debug("%s: no /memory range\n", __func__);
+		return -EINVAL;
+	}
+	gd->ram_base = (unsigned long)start;
+	gd->ram_size = size;
+
+	return 0;
 }
 
 int dram_init_banksize(void)
 {
-	ofnode mem = ofnode_null();
-	struct resource res;
-	int bank = 0, reg;
+	int bank;
 
-	/* fdtdec_setup_memory_banksize() stops silently at the array limit. */
-	while (ofnode_valid(mem = fdtdec_get_next_memory_node(mem))) {
-		for (reg = 0; !ofnode_read_resource(mem, reg, &res); reg++) {
-			if (++bank > CONFIG_NR_DRAM_BANKS) {
-				log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
-					bank, CONFIG_NR_DRAM_BANKS);
-				return -E2BIG;
-			}
-		}
+	/* fdtdec_setup_memory_banksize() would stop silently at the limit. */
+	if (apple_dram.ret == -E2BIG)
+		log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
+			apple_dram.ranges, CONFIG_NR_DRAM_BANKS);
+	if (apple_dram.ret)
+		return apple_dram.ret;
+
+	for (bank = 0; bank < apple_dram.banks; bank++) {
+		gd->bd->bi_dram[bank].start = apple_dram.bank[bank].start;
+		gd->bd->bi_dram[bank].size = apple_dram.bank[bank].size;
 	}
 
-	return fdtdec_setup_memory_banksize();
+	return 0;
 }
 
 extern long fw_dtb_pointer;

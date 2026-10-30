@@ -1173,36 +1173,90 @@ u64 get_page_table_size(void)
 
 /*
  * The ESP U-Boot boots from, as "dev:part".  It is the ESP that the boot
- * loader names in /chosen/asahi,efi-system-partition.  Where that ESP holds
- * no EFI boot loader but another ESP on the same disk does, the other one is
- * used: on a Mac whose stub ESP (where Stage 1 finds Stage 2) is not the
- * ESP of the installed OS, the loader's ESP is the OS's.  The OS is then
- * told that ESP (see ft_board_setup()), since its firmware and boot files
- * live there.
+ * loader names in /chosen/asahi,efi-system-partition.
+ *
+ * Another ESP is used only when the named one does not belong to an
+ * install: it is not on the disk, U-Boot cannot read it, or it holds
+ * neither an EFI boot loader nor vendor firmware (a stub ESP that only
+ * carries Stage 2, as on the J616s, where Fedora has its own ESP).  Even
+ * then the other ESP must be the only one on the disk with an EFI boot
+ * loader, since with two installs side by side U-Boot cannot tell which
+ * is ours.  The OS is then told that ESP (see ft_board_setup()), since its
+ * firmware and boot files live there.
+ *
+ * An ESP that holds vendorfw/ belongs to the install that put it there.
+ * When it is named it is always used, with or without an EFI boot loader,
+ * and the normal boot flow takes over from it.
  */
 #define ASAHI_EFI_LOADER	"EFI/BOOT/BOOTAA64.EFI"
+#define ASAHI_VENDORFW		"vendorfw/firmware.cpio"
 
-static char asahi_esp_uuid[UUID_STR_LEN + 1];
-static bool asahi_esp_moved;
+/* What one disk holds, as seen by asahi_esp_devpart(). */
+struct asahi_esp_scan {
+	int named;		/* ESP with the named UUID, or 0 */
+	bool named_readable;	/* U-Boot can read its file system */
+	bool named_owned;	/* it holds an EFI boot loader or vendorfw/ */
+	int first;		/* first ESP on the disk, or 0 */
+	int other;		/* first other ESP with an EFI boot loader, or 0 */
+	int others;		/* number of other ESPs with an EFI boot loader */
+};
 
-static bool asahi_esp_has_loader(struct blk_desc *desc, int part)
+enum asahi_esp_choice {
+	ASAHI_ESP_NONE,
+	ASAHI_ESP_NAMED,	/* the named ESP, /chosen unchanged */
+	ASAHI_ESP_FIRST,	/* named ESP absent, no single other: the first ESP */
+	ASAHI_ESP_OTHER,	/* scan->other, and /chosen is told about it */
+};
+
+static enum asahi_esp_choice asahi_esp_choose(const struct asahi_esp_scan *scan)
+{
+	if (scan->named && scan->named_readable && scan->named_owned)
+		return ASAHI_ESP_NAMED;
+	if (scan->others == 1)
+		return ASAHI_ESP_OTHER;
+	if (scan->named)
+		return ASAHI_ESP_NAMED;
+	if (scan->first)
+		return ASAHI_ESP_FIRST;
+	return ASAHI_ESP_NONE;
+}
+
+static const char *asahi_esp_state(const struct asahi_esp_scan *scan,
+				   const char *uuid)
+{
+	if (!uuid)
+		return "(none named)";
+	if (!scan->named)
+		return "not on this disk";
+	if (!scan->named_readable)
+		return "unreadable";
+	if (!scan->named_owned)
+		return "has no EFI loader or vendorfw";
+	return "belongs to an install";
+}
+
+static bool asahi_esp_has(struct blk_desc *desc, int part, const char *path)
 {
 	if (fs_set_blk_dev_with_part(desc, part))
 		return false;
 
-	return fs_exists(ASAHI_EFI_LOADER);
+	return fs_exists(path);
 }
+
+static char asahi_esp_uuid[UUID_STR_LEN + 1];
+static bool asahi_esp_moved;
 
 static char *asahi_esp_devpart(void)
 {
+	struct asahi_esp_scan scan;
+	enum asahi_esp_choice choice;
 	struct disk_partition info;
 	struct blk_desc *nvme_blk;
 	const char *uuid = NULL;
-	int devnum, len, p, part, named, first, loader;
-	bool named_loader;
-	char named_uuid[UUID_STR_LEN + 1] = "";
-	char loader_uuid[UUID_STR_LEN + 1] = "";
-	char first_uuid[UUID_STR_LEN + 1] = "";
+	int devnum, len, p, part;
+	char named_uuid[UUID_STR_LEN + 1];
+	char other_uuid[UUID_STR_LEN + 1];
+	char first_uuid[UUID_STR_LEN + 1];
 	static char devpart[64];
 	struct udevice *dev;
 	ofnode node;
@@ -1232,42 +1286,66 @@ static char *asahi_esp_devpart(void)
 		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
 			continue;
 
-		named = first = loader = 0;
-		named_loader = false;
+		memset(&scan, 0, sizeof(scan));
+		named_uuid[0] = other_uuid[0] = first_uuid[0] = '\0';
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
 			if (part_get_info(nvme_blk, p, &info) < 0)
 				break;
 			if (!(info.bootable & PART_EFI_SYSTEM_PARTITION))
 				continue;
 
-			if (!first) {
-				first = p;
+			if (!scan.first) {
+				scan.first = p;
 				strlcpy(first_uuid, info.uuid, sizeof(first_uuid));
 			}
-			if (!named && uuid && !strcasecmp(uuid, info.uuid)) {
-				named = p;
+			if (!scan.named && uuid && !strcasecmp(uuid, info.uuid)) {
+				scan.named = p;
 				strlcpy(named_uuid, info.uuid, sizeof(named_uuid));
-				named_loader = asahi_esp_has_loader(nvme_blk, p);
+				scan.named_readable =
+					!fs_set_blk_dev_with_part(nvme_blk, p);
+				if (scan.named_readable)
+					fs_close();
+				scan.named_owned =
+					asahi_esp_has(nvme_blk, p, ASAHI_EFI_LOADER) ||
+					asahi_esp_has(nvme_blk, p, ASAHI_VENDORFW);
 				continue;
 			}
-			if (!loader && asahi_esp_has_loader(nvme_blk, p)) {
-				loader = p;
-				strlcpy(loader_uuid, info.uuid, sizeof(loader_uuid));
+			if (asahi_esp_has(nvme_blk, p, ASAHI_EFI_LOADER)) {
+				if (!scan.other) {
+					scan.other = p;
+					strlcpy(other_uuid, info.uuid,
+						sizeof(other_uuid));
+				}
+				scan.others++;
 			}
 		}
 
-		if (named && (named_loader || !loader)) {
-			part = named;
+		choice = asahi_esp_choose(&scan);
+		switch (choice) {
+		case ASAHI_ESP_NAMED:
+			part = scan.named;
 			strlcpy(asahi_esp_uuid, named_uuid, sizeof(asahi_esp_uuid));
-		} else if (loader) {
-			part = loader;
-			strlcpy(asahi_esp_uuid, loader_uuid, sizeof(asahi_esp_uuid));
+			printf("ESP: named ESP %d %s; %d other ESP(s) have an EFI loader; using the named ESP\n",
+			       scan.named, asahi_esp_state(&scan, uuid),
+			       scan.others);
+			break;
+		case ASAHI_ESP_OTHER:
+			part = scan.other;
+			strlcpy(asahi_esp_uuid, other_uuid, sizeof(asahi_esp_uuid));
 			asahi_esp_moved = true;
-			printf("ESP: partition %d has the EFI boot loader; the %s ESP (%d) has none\n",
-			       loader, named ? "named" : "first", named ?: first);
-		} else if (first) {
-			part = first;
+			printf("ESP: named ESP %.36s %s; using ESP %d %s, the only other ESP with an EFI loader, and telling the OS\n",
+			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
+			       scan.other, other_uuid);
+			break;
+		case ASAHI_ESP_FIRST:
+			part = scan.first;
 			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
+			printf("ESP: named ESP %.36s %s; %d ESP(s) have an EFI loader; using the first ESP %d\n",
+			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
+			       scan.others, scan.first);
+			break;
+		case ASAHI_ESP_NONE:
+			break;
 		}
 
 		if (part > 0)

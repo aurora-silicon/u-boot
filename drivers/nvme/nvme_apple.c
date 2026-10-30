@@ -16,6 +16,7 @@
 #include <asm/arch/sart.h>
 #include <linux/apple-mailbox.h>
 #include <linux/bitfield.h>
+#include <linux/bug.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
@@ -32,8 +33,6 @@
 #define ANS_BOOT_STATUS		0x01300
 #define  ANS_BOOT_STATUS_OK	0xde71ce55
 #define ANS_MODESEL		0x01304
-#define ANS_UNKNOWN_CTRL	0x24008
-#define  ANS_PRP_NULL_CHECK	(1 << 11)
 #define ANS_LINEAR_SQ_CTRL	0x24908
 #define  ANS_LINEAR_SQ_CTRL_EN	(1 << 0)
 #define ANS_ASQ_DB		0x2490c
@@ -177,23 +176,31 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 {
 	struct apple_nvme_priv *priv =
 		container_of(nvmeq->dev, struct apple_nvme_priv, ndev);
+	u32 page_size = nvmeq->dev->page_size;
 	struct ans_nvmmu_tcb *tcb;
 	u16 tail = nvmeq->sq_tail;
 
+	if (nvmeq->qid == NVME_ADMIN_Q) {
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp1, page_size));
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp2, page_size));
+	}
+
 	tcb = ((void *)priv->tcbs[nvmeq->qid]) + tail * ANS_NVMMU_TCB_PITCH;
 	memset(tcb, 0, sizeof(*tcb));
+	/* Firmware interprets a nonzero opcode as an out-of-line command. */
+	tcb->opcode = 0;
 	if (priv->hw->post_m4) {
 		/* Post-M4 firmware checks the DMA direction against the command. */
-		tcb->opcode = 0;
 		if (!cmd->common.prp1)
 			tcb->flags = 0;
 		else if (cmd->common.opcode & 1)
 			tcb->flags = ANS_NVMMU_TCB_READ;
 		else
 			tcb->flags = ANS_NVMMU_TCB_WRITE;
-	} else {
-		tcb->opcode = cmd->common.opcode;
+	} else if (cmd->common.prp1) {
 		tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
+	} else {
+		tcb->flags = 0;
 	}
 	tcb->slot = tail;
 	tcb->prpl_len = cmd->rw.length;
@@ -560,9 +567,6 @@ static int apple_nvme_boot(struct udevice *dev)
 	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
 	writel(((ANS_MAX_QUEUE_DEPTH << 16) | ANS_MAX_QUEUE_DEPTH),
 	       priv->base + ANS_MAX_PEND_CMDS_CTRL);
-
-	writel(readl(priv->base + ANS_UNKNOWN_CTRL) & ~ANS_PRP_NULL_CHECK,
-	       priv->base + ANS_UNKNOWN_CTRL);
 
 	writel((ANS_NVMMU_TCB_SIZE / ANS_NVMMU_TCB_PITCH) - 1,
 	       priv->nvmmu + ANS_NVMMU_NUM);

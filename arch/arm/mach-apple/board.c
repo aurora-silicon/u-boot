@@ -1577,6 +1577,31 @@ static int j713_prepare_input(void)
 	return 0;
 }
 
+/*
+ * On a machine with a built-in keyboard, leave the USB-C ports to the OS.
+ *
+ * U-Boot drives a Type-C port as a USB 2.0 host only: its SuperSpeed lanes
+ * stay on the dummy PIPE and the alternate mode set up by the Type-C
+ * controller is not followed.  A dock that is already attached and in
+ * DisplayPort alternate mode can keep the state of such a session after the
+ * OS takes over: the Plugable UD-ULTC4K on a T6000 MacBook Pro then shows
+ * only its USB 3 hub, and its USB 2.0 hub, keyboard and mouse stay absent
+ * until the cable is reconnected.  The built-in keyboard covers the boot
+ * prompt, so "usb start" is not needed to reach it.  Machines without one
+ * keep it, and "usb start" still works by hand.
+ */
+static void apple_typec_late_init(void)
+{
+	if (!ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,spi-hid-transport")) &&
+	    !ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,dockchannel-hid")))
+		return;
+
+	if (!strcmp(env_get("preboot") ?: "", "usb start"))
+		env_set("preboot", "");
+}
+
 int board_late_init(void)
 {
 	bool start_keyboard = true;
@@ -1601,6 +1626,8 @@ int board_late_init(void)
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);
+	else
+		apple_typec_late_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M

@@ -385,7 +385,6 @@ static int ans_probe(struct udevice *dev)
 static int ans_remove(struct udevice *dev)
 {
 	struct apple_nvme_apif *priv = dev_get_priv(dev);
-	ulong start;
 	int ret;
 
 	if (priv->failed)
@@ -393,22 +392,25 @@ static int ans_remove(struct udevice *dev)
 	for (unsigned int i = 0; i < NVME_Q_NUM; i++)
 		if (priv->pending[i].registered)
 			return -EBUSY;
-	/* Native queue-address setters require valid pinned pages, including
-	 * at shutdown. Match Linux's post-M4 fence: clear EN, wait for RDY=0,
-	 * then quiesce RTKit and release DMA grants. Never program address 0.
+	/* Match the native ESP reader's stop order: retire I/O queues, wait
+	 * for normal NVMe shutdown and RDY=0, then quiesce both RTKit peers.
+	 * Pinned queue addresses stay valid throughout; do not write address 0.
 	 */
-	writel(priv->ndev.ctrl_config & ~NVME_CC_ENABLE, &priv->ndev.bar->cc);
-	start = get_timer(0);
-	while (readl(&priv->ndev.bar->csts) & NVME_CSTS_RDY) {
-		ret = apple_rtkit_poll(priv->rtkit, 0);
-		if (ret && ret != -ETIMEDOUT && ret != -ENODATA)
-			return ret;
-		if (get_timer(start) >= 5000)
-			return -ETIMEDOUT;
+	ret = nvme_retire_io_queues(dev);
+	if (ret) {
+		dev_err(dev, "I/O queue retirement failed: %d\n", ret);
+		return ret;
+	}
+	ret = nvme_shutdown(dev);
+	if (ret) {
+		dev_err(dev, "NVMe controller shutdown failed: %d\n", ret);
+		return ret;
 	}
 	ret = apple_rtkit_shutdown(priv->rtkit, APPLE_RTKIT_PWR_STATE_QUIESCED);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "RTKit quiesce failed: %d\n", ret);
 		return ret;
+	}
 	apple_rtkit_free(priv->rtkit);
 	priv->rtkit = NULL;
 	if (priv->rtkit_release_failed)

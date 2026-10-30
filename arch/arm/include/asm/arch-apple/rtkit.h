@@ -46,5 +46,6 @@ bool apple_rtkit_helper_input_retained(struct udevice *dev);
 void apple_rtkit_helper_input_failed(struct udevice *dev);
 
 bool apple_rtkit_helper_allowed(ofnode node);
+bool apple_rtkit_helper_needs_live_handoff(ofnode node);
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */
 int apple_rtkit_helper_fdt_fixup(void *blob);

@@ -1516,6 +1516,10 @@ int board_late_init(void)
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);
+	/* The T6050 guest keeps its own boot command; it still needs input. */
+	else if (m5_apif_guest() && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+		 IS_ENABLED(CONFIG_CMDLINE))
+		run_command("mtpkbd start", 0);
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M
@@ -1572,10 +1576,11 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
 		ret = apple_rtkit_helper_fdt_fixup(blob);
 		/*
-		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
-		 * fixup only costs the OS the running session: keep booting.
+		 * A refused J713 or APIF handoff must not reach Linux. Elsewhere a
+		 * failed fixup only costs the OS the running session: keep booting.
 		 */
-		if (ret && of_machine_is_compatible("apple,j713"))
+		if (ret && (of_machine_is_compatible("apple,j713") ||
+			    apple_apif_present()))
 			return ret;
 		if (ret)
 			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",

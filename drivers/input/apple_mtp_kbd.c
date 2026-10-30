@@ -33,7 +33,7 @@ struct apple_mtp_kbd_priv {
 	u32 fifo_size;
 
 	/*
-	 * Newer MTP firmware (A18 Pro) announces its interfaces on the comm
+	 * Newer MTP firmware (A18 Pro and M5) announces its interfaces on the comm
 	 * interface and only streams keyboard reports once the host enables
 	 * the keyboard interface.
 	 */
@@ -513,7 +513,8 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 * Preserve every INIT packet for Linux, including STM and trackpad.
 	 */
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
-			 of_machine_is_compatible("apple,j713");
+			 of_machine_is_compatible("apple,j713") ||
+			 apple_rtkit_helper_needs_live_handoff(dev_ofnode(priv->helper));
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {

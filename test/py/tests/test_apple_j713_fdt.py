@@ -200,7 +200,7 @@ int main(int argc, char **argv)
  assert(argc == 4);
  int fault = atoi(argv[3]), len;
  size_t capacity = fault == 1 ? 65536 : 1024 * 1024;
- void *source = load(argv[1], 128 * 1024), *target = load(argv[2], capacity);
+ void *source = load(argv[1], J713_FDT_MAX_SOURCE), *target = load(argv[2], capacity);
  if (fault == 18 || fault == 19) {
   /* Model EFI_DT_APPLY_FIXUPS allocation from used tree bytes + real pad. */
   size_t used = fdt_off_dt_strings(target) + fdt_size_dt_strings(target);
@@ -562,11 +562,23 @@ def test_j713_sep_manifests(tmp_path):
     subprocess.run([str(binary), str(older), str(target), '0'], check=True)
 
 
+def test_j713_large_source(tmp_path):
+    # m1n1's J713 tree passed 128 KiB once it carried the SEP node and its boot
+    # manifests: a source of about 160 KiB must still import.
+    binary = build_importer(tmp_path)
+    text = fixture_tree(True).replace(
+        "mtp {", "filler { apple,padding = [" + "00 " * (152 * 1024) + "]; };\n        mtp {", 1)
+    source = compile_tree(tmp_path, 'large', text)
+    assert 150 * 1024 < source.stat().st_size < 192 * 1024
+    target = compile_tree(tmp_path, 'os', fixture_tree(False))
+    subprocess.run([str(binary), str(source), str(target), '0'], check=True)
+
+
 def test_j713_fdt_padding_guard():
     repo = Path(__file__).resolve().parents[3]
     header = repo / 'arch/arm/include/asm/arch-apple/j713_fdt.h'
-    for enabled, pad, valid in [(True, 0x3000, False), (True, 144 * 1024 - 1, False),
-                                (True, 144 * 1024, True), (True, 0x40000, True),
+    for enabled, pad, valid in [(True, 0x3000, False), (True, 208 * 1024 - 1, False),
+                                (True, 208 * 1024, True), (True, 0x40000, True),
                                 (False, 0x3000, True)]:
         command = ['cc', '-x', 'c', '-fsyntax-only', '-include', str(header),
                    '-DCONFIG_SYS_FDT_PAD=' + str(pad)]

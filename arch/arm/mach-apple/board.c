@@ -8,6 +8,8 @@
 #include <command.h>
 #include <efi_loader.h>
 #include <env.h>
+#include <fs.h>
+#include <u-boot/uuid.h>
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
@@ -22,6 +24,7 @@
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
 #include <asm/arch/j713_fdt.h>
+#include <asm/arch/nvme_apple.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -936,6 +939,41 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 	}
 };
 
+/*
+ * Apple M4 Pro (T6040; its blocks carry T6041 compatibles).  Every register
+ * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
+ * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
+ * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
+ * T8140.
+ */
+static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 5] = {
+	{
+		/* I/O */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE ECAM (the DT's config reg) */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE endpoint windows (both DT ranges) */
+		.virt = 0xb80000000,
+		.phys = 0xb80000000,
+		.size = SZ_1G + SZ_512M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
 /* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
  * RAM and framebuffer entries are populated from the m1n1-patched FDT.
  */
@@ -1054,6 +1092,8 @@ void build_mem_map(void)
 		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
+	else if (of_machine_is_compatible("apple,t6040"))
+		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
 	else if (of_machine_is_compatible("apple,t8152") &&
@@ -1062,8 +1102,10 @@ void build_mem_map(void)
 	else
 		panic("Unsupported SoC\n");
 
-	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map) {
-		int ram_slot = mem_map == t8132_mem_map ? 8 : 1;
+	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
+	    mem_map == t6040_mem_map) {
+		int ram_slot = mem_map == t8132_mem_map ? 8 :
+			       mem_map == t6040_mem_map ? 3 : 1;
 
 		/* LMB and EFI see every bank, so the MMU must map every bank. */
 		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
@@ -1129,12 +1171,38 @@ u64 get_page_table_size(void)
 	return SZ_256K;
 }
 
+/*
+ * The ESP U-Boot boots from, as "dev:part".  It is the ESP that the boot
+ * loader names in /chosen/asahi,efi-system-partition.  Where that ESP holds
+ * no EFI boot loader but another ESP on the same disk does, the other one is
+ * used: on a Mac whose stub ESP (where Stage 1 finds Stage 2) is not the
+ * ESP of the installed OS, the loader's ESP is the OS's.  The OS is then
+ * told that ESP (see ft_board_setup()), since its firmware and boot files
+ * live there.
+ */
+#define ASAHI_EFI_LOADER	"EFI/BOOT/BOOTAA64.EFI"
+
+static char asahi_esp_uuid[UUID_STR_LEN + 1];
+static bool asahi_esp_moved;
+
+static bool asahi_esp_has_loader(struct blk_desc *desc, int part)
+{
+	if (fs_set_blk_dev_with_part(desc, part))
+		return false;
+
+	return fs_exists(ASAHI_EFI_LOADER);
+}
+
 static char *asahi_esp_devpart(void)
 {
 	struct disk_partition info;
 	struct blk_desc *nvme_blk;
 	const char *uuid = NULL;
-	int devnum, len, p, part, ret;
+	int devnum, len, p, part, named, first, loader;
+	bool named_loader;
+	char named_uuid[UUID_STR_LEN + 1] = "";
+	char loader_uuid[UUID_STR_LEN + 1] = "";
+	char first_uuid[UUID_STR_LEN + 1] = "";
 	static char devpart[64];
 	struct udevice *dev;
 	ofnode node;
@@ -1160,22 +1228,46 @@ static char *asahi_esp_devpart(void)
 
 		dev = dev_get_parent(nvme_blk->bdev);
 		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t8132-nvme-ans2"))
+		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
 			continue;
 
+		named = first = loader = 0;
+		named_loader = false;
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
-			ret = part_get_info(nvme_blk, p, &info);
-			if (ret < 0)
+			if (part_get_info(nvme_blk, p, &info) < 0)
 				break;
+			if (!(info.bootable & PART_EFI_SYSTEM_PARTITION))
+				continue;
 
-			if (info.bootable & PART_EFI_SYSTEM_PARTITION) {
-				if (uuid && strcasecmp(uuid, info.uuid) == 0) {
-					part = p;
-					break;
-				}
-				if (part == 0)
-					part = p;
+			if (!first) {
+				first = p;
+				strlcpy(first_uuid, info.uuid, sizeof(first_uuid));
 			}
+			if (!named && uuid && !strcasecmp(uuid, info.uuid)) {
+				named = p;
+				strlcpy(named_uuid, info.uuid, sizeof(named_uuid));
+				named_loader = asahi_esp_has_loader(nvme_blk, p);
+				continue;
+			}
+			if (!loader && asahi_esp_has_loader(nvme_blk, p)) {
+				loader = p;
+				strlcpy(loader_uuid, info.uuid, sizeof(loader_uuid));
+			}
+		}
+
+		if (named && (named_loader || !loader)) {
+			part = named;
+			strlcpy(asahi_esp_uuid, named_uuid, sizeof(asahi_esp_uuid));
+		} else if (loader) {
+			part = loader;
+			strlcpy(asahi_esp_uuid, loader_uuid, sizeof(asahi_esp_uuid));
+			asahi_esp_moved = true;
+			printf("ESP: partition %d has the EFI boot loader; the %s ESP (%d) has none\n",
+			       loader, named ? "named" : "first", named ?: first);
+		} else if (first) {
+			part = first;
+			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
 		}
 
 		if (part > 0)
@@ -1207,7 +1299,7 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for J700 (T8140) and J713 (T8132).
+ * Aurora Silicon boot flow for J700 (T8140), J713 (T8132) and J616s (T6040).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
@@ -1290,9 +1382,13 @@ static void apple_efi_late_init(bool start_keyboard)
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
 		env_set("preboot", "");
-	/* Keep the added boot time small; a key on the console still stops it. */
+	/*
+	 * Boot without a countdown.  With bootdelay 0 autoboot still polls
+	 * the console once, so a key held on the serial console (or on the
+	 * internal keyboard where U-Boot drives it) stops at the prompt.
+	 */
 	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
-		env_set("bootdelay", "1");
+		env_set("bootdelay", "0");
 
 	/* EFI ConIn uses the active stdin; keep serial input available. */
 	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
@@ -1377,8 +1473,12 @@ int board_late_init(void)
 		if (ret)
 			printf("J713: input unavailable (%d); continuing boot\n", ret);
 	}
+	/* T6040: the MTP stays with Linux (apple_rtkit_helper_allowed()). */
+	if (of_machine_is_compatible("apple,t6040"))
+		start_keyboard = false;
 	if (of_machine_is_compatible("apple,t8140") ||
-	    of_machine_is_compatible("apple,t8132"))
+	    of_machine_is_compatible("apple,t8132") ||
+	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);
 
 	/* somewhat based on the Linux Kernel boot requirements:
@@ -1438,6 +1538,21 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		if (ret)
 			return ret;
 		printf("J713: OS devicetree runtime import complete\n");
+	}
+
+	/* RTKit buffers of an ANS session handed on live stay the firmware's. */
+	ret = apple_nvme_fdt_fixup(blob);
+	if (ret) {
+		printf("ANS: cannot reserve its RTKit buffers for the OS (%d)\n", ret);
+		return ret;
+	}
+
+	/* The OS finds its firmware on the ESP it was booted from. */
+	if (asahi_esp_moved) {
+		node = fdt_path_offset(blob, "/chosen");
+		if (node >= 0)
+			fdt_setprop_string(blob, node, "asahi,efi-system-partition",
+					   asahi_esp_uuid);
 	}
 
 	/*

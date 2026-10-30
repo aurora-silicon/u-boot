@@ -13,15 +13,27 @@
 #include <video_font.h>		/* Get font data, width and height */
 #include "vidconsole_internal.h"
 
+/*
+ * Width of the console in pixels. It is narrower than the display when the
+ * console keeps clear of something drawn beside it, such as the logo.
+ */
+static uint console_width(struct udevice *dev)
+{
+	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
+	struct vidconsole_priv *vc_priv = dev_get_uclass_priv(dev);
+
+	return min_t(uint, VID_TO_PIXEL(vc_priv->xsize_frac), vid_priv->xsize);
+}
+
 static int console_set_row(struct udevice *dev, uint row, int clr)
 {
 	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
 	struct console_simple_priv *priv = dev_get_priv(dev);
 	struct video_fontdata *fontdata = priv->fontdata;
-	void *line, *dst, *end;
-	int pixels = fontdata->height * vid_priv->xsize;
+	uint width = console_width(dev);
+	void *line, *dst;
 	int ret;
-	int i;
+	int i, y;
 	int pbytes;
 
 	ret = check_bpix_support(vid_priv->bpix);
@@ -29,16 +41,26 @@ static int console_set_row(struct udevice *dev, uint row, int clr)
 		return ret;
 
 	line = vid_priv->fb + row * fontdata->height * vid_priv->line_length;
-	dst = line;
 	pbytes = VNBYTES(vid_priv->bpix);
-	for (i = 0; i < pixels; i++)
-		fill_pixel_and_goto_next(&dst, clr, pbytes, pbytes);
-	end = dst;
+	if (width == vid_priv->xsize) {
+		int pixels = fontdata->height * vid_priv->xsize;
+
+		dst = line;
+		for (i = 0; i < pixels; i++)
+			fill_pixel_and_goto_next(&dst, clr, pbytes, pbytes);
+	} else {
+		for (y = 0; y < fontdata->height; y++) {
+			dst = line + y * vid_priv->line_length;
+			for (i = 0; i < width; i++)
+				fill_pixel_and_goto_next(&dst, clr, pbytes,
+							 pbytes);
+		}
+	}
 
 	video_damage(dev->parent,
 		     0,
 		     fontdata->height * row,
-		     vid_priv->xsize,
+		     width,
 		     fontdata->height);
 
 	return 0;
@@ -50,19 +72,32 @@ static int console_move_rows(struct udevice *dev, uint rowdst,
 	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
 	struct console_simple_priv *priv = dev_get_priv(dev);
 	struct video_fontdata *fontdata = priv->fontdata;
+	uint width = console_width(dev);
 	void *dst;
 	void *src;
-	int size;
+	int size, y;
 
 	dst = vid_priv->fb + rowdst * fontdata->height * vid_priv->line_length;
 	src = vid_priv->fb + rowsrc * fontdata->height * vid_priv->line_length;
-	size = fontdata->height * vid_priv->line_length * count;
-	memmove(dst, src, size);
+	if (width == vid_priv->xsize) {
+		size = fontdata->height * vid_priv->line_length * count;
+		memmove(dst, src, size);
+	} else {
+		/* Move only the console's columns, a pixel row at a time */
+		size = width * VNBYTES(vid_priv->bpix);
+		for (y = 0; y < fontdata->height * count; y++) {
+			int line = rowdst < rowsrc ? y :
+				   fontdata->height * count - 1 - y;
+
+			memmove(dst + line * vid_priv->line_length,
+				src + line * vid_priv->line_length, size);
+		}
+	}
 
 	video_damage(dev->parent,
 		     0,
 		     fontdata->height * rowdst,
-		     vid_priv->xsize,
+		     width,
 		     fontdata->height * count);
 
 	return 0;

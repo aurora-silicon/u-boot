@@ -600,14 +600,54 @@ void *video_get_u_boot_logo(void)
 	return SPLASH_START(u_boot_logo);
 }
 
+/* Where the logo sits: this far in from the right and down from the top */
+#define SPLASH_X	-4
+#define SPLASH_Y	4
+
 static int show_splash(struct udevice *dev)
 {
 	u8 *data = SPLASH_START(u_boot_logo);
 	int ret;
 
-	ret = video_bmp_display(dev, map_to_sysmem(data), -4, 4, true);
+	ret = video_bmp_display(dev, map_to_sysmem(data), SPLASH_X, SPLASH_Y,
+				 true);
 
 	return 0;
+}
+
+/* Space kept between the end of the console text and the logo */
+#define SPLASH_MARGIN	8
+
+/**
+ * console_beside_splash() - Keep the console text clear of the logo
+ *
+ * The logo is drawn at the top right, beside the first rows of the text
+ * console. Lines rewritten in place (the autoboot countdown, the bootflow
+ * scan) clear their whole row, and long lines run on into the logo, so
+ * narrow the console to end just left of it: text wraps there, and rows
+ * are cleared and scrolled only up to that width. The text keeps starting
+ * at the top, beside the logo, and the logo is never drawn over or moved.
+ *
+ * @dev: Video device showing the logo
+ * @cons: Its console device
+ */
+static void console_beside_splash(struct udevice *dev, struct udevice *cons)
+{
+	struct video_priv *priv = dev_get_uclass_priv(dev);
+	struct vidconsole_priv *vc_priv = dev_get_uclass_priv(cons);
+	ulong width, height;
+	long left;
+	uint bpix;
+
+	if (priv->rot || !vc_priv->x_charsize)
+		return;
+	video_bmp_get_info(SPLASH_START(u_boot_logo), &width, &height, &bpix);
+	/* show_splash() aligns the logo with x = SPLASH_X from the right */
+	left = (long)priv->xsize - (long)width + SPLASH_X + 1 - SPLASH_MARGIN;
+	if (left < vc_priv->x_charsize)
+		return;
+	vc_priv->xsize_frac = VID_TO_POS(left);
+	vc_priv->cols = left / vc_priv->x_charsize;
 }
 
 bool video_is_hidpi(const struct video_priv *priv)
@@ -763,6 +803,7 @@ static int video_post_probe(struct udevice *dev)
 			log_debug("Cannot show splash screen\n");
 			return ret;
 		}
+		console_beside_splash(dev, cons);
 	}
 
 	/* register cyclic as soon as the first video device is probed */

@@ -224,6 +224,15 @@ static bool j713_omitted_display(const void *dst, const void *src, int sn)
 	return false;
 }
 
+/* m1n1 reserves the AOP's firmware and DAPF windows for the AOP of its control
+ * tree. An OS tree without that AOP owns none of them.
+ */
+static bool j713_omitted_aop(const void *dst, const void *src, int sn)
+{
+	return !fdt_node_check_compatible(src, sn, "apple,t8132-aop") &&
+	       j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
+}
+
 static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 {
 	const fdt32_t *value;
@@ -262,7 +271,7 @@ static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 			break;
 		}
 		cells = 1 + na + ns;
-		if (!j713_omitted_display(dst, src, owner)) {
+		if (!j713_omitted_display(dst, src, owner) && !j713_omitted_aop(dst, src, owner)) {
 			int target = j713_map_node(dst, src, owner);
 			int parent = target < 0 ? target : fdt_parent_offset(dst, target);
 
@@ -715,6 +724,41 @@ static int j713_devices(void *dst, const void *src)
 	return 0;
 }
 
+/* m1n1 publishes this boot's local-policy and iBoot manifests on the node its
+ * sep alias names; the SEP driver refuses to attach without them. An OS tree
+ * without the SEP imports as before. A manifest this boot did not publish,
+ * including from a source tree without the SEP, is removed from the OS tree,
+ * so an older copy never survives.
+ */
+static int j713_sep(void *dst, const void *src)
+{
+	static const char * const names[] = {
+		"local-policy-manifest", "iboot-manifest",
+	};
+	int sn = j713_alias_node(src, "sep"), dn = j713_alias_node(dst, "sep");
+	unsigned int i;
+	int ret;
+
+	if (dn == -FDT_ERR_NOTFOUND)
+		return 0;
+	if (dn < 0 || fdt_node_check_compatible(dst, dn, "apple,sep"))
+		return -EINVAL;
+	if (sn != -FDT_ERR_NOTFOUND &&
+	    (sn < 0 || fdt_node_check_compatible(src, sn, "apple,sep")))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		ret = sn < 0 ? -ENOENT : j713_copy_prop(dst, dn, src, sn, names[i], -1);
+		if (ret == -ENOENT) {
+			ret = fdt_delprop(dst, dn, names[i]);
+			if (ret == -FDT_ERR_NOTFOUND)
+				ret = 0;
+		}
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int j713_display_refs(void *dst, const void *src)
 {
 	static const char * const aliases[] = { "dcp", "disp0", "disp0_piodma" };
@@ -751,6 +795,37 @@ static int j713_display_refs(void *dst, const void *src)
 		}
 	}
 	return 0;
+}
+
+static bool j713_enabled(const void *fdt, int node)
+{
+	const char *status = fdt_getprop(fdt, node, "status", NULL);
+
+	return !status || !strcmp(status, "okay") || !strcmp(status, "ok");
+}
+
+/* m1n1 programs the AOP DART's DAPF and reserves the AOP's firmware segments
+ * and DAPF windows for this boot, or disables the AOP. Reference those
+ * reservations from the OS tree's AOP, or disable it there too. An OS tree
+ * whose AOP describes its own reservations (an older kernel) keeps them.
+ */
+static int j713_aop(void *dst, const void *src)
+{
+	static const char compatible[] = "apple,t8132-aop";
+	int dn = fdt_node_offset_by_compatible(dst, -1, compatible), sn;
+
+	if (dn < 0)
+		return dn == -FDT_ERR_NOTFOUND ? 0 : -EINVAL;
+	if (!j713_enabled(dst, dn) || fdt_getprop(dst, dn, "memory-region", NULL))
+		return 0;
+	sn = fdt_node_offset_by_compatible(src, -1, compatible);
+	if (sn < 0 && sn != -FDT_ERR_NOTFOUND)
+		return -EINVAL;
+	if (sn < 0 || !j713_enabled(src, sn) ||
+	    !fdt_getprop(src, sn, "memory-region", NULL) ||
+	    j713_map_node(dst, src, sn) != dn)
+		return fdt_setprop_string(dst, dn, "status", "disabled");
+	return j713_phandles(dst, src, sn, "memory-region", -1);
 }
 
 static int j713_chosen(void *dst, const void *src)
@@ -906,11 +981,13 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = j713_reservations(scratch, source);
 	ret = ret ?: j713_cpus(scratch, source);
 	ret = ret ?: j713_devices(scratch, source);
+	ret = ret ?: j713_sep(scratch, source);
 	ret = ret ?: j713_bluetooth(scratch, source);
 	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy0");
 	ret = ret ?: j713_atc_tunables(scratch, source, "atcphy1");
 	ret = ret ?: j713_pcie_admission(scratch, source);
 	ret = ret ?: j713_display_refs(scratch, source);
+	ret = ret ?: j713_aop(scratch, source);
 	ret = ret ?: j713_chosen(scratch, source);
 	if (!ret) {
 		/* All helper paths must resolve before its real hardware fixup runs. */

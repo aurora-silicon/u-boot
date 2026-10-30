@@ -666,6 +666,8 @@ struct nvme_queue {
 	u8 cqe_seen;
 	/* A command timed out and the controller has not completed it yet. */
 	bool timed_out;
+	/* Queue pages supplied by firmware remain reserved across boot stages. */
+	bool external_buffers;
 	unsigned long cmdid_data[];
 };
 
@@ -684,6 +686,15 @@ struct nvme_ns {
 };
 
 struct nvme_ops {
+	/* Optional firmware-owned queue storage, before setup_queue(). */
+	int (*alloc_queue)(struct nvme_queue *nvmeq);
+	/* Optional replacement for direct AQA/ASQ/ACQ register programming. */
+	int (*configure_admin_queue)(struct nvme_queue *nvmeq);
+	/* Prepare DMA state before publishing the command to the SQ. */
+	int (*prepare_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+			   size_t payload_len);
+	/* Register DMA after the final command is visible in the SQ. */
+	int (*register_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd);
 	/**
 	 * setup_queue - Controller-specific NVM Express queue setup.
 	 *
@@ -708,7 +719,7 @@ struct nvme_ops {
 	 * @cmd:   NVM Express command, or NULL when completing a command
 	 *         that had timed out
 	 */
-	void (*complete_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd);
+	int (*complete_cmd)(struct nvme_queue *nvmeq, struct nvme_command *cmd);
 	/**
 	 * queue_created - Controller-specific setup after queue creation
 	 *

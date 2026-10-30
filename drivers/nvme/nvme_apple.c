@@ -255,7 +255,7 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 	writel(tail, priv->q_db[nvmeq->qid]);
 }
 
-static void apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
+static int apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
 				    struct nvme_command *cmd)
 {
 	struct apple_nvme_priv *priv =
@@ -271,6 +271,7 @@ static void apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
 	if (++tail == nvmeq->q_depth)
 		tail = 0;
 	nvmeq->sq_tail = tail;
+	return 0;
 }
 
 /*

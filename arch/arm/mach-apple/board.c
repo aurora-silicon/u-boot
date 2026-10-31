@@ -16,7 +16,6 @@
 #include <time.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
@@ -1503,14 +1502,6 @@ static void apple_efi_late_init(bool start_keyboard)
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
 		env_set("preboot", "");
-	/*
-	 * Boot without a countdown.  With bootdelay 0 autoboot still polls
-	 * the console once, so a key held on the serial console (or on the
-	 * internal keyboard where U-Boot drives it) stops at the prompt.
-	 */
-	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
-		env_set("bootdelay", "0");
-
 	/* EFI ConIn uses the active stdin; keep serial input available. */
 	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
 	    IS_ENABLED(CONFIG_CMDLINE))

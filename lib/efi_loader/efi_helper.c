@@ -6,6 +6,7 @@
 #define LOG_CATEGORY LOGC_EFI
 
 #include <blkmap.h>
+#include <bootstage.h>
 #include <bootm.h>
 #include <efi_device_path.h>
 #include <env.h>
@@ -598,6 +599,16 @@ efi_status_t efi_install_fdt(void *fdt)
 	if (image_setup_libfdt(&img, fdt, false)) {
 		log_err("failed to process device tree\n");
 		return EFI_LOAD_ERROR;
+	}
+
+	/*
+	 * Hand the boot timings to the payload, as bootm does.  The last
+	 * record marks the moment the device tree is handed over.
+	 */
+	if (IS_ENABLED(CONFIG_BOOTSTAGE_FDT)) {
+		bootstage_mark_name(BOOTSTAGE_ID_ALLOC, "efi_install_fdt");
+		if (bootstage_fdt_add(fdt))
+			log_warning("bootstage: failed to add to device tree\n");
 	}
 
 	/* Create memory reservations as indicated by the device tree */

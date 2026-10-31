@@ -266,7 +266,7 @@ static uint32_t print_time_record(struct bootstage_record *rec, uint32_t prev)
  * @param blob	Device tree blob
  * Return: 0 on success, != 0 on failure.
  */
-static int add_bootstages_devicetree(struct fdt_header *blob)
+int bootstage_fdt_add(void *blob)
 {
 	struct bootstage_data *data = gd->bootstage;
 	int bootstage;
@@ -317,7 +317,7 @@ static int add_bootstages_devicetree(struct fdt_header *blob)
 
 int bootstage_fdt_add_report(void)
 {
-	if (add_bootstages_devicetree(working_fdt))
+	if (bootstage_fdt_add(working_fdt))
 		puts("bootstage: Failed to add to device tree\n");
 
 	return 0;

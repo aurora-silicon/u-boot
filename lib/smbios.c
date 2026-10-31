@@ -875,9 +875,11 @@ static int smbios_write_type7_1level(ulong *current, int handle,
 	t->socket_design = smbios_add_prop_si(ctx, "socket-design",
 					      SYSID_SM_CACHE_SOCKET + level,
 					      NULL);
+	/* @level counts from 0, as the level field of the configuration does */
 	t->config.data = smbios_get_val_si(ctx, "config",
 					   SYSID_SM_CACHE_CONFIG + level,
-					   (level - 1) | SMBIOS_CACHE_OP_UND);
+					   level | SMBIOS_CACHE_ENABLED |
+					   SMBIOS_CACHE_OP_UND);
 	t->max_size.data = smbios_get_val_si(ctx, "max-size",
 					     SYSID_SM_CACHE_MAX_SIZE + level,
 					     0);

@@ -101,9 +101,9 @@ enum {
  */
 int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 {
-	u64 clidr_el1;
+	u64 clidr_el1, mmfr2_el1;
 	u32 csselr_el1;
-	u32 num_sets;
+	u32 num_sets, ways;
 	union ccsidr_el1 creg;
 	int cache_type;
 
@@ -143,11 +143,24 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 	asm volatile("mrs %0, ccsidr_el1" : "=r" (creg.data));
 	debug("CCSIDR_EL1 (Level %d): 0x%llx\n", level + 1, creg.data);
 
-	/* Extract cache size and associativity */
-	cinfo->line_size = 1 << (creg.no_ccidx.linesize + 4);
+	/*
+	 * Extract cache size and associativity. With FEAT_CCIDX
+	 * (ID_AA64MMFR2_EL1.CCIDX), CCSIDR_EL1 has wider fields at other
+	 * positions.
+	 */
+	asm volatile("mrs %0, id_aa64mmfr2_el1" : "=r" (mmfr2_el1));
+	if ((mmfr2_el1 >> 20) & 0xf) {
+		cinfo->line_size = 1 << (creg.ccidx_aarch64.linesize + 4);
+		ways = creg.ccidx_aarch64.associativity + 1;
+		num_sets = creg.ccidx_aarch64.numsets + 1;
+	} else {
+		cinfo->line_size = 1 << (creg.no_ccidx.linesize + 4);
+		ways = creg.no_ccidx.associativity + 1;
+		num_sets = creg.no_ccidx.numsets + 1;
+	}
 
 	/* Map the associativity value */
-	switch (creg.no_ccidx.associativity + 1) {
+	switch (ways) {
 	case CACHE_ASSOC_DIRECT_MAPPED:
 		cinfo->associativity = SMBIOS_CACHE_ASSOC_DMAPPED;
 		break;
@@ -186,14 +199,12 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 		break;
 	}
 
-	num_sets = creg.no_ccidx.numsets + 1;
-	/* Size in KB */
-	cinfo->max_size = (cinfo->associativity * num_sets * cinfo->line_size) /
-			  1024;
+	/* Size in KB, from the number of ways, not the SMBIOS code for it */
+	cinfo->max_size = (ways * num_sets * cinfo->line_size) / 1024;
 
 	debug("L%d Cache:\n", level + 1);
 	debug("Number of bytes in cache line:%u\n", cinfo->line_size);
-	debug("Associativity of cache:%u\n", cinfo->associativity);
+	debug("Associativity of cache:%u\n", ways);
 	debug("Number of sets in cache:%u\n", num_sets);
 	debug("Cache size in KB:%u\n", cinfo->max_size);
 

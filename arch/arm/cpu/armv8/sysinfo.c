@@ -4,6 +4,8 @@
  * Author: Raymond Mao <raymond.mao@linaro.org>
  */
 #include <dm.h>
+#include <dm/ofnode.h>
+#include <linux/string.h>
 #include <smbios_plat.h>
 #include <stdio.h>
 #include <sysinfo.h>
@@ -208,6 +210,26 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 	return 0;
 }
 
+/* Count the enabled CPU nodes of the device tree, or return 0 if it has none */
+static int sysinfo_count_dt_cpus(void)
+{
+	ofnode cpus, node;
+	int count = 0;
+
+	cpus = ofnode_path("/cpus");
+	if (!ofnode_valid(cpus))
+		return 0;
+
+	ofnode_for_each_subnode(node, cpus) {
+		const char *type = ofnode_read_string(node, "device_type");
+
+		if (type && !strcmp(type, "cpu") && ofnode_is_enabled(node))
+			count++;
+	}
+
+	return count;
+}
+
 int sysinfo_get_processor_info(struct processor_info *pinfo)
 {
 	u64 mpidr, core_count;
@@ -275,9 +297,14 @@ int sysinfo_get_processor_info(struct processor_info *pinfo)
 	debug("CPU architecture: 0x%x\n", midr.fields.architecture);
 	debug("CPU variant: 0x%x\n", midr.fields.variant);
 
-	/* Extract number of cores */
-	core_count = (mpidr >> 0) & 0xFF;
-	pinfo->core_count = core_count + 1;
+	/*
+	 * Count the cores in the device tree. MPIDR_EL1 only identifies the
+	 * boot core, so its Aff0 is a guess kept for boards without CPU nodes.
+	 */
+	core_count = sysinfo_count_dt_cpus();
+	if (!core_count)
+		core_count = ((mpidr >> 0) & 0xFF) + 1;
+	pinfo->core_count = core_count;
 	debug("CPU Core Count: %d\n", pinfo->core_count);
 
 	pinfo->core_enabled = pinfo->core_count;

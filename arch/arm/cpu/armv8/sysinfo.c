@@ -308,10 +308,18 @@ int sysinfo_get_processor_info(struct processor_info *pinfo)
 	debug("CPU Core Count: %d\n", pinfo->core_count);
 
 	pinfo->core_enabled = pinfo->core_count;
-	pinfo->characteristics = SMBIOS_PROCESSOR_64BIT |
-		SMBIOS_PROCESSOR_ARM64_SOCID;
+	pinfo->characteristics = SMBIOS_PROCESSOR_64BIT;
 	if (pinfo->core_count > 1)
 		pinfo->characteristics |= SMBIOS_PROCESSOR_MULTICORE;
+
+	/*
+	 * The Processor ID of an Arm64 processor is the SMCCC_ARCH_SOC_ID
+	 * value when the "Arm64 SoC ID" characteristic is set and MIDR_EL1
+	 * otherwise. Nothing here queries SMCCC_ARCH_SOC_ID, so report
+	 * MIDR_EL1 rather than claim an SoC ID and leave the field empty.
+	 */
+	pinfo->id[0] = (u32)midr.data;
+	pinfo->id[1] = 0;
 
 	/*
 	 * Below fields with common values are placed under DT smbios node

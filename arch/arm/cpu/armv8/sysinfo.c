@@ -79,6 +79,7 @@ enum {
 	VENDOR_AMCC = 0x50,
 	VENDOR_QUALCOMM = 0x51,
 	VENDOR_MARVELL = 0x56,
+	VENDOR_APPLE = 0x61,
 	VENDOR_INTEL = 0x69,
 	VENDOR_AMPERE = 0xc0,
 };
@@ -255,6 +256,9 @@ int sysinfo_get_processor_info(struct processor_info *pinfo)
 		break;
 	case VENDOR_MARVELL:
 		pinfo->manufacturer = "Marvell International Ltd";
+		break;
+	case VENDOR_APPLE:
+		pinfo->manufacturer = "Apple Inc.";
 		break;
 	case VENDOR_INTEL:
 		pinfo->manufacturer = "Intel Corporation";

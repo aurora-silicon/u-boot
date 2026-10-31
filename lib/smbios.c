@@ -1681,6 +1681,12 @@ static int smbios_write_type17_mem(ulong *current, int handle,
 		t->phy_mem_array_hdl =
 			smbios_get_val_si(ctx, "physical-memory-array-handle",
 					  SYSID_NONE, 0);
+		/* Without one, belong to the first memory array */
+		if (!t->phy_mem_array_hdl &&
+		    !sysinfo_get_data(ctx->dev, SYSID_SM_MEMARRAY_HANDLE, &hdl,
+				      &hdl_size) &&
+		    hdl_size == SYSINFO_MEM_HANDLE_MAX * sizeof(u16))
+			t->phy_mem_array_hdl = *(u16 *)hdl;
 	} else if (type == SMBIOS_MEM_FDT_MEM_NODE) {
 		smbios_pop_type17_size_from_memory_node(ctx->node, t);
 
@@ -1931,6 +1937,12 @@ static int smbios_write_type19_mem(ulong *current, int handle,
 		smbios_pop_type19_addr_si(ctx, t);
 		t->mem_array_hdl = smbios_get_val_si(ctx, "memory-array-handle",
 						     SYSID_NONE, 0);
+		/* Without one, map the first memory array */
+		if (!t->mem_array_hdl &&
+		    !sysinfo_get_data(ctx->dev, SYSID_SM_MEMARRAY_HANDLE, &hdl,
+				      &hdl_size) &&
+		    hdl_size == SYSINFO_MEM_HANDLE_MAX * sizeof(u16))
+			t->mem_array_hdl = *(u16 *)hdl;
 	} else if (type == SMBIOS_MEM_FDT_MEM_NODE) {
 		smbios_pop_type19_addr_from_memory_node(ctx->node, t);
 		/* Read the memory array handles */

@@ -2040,7 +2040,7 @@ static int smbios_write_type19(ulong *current, int *handle,
 
 static int smbios_write_type45_1fw(ulong *current, int handle,
 				   struct smbios_ctx *ctx, int __maybe_unused idx,
-				   int __maybe_unused type)
+				   int self)
 {
 	struct smbios_type45 *t;
 	int len = sizeof(*t);
@@ -2050,33 +2050,29 @@ static int smbios_write_type45_1fw(ulong *current, int handle,
 	fill_smbios_header(t, SMBIOS_FIRMWARE_INVENTORY, len, handle);
 	smbios_set_eos(ctx, t->eos);
 
-	if (ofnode_valid(ctx->node)) {
-		t->component_name = smbios_add_prop(ctx, "component-name",
-						    ofnode_get_name(ctx->node));
-		t->version = smbios_add_prop(ctx, "version", NULL);
-		t->version_format = smbios_get_val_si(ctx, "version-format", SYSID_NONE,
-						      SMBIOS_FW_VERSION_FORMAT_FREE);
-		t->id = smbios_add_prop(ctx, "firmware-id", NULL);
-		t->id_format = smbios_get_val_si(ctx, "firmware-id-format", SYSID_NONE,
-						 SMBIOS_FW_ID_FORMAT_FREE);
-		t->release_date = smbios_add_prop(ctx, "release-date", NULL);
-		t->manufacturer = smbios_add_prop(ctx, "manufacturer", NULL);
-		t->lowest_supported_version =
-			smbios_add_prop(ctx, "lowest-supported-version", NULL);
-		t->image_size = smbios_get_u64_si(ctx, "image-size", SYSID_NONE,
-						  SMBIOS_FW_IMAGE_SIZE_UNKNOWN);
-		t->characteristics = smbios_get_val_si(ctx, "characteristics",
-						       SYSID_NONE, 0);
-		t->state = smbios_get_val_si(ctx, "state", SYSID_NONE,
-					     SMBIOS_FW_STATE_UNKNOWN);
-	} else {
-		/* U-Boot itself */
-		t->component_name = smbios_add_string(ctx, "U-Boot");
-		t->version = smbios_add_string(ctx, PLAIN_VERSION);
-		t->release_date = smbios_add_string(ctx, U_BOOT_DMI_DATE);
-		t->image_size = SMBIOS_FW_IMAGE_SIZE_UNKNOWN;
-		t->state = SMBIOS_FW_STATE_ENABLED;
-	}
+	/* U-Boot's own entry takes its name, version and date from U-Boot */
+	t->component_name = smbios_add_prop(ctx, "component-name",
+					    self ? "U-Boot" :
+					    ofnode_get_name(ctx->node));
+	t->version = smbios_add_prop(ctx, "version",
+				     self ? PLAIN_VERSION : NULL);
+	t->version_format = smbios_get_val_si(ctx, "version-format", SYSID_NONE,
+					      SMBIOS_FW_VERSION_FORMAT_FREE);
+	t->id = smbios_add_prop(ctx, "firmware-id", NULL);
+	t->id_format = smbios_get_val_si(ctx, "firmware-id-format", SYSID_NONE,
+					 SMBIOS_FW_ID_FORMAT_FREE);
+	t->release_date = smbios_add_prop(ctx, "release-date",
+					  self ? U_BOOT_DMI_DATE : NULL);
+	t->manufacturer = smbios_add_prop(ctx, "manufacturer", NULL);
+	t->lowest_supported_version =
+		smbios_add_prop(ctx, "lowest-supported-version", NULL);
+	t->image_size = smbios_get_u64_si(ctx, "image-size", SYSID_NONE,
+					  SMBIOS_FW_IMAGE_SIZE_UNKNOWN);
+	t->characteristics = smbios_get_val_si(ctx, "characteristics",
+					       SYSID_NONE, 0);
+	t->state = smbios_get_val_si(ctx, "state", SYSID_NONE,
+				     self ? SMBIOS_FW_STATE_ENABLED :
+				     SMBIOS_FW_STATE_UNKNOWN);
 
 	len = t->hdr.length + smbios_string_table_len(ctx);
 	*current += len;
@@ -2088,22 +2084,33 @@ static int smbios_write_type45_1fw(ulong *current, int handle,
 /*
  * Firmware Inventory: one structure per subnode of the firmware-inventory
  * node, which describes the firmware components that run before or beside
- * U-Boot, followed by one for U-Boot. Nothing without the node.
+ * U-Boot, followed by one for U-Boot. A subnode named "u-boot" adds to
+ * U-Boot's own entry what only the platform knows, such as whether it can
+ * be updated (characteristics). Nothing without the node.
  */
 static int smbios_write_type45(ulong *current, int *handle,
 			       struct smbios_ctx *ctx)
 {
-	int len;
+	ofnode parent = ctx->node, self = ofnode_null(), child;
+	int hdl_base = *handle;
+	int len = 0, n = 0;
 
-	if (!IS_ENABLED(CONFIG_OF_CONTROL) || !ofnode_valid(ctx->node))
+	if (!IS_ENABLED(CONFIG_OF_CONTROL) || !ofnode_valid(parent))
 		return 0;
 
-	len = smbios_scan_subnodes(current, ctx, handle,
-				   smbios_write_type45_1fw, 0);
-	if (len)
-		(*handle)++;
-	ctx->node = ofnode_null();
-	len += smbios_write_type45_1fw(current, *handle, ctx, 0, 0);
+	ofnode_for_each_subnode(child, parent) {
+		if (!strcmp(ofnode_get_name(child), "u-boot")) {
+			self = child;
+			continue;
+		}
+		ctx->node = child;
+		len += smbios_write_type45_1fw(current, hdl_base + n++, ctx, 0,
+					       0);
+	}
+	ctx->node = self;
+	len += smbios_write_type45_1fw(current, hdl_base + n, ctx, 0, 1);
+	*handle = hdl_base + n;
+	ctx->node = parent;
 
 	return len;
 }

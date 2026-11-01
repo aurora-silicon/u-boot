@@ -935,11 +935,21 @@ static int smbios_write_type7(ulong *current, int *handle,
 	ofnode parent = ctx->node;
 	struct smbios_ctx ctx_bak;
 	int hdl_base = *handle;
+	int written = 0;
+	bool dt_only;
 
 	memcpy(&ctx_bak, ctx, sizeof(ctx_bak));
 
-	/* Get the number of level */
-	level =	smbios_get_val_si(ctx, NULL, SYSID_SM_CACHE_LEVEL, 0);
+	/*
+	 * Get the number of levels from the CPU. When it describes none, write
+	 * the levels the device tree describes, as l<n>-cache nodes.
+	 */
+	if (ctx->dev && !sysinfo_get_int(ctx->dev, SYSID_SM_CACHE_LEVEL, &level)) {
+		dt_only = false;
+	} else {
+		dt_only = true;
+		level = SYSINFO_CACHE_LVL_MAX - 1;
+	}
 	if (level >= SYSINFO_CACHE_LVL_MAX) /* Error, return 0-length */
 		return 0;
 
@@ -950,10 +960,16 @@ static int smbios_write_type7(ulong *current, int *handle,
 			return 0;
 		ctx->subnode_name = buf;
 		ctx->node = ofnode_find_subnode(parent, ctx->subnode_name);
-		*handle = hdl_base + i;
+		if (dt_only && !ofnode_valid(ctx->node)) {
+			memcpy(ctx, &ctx_bak, sizeof(*ctx));
+			continue;
+		}
+		*handle = hdl_base + written++;
 		len += smbios_write_type7_1level(current, *handle, ctx, i);
 		memcpy(ctx, &ctx_bak, sizeof(*ctx));
 	}
+	if (written)
+		*handle = hdl_base + written - 1;
 
 	return len;
 }

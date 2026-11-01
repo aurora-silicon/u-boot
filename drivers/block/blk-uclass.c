@@ -10,6 +10,7 @@
 #include <dm.h>
 #include <log.h>
 #include <malloc.h>
+#include <memalign.h>
 #include <part.h>
 #include <dm/device-internal.h>
 #include <dm/lists.h>
@@ -429,11 +430,89 @@ static int blk_buffer_aligned(struct bounce_buffer *state)
 	return 1;	/* Default, any buffer is OK */
 }
 
+static long blk_read_dev(struct udevice *dev, lbaint_t start, lbaint_t blkcnt,
+			 void *buf);
+
+#if CONFIG_IS_ENABLED(BLOCK_READAHEAD)
+/*
+ * Sequential read-ahead.  A reader that walks a file a few blocks at a time
+ * (an EFI application reading through a filesystem driver, for example)
+ * otherwise sends the device one small command per call.  After two reads in
+ * a row, read a window of CONFIG_BLOCK_READAHEAD_SIZE bytes and serve the
+ * following reads from it.  Any write or erase to the device drops the window.
+ */
+static struct {
+	struct udevice *dev;	/* device the window and @next belong to */
+	lbaint_t start;		/* first block in @buf */
+	lbaint_t count;		/* blocks in @buf, 0 if none */
+	lbaint_t next;		/* block after the last read */
+	void *buf;
+} blk_ra;
+
+static void blk_readahead_drop(struct udevice *dev)
+{
+	if (blk_ra.dev == dev) {
+		blk_ra.dev = NULL;
+		blk_ra.count = 0;
+		blk_ra.next = 0;
+	}
+}
+
+/* Return the number of blocks served from the window, 0 if not served */
+static lbaint_t blk_readahead(struct udevice *dev, struct blk_desc *desc,
+			      lbaint_t start, lbaint_t blkcnt, void *buf)
+{
+	const lbaint_t window = CONFIG_BLOCK_READAHEAD_SIZE >> desc->log2blksz;
+	bool sequential = blk_ra.dev == dev && start == blk_ra.next;
+	lbaint_t count;
+
+	if (blk_ra.dev != dev) {
+		blk_ra.dev = dev;
+		blk_ra.count = 0;
+	}
+	blk_ra.next = start + blkcnt;
+
+	if (!blk_ra.count || start < blk_ra.start ||
+	    start + blkcnt > blk_ra.start + blk_ra.count) {
+		/* Only small sequential reads gain from a window. */
+		if (!sequential || window < 2 || blkcnt > window / 2 ||
+		    start >= desc->lba)
+			return 0;
+		if (!blk_ra.buf)
+			blk_ra.buf = malloc_cache_aligned(CONFIG_BLOCK_READAHEAD_SIZE);
+		if (!blk_ra.buf)
+			return 0;
+		count = min(window, desc->lba - start);
+		blk_ra.count = 0;
+		if (blk_read_dev(dev, start, count, blk_ra.buf) != count)
+			return 0;
+		blk_ra.start = start;
+		blk_ra.count = count;
+		if (blkcnt > count)
+			return 0;
+	}
+
+	memcpy(buf, blk_ra.buf + ((start - blk_ra.start) << desc->log2blksz),
+	       blkcnt << desc->log2blksz);
+
+	return blkcnt;
+}
+#else
+static inline void blk_readahead_drop(struct udevice *dev)
+{
+}
+
+static inline lbaint_t blk_readahead(struct udevice *dev, struct blk_desc *desc,
+				     lbaint_t start, lbaint_t blkcnt, void *buf)
+{
+	return 0;
+}
+#endif
+
 long blk_read(struct udevice *dev, lbaint_t start, lbaint_t blkcnt, void *buf)
 {
 	struct blk_desc *desc = dev_get_uclass_plat(dev);
 	const struct blk_ops *ops = blk_get_ops(dev);
-	ulong blks_read;
 
 	if (!ops->read)
 		return -ENOSYS;
@@ -441,6 +520,19 @@ long blk_read(struct udevice *dev, lbaint_t start, lbaint_t blkcnt, void *buf)
 	if (blkcache_read(desc->uclass_id, desc->devnum,
 			  start, blkcnt, desc->blksz, buf))
 		return blkcnt;
+
+	if (blk_readahead(dev, desc, start, blkcnt, buf) == blkcnt)
+		return blkcnt;
+
+	return blk_read_dev(dev, start, blkcnt, buf);
+}
+
+static long blk_read_dev(struct udevice *dev, lbaint_t start, lbaint_t blkcnt,
+			 void *buf)
+{
+	struct blk_desc *desc = dev_get_uclass_plat(dev);
+	const struct blk_ops *ops = blk_get_ops(dev);
+	ulong blks_read;
 
 	if (IS_ENABLED(CONFIG_BOUNCE_BUFFER) && desc->bb) {
 		struct blk_bounce_buffer bbstate = { .dev = dev };
@@ -478,6 +570,7 @@ long blk_write(struct udevice *dev, lbaint_t start, lbaint_t blkcnt,
 		return -ENOSYS;
 
 	blkcache_invalidate(desc->uclass_id, desc->devnum);
+	blk_readahead_drop(dev);
 
 	if (IS_ENABLED(CONFIG_BOUNCE_BUFFER) && desc->bb) {
 		struct blk_bounce_buffer bbstate = { .dev = dev };
@@ -510,6 +603,7 @@ long blk_erase(struct udevice *dev, lbaint_t start, lbaint_t blkcnt)
 		return -ENOSYS;
 
 	blkcache_invalidate(desc->uclass_id, desc->devnum);
+	blk_readahead_drop(dev);
 
 	return ops->erase(dev, start, blkcnt);
 }
@@ -841,9 +935,18 @@ static int blk_post_probe(struct udevice *dev)
 	return 0;
 }
 
+static int blk_pre_remove(struct udevice *dev)
+{
+	/* A later device may be allocated at the same address. */
+	blk_readahead_drop(dev);
+
+	return 0;
+}
+
 UCLASS_DRIVER(blk) = {
 	.id		= UCLASS_BLK,
 	.name		= "blk",
 	.post_probe	= blk_post_probe,
+	.pre_remove	= blk_pre_remove,
 	.per_device_plat_auto	= sizeof(struct blk_desc),
 };

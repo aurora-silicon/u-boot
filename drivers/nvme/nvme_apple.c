@@ -579,8 +579,8 @@ static int apple_nvme_adopt(struct udevice *dev)
 	}
 
 	cc = readl(&priv->ndev.bar->cc);
-	printf("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
-	       dev->name, cc, csts);
+	debug("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
+	      dev->name, cc, csts);
 
 	/* Only answers to the firmware; the session itself is left alone. */
 	if (mbox_get_by_index(dev, 0, &priv->chan))
@@ -671,9 +671,9 @@ static int apple_nvme_wake(struct udevice *dev)
 	if (!priv->rtk)
 		return -ENOMEM;
 
-	printf("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
-	       dev->name, readl(&priv->ndev.bar->cc),
-	       readl(&priv->ndev.bar->csts));
+	debug("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
+	      dev->name, readl(&priv->ndev.bar->cc),
+	      readl(&priv->ndev.bar->csts));
 	ret = apple_rtkit_boot(priv->rtk);
 	if (ret < 0) {
 		printf("%s: ANS RTKit handshake failed (%d)\n", dev->name, ret);
@@ -883,9 +883,9 @@ static int apple_nvme_remove(struct udevice *dev)
 			printf("%s: could not delete the I/O queues\n", dev->name);
 		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
 		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
-		printf("%s: handing over the live ANS session (CC %#x CSTS %#x)\n",
-		       dev->name, readl(&priv->ndev.bar->cc),
-		       readl(&priv->ndev.bar->csts));
+		debug("%s: handing over the live ANS session (CC %#x CSTS %#x)\n",
+		      dev->name, readl(&priv->ndev.bar->cc),
+		      readl(&priv->ndev.bar->csts));
 		return 0;
 	}
 

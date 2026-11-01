@@ -16,7 +16,6 @@
 #include <time.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
@@ -1384,8 +1383,8 @@ static char *asahi_esp_devpart(void)
 			part = loader;
 			strlcpy(asahi_esp_uuid, loader_uuid, sizeof(asahi_esp_uuid));
 			asahi_esp_moved = true;
-			printf("ESP: partition %d has the EFI boot loader; the %s ESP (%d) has none\n",
-			       loader, named ? "named" : "first", named ?: first);
+			debug("ESP: partition %d has the EFI boot loader; the %s ESP (%d) has none\n",
+			      loader, named ? "named" : "first", named ?: first);
 		} else if (first) {
 			part = first;
 			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
@@ -1435,7 +1434,7 @@ char *env_fat_get_dev_part(void)
  */
 static const char * const apple_efi_env[][2] = {
 	{ "aurora_boot",
-	  "echo AURORA_UBOOT_BOOT: EFI on internal ESP; run aurora_efi; "
+	  "run aurora_efi; "
 	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
 	  "echo AURORA_UBOOT_BOOT: bootflow; bootflow scan -b; "
 	  "echo AURORA_UBOOT_BOOT_FAIL: no bootable entry; run aurora_rescue" },
@@ -1503,14 +1502,6 @@ static void apple_efi_late_init(bool start_keyboard)
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
 		env_set("preboot", "");
-	/*
-	 * Boot without a countdown.  With bootdelay 0 autoboot still polls
-	 * the console once, so a key held on the serial console (or on the
-	 * internal keyboard where U-Boot drives it) stops at the prompt.
-	 */
-	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
-		env_set("bootdelay", "0");
-
 	/* EFI ConIn uses the active stdin; keep serial input available. */
 	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
 	    IS_ENABLED(CONFIG_CMDLINE))
@@ -1569,8 +1560,8 @@ static int j713_prepare_input(void)
 		}
 		udelay(50);
 	}
-	printf("J713: input discovery FIFO has %u bytes at handoff\n",
-	       readl((void *)(data + 0x2c)));
+	debug("J713: input discovery FIFO has %u bytes at handoff\n",
+	      readl((void *)(data + 0x2c)));
 	if (readl((void *)(data + 0x2c)) < 8)
 		return -ETIMEDOUT;
 	apple_rtkit_helper_input_ready(helper);
@@ -1685,7 +1676,7 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		ret = apple_j713_complete_fdt(blob);
 		if (ret)
 			return ret;
-		printf("J713: OS devicetree runtime import complete\n");
+		debug("J713: OS devicetree runtime import complete\n");
 	}
 
 	/* RTKit buffers of an ANS session handed on live stay the firmware's. */

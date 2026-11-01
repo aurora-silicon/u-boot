@@ -32,6 +32,7 @@ enum {
 	SMBIOS_MEMORY_DEVICE = 17,
 	SMBIOS_MEMORY_ARRAY_MAPPED_ADDRESS = 19,
 	SMBIOS_SYSTEM_BOOT_INFORMATION = 32,
+	SMBIOS_FIRMWARE_INVENTORY = 45,
 	SMBIOS_END_OF_TABLE = 127
 };
 
@@ -421,6 +422,30 @@ struct __packed smbios_type32 {
 	u16 handle;
 	u8 reserved[6];
 	u8 boot_status;
+	char eos[SMBIOS_STRUCT_EOS_BYTES];
+};
+
+/* Firmware Inventory Information (SMBIOS 3.5) */
+#define SMBIOS_FW_VERSION_FORMAT_FREE	0
+#define SMBIOS_FW_ID_FORMAT_FREE	0
+#define SMBIOS_FW_IMAGE_SIZE_UNKNOWN	0xffffffffffffffffULL
+#define SMBIOS_FW_STATE_UNKNOWN		2
+#define SMBIOS_FW_STATE_ENABLED		4
+
+struct __packed smbios_type45 {
+	struct smbios_header hdr;
+	u8 component_name;
+	u8 version;
+	u8 version_format;
+	u8 id;
+	u8 id_format;
+	u8 release_date;
+	u8 manufacturer;
+	u8 lowest_supported_version;
+	u64 image_size;
+	u16 characteristics;
+	u8 state;
+	u8 num_assoc_components;
 	char eos[SMBIOS_STRUCT_EOS_BYTES];
 };
 

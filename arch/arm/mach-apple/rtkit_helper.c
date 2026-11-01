@@ -306,7 +306,7 @@ static int rtkit_helper_remove(struct udevice *dev)
 		if (ret)
 			goto stop;
 
-		printf("%s: leaving RTKit running for the OS\n", dev->name);
+		debug("%s: leaving RTKit running for the OS\n", dev->name);
 		apple_rtkit_free(priv->rtk);
 		priv->rtk = NULL;
 		return 0;
@@ -455,8 +455,8 @@ static int rtkit_helper_fdt_publish_j713(struct udevice *dev, void *blob)
 		return ret;
 	priv->handoff_published = true;
 	dev_or_flags(dev, DM_FLAG_LEAVE_PD_ON);
-	printf("%s: initialized session retained for Linux (%d buffers)\n",
-	       dev->name, priv->nbufs);
+	debug("%s: initialized session retained for Linux (%d buffers)\n",
+	      dev->name, priv->nbufs);
 	return 0;
 }
 
@@ -563,8 +563,8 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 		return -ENOSPC;
 
 	priv->handoff_published = true;
-	printf("%s: live OS handoff published (%d buffers, DART stream %u)\n",
-	       dev->name, priv->nbufs, priv->dart_sid);
+	debug("%s: live OS handoff published (%d buffers, DART stream %u)\n",
+	      dev->name, priv->nbufs, priv->dart_sid);
 	return 0;
 }
 

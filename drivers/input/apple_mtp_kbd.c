@@ -240,7 +240,7 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 	case DCHID_EVENT_READY:
 		if (len >= 2 && p[1] == priv->kbd_iface && !priv->ready) {
 			priv->ready = true;
-			printf("mtpkbd: keyboard ready\n");
+			debug("mtpkbd: keyboard ready\n");
 		}
 		break;
 	}
@@ -613,7 +613,7 @@ static int apple_mtp_kbd_handoff(struct udevice *dev)
 		ret = apple_mtp_kbd_replay_j713(priv);
 		if (ret)
 			return ret;
-		printf("mtpkbd: replayed %u startup bytes for Linux\n", priv->init_size);
+		debug("mtpkbd: replayed %u startup bytes for Linux\n", priv->init_size);
 	} else if (priv->announce) {
 		/* T8140 aborts byte writes to DATA_TX8. */
 		for (i = 0; i < priv->init_size; i += sizeof(u32))

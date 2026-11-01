@@ -201,6 +201,12 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 
 	/* Size in KB, from the number of ways, not the SMBIOS code for it */
 	cinfo->max_size = (ways * num_sets * cinfo->line_size) / 1024;
+	/*
+	 * Some cores, Apple's among them, leave the geometry fields empty.
+	 * Describe no level rather than a cache of 0 KiB.
+	 */
+	if (!cinfo->max_size)
+		return -1;
 
 	debug("L%d Cache:\n", level + 1);
 	debug("Number of bytes in cache line:%u\n", cinfo->line_size);

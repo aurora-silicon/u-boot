@@ -19,6 +19,7 @@
 #include <version.h>
 #include <malloc.h>
 #include <dm/ofnode.h>
+#include <u-boot/uuid.h>
 #ifdef CONFIG_CPU
 #include <cpu.h>
 #include <dm/uclass-internal.h>
@@ -471,11 +472,27 @@ static int smbios_write_type0(ulong *current, int *handle,
 	memset(t, 0, len);
 	fill_smbios_header(t, SMBIOS_BIOS_INFORMATION, len, *handle);
 	smbios_set_eos(ctx, t->eos);
-	t->vendor = smbios_add_prop_si(ctx, NULL, SYSID_SM_BIOS_VENDOR,
+	t->vendor = smbios_add_prop_si(ctx, "vendor", SYSID_SM_BIOS_VENDOR,
 				       "U-Boot");
 
-	t->bios_ver = smbios_add_prop_si(ctx, "version", SYSID_SM_BIOS_VER,
-					 PLAIN_VERSION);
+	/*
+	 * A "version" in the device tree names the firmware stages that run
+	 * before U-Boot and make up the platform firmware with it, so the
+	 * version names both, e.g. "aura 1.0.0 / U-Boot 2026.07".
+	 */
+	if (ofnode_valid(ctx->node) &&
+	    ofnode_read_string(ctx->node, "version")) {
+		char ver[SMBIOS_STR_MAX];
+
+		snprintf(ver, sizeof(ver), "%s / U-Boot %s",
+			 ofnode_read_string(ctx->node, "version"),
+			 PLAIN_VERSION);
+		t->bios_ver = smbios_add_string(ctx, ver);
+	} else {
+		t->bios_ver = smbios_add_prop_si(ctx, "version",
+						 SYSID_SM_BIOS_VER,
+						 PLAIN_VERSION);
+	}
 	if (t->bios_ver)
 		gd->smbios_version = ctx->last_str;
 	log_debug("smbios_version = %p: '%s'\n", gd->smbios_version,
@@ -484,7 +501,7 @@ static int smbios_write_type0(ulong *current, int *handle,
 	print_buffer((ulong)gd->smbios_version, gd->smbios_version,
 		     1, strlen(gd->smbios_version) + 1, 0);
 #endif
-	t->bios_release_date = smbios_add_prop_si(ctx, NULL,
+	t->bios_release_date = smbios_add_prop_si(ctx, "release-date",
 						  SYSID_SM_BIOS_REL_DATE,
 						  U_BOOT_DMI_DATE);
 #ifdef CONFIG_ROM_SIZE
@@ -553,6 +570,11 @@ static int smbios_write_type1(ulong *current, int *handle,
 			      &uuid_len) &&
 	    uuid_len == sizeof(t->uuid))
 		memcpy(t->uuid, uuid, sizeof(t->uuid));
+	else if (CONFIG_IS_ENABLED(LIB_UUID) && ofnode_valid(ctx->node) &&
+		 ofnode_read_string(ctx->node, "uuid"))
+		/* SMBIOS stores the first three fields little-endian */
+		uuid_str_to_bin(ofnode_read_string(ctx->node, "uuid"),
+				t->uuid, UUID_STR_FORMAT_GUID);
 	t->wakeup_type = smbios_get_val_si(ctx, "wakeup-type",
 					   SYSID_SM_SYSTEM_WAKEUP,
 					   SMBIOS_WAKEUP_TYPE_UNKNOWN);
@@ -840,6 +862,16 @@ static int smbios_write_type4(ulong *current, int *handle,
 		smbios_get_val_si(ctx, "characteristics",
 				  SYSID_SM_PROCESSOR_CHARA,
 				  SMBIOS_PROCESSOR_UND);
+	/*
+	 * The CPU describes what it can tell about itself; the device tree
+	 * adds what only the board knows, such as frequency control.
+	 */
+	if (ofnode_valid(ctx->node)) {
+		u32 chara;
+
+		if (!ofnode_read_u32(ctx->node, "characteristics", &chara))
+			t->processor_characteristics |= chara;
+	}
 	t->core_count2 = smbios_get_val_si(ctx, "core-count2",
 					   SYSID_SM_PROCESSOR_CORE_CNT2, 0);
 	t->core_enabled2 = smbios_get_val_si(ctx, "core-enabled2",
@@ -1213,6 +1245,13 @@ static int smbios_write_type9(ulong *current, int *handle,
 				   SMBIOS_SYSSLOT_TYPE_UNKNOWN);
 	if (len)
 		return len;
+
+	/*
+	 * A system-slot node without slots says the machine has none: its
+	 * PCIe links are wired to built-in devices, not expansion slots.
+	 */
+	if (ofnode_valid(ctx->node))
+		return 0;
 
 	/* if no subnode under 'system-slot', try scan the entire FDT */
 	len = smbios_scan_slot_type(current, handle, ctx);

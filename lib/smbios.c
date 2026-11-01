@@ -892,8 +892,10 @@ static int smbios_write_type4(ulong *current, int *handle,
 #if IS_ENABLED(CONFIG_GENERATE_SMBIOS_TABLE_VERBOSE)
 
 static int smbios_write_type7_1level(ulong *current, int handle,
-				     struct smbios_ctx *ctx, int level)
+				     struct smbios_ctx *ctx, int level, bool si)
 {
+	/* With si clear, the device tree describes this level alone */
+#define SI(id) (si ? (id) + level : SYSID_NONE)
 	struct smbios_type7 *t;
 	int len = sizeof(*t);
 	void *hdl;
@@ -905,45 +907,45 @@ static int smbios_write_type7_1level(ulong *current, int handle,
 	smbios_set_eos(ctx, t->eos);
 
 	t->socket_design = smbios_add_prop_si(ctx, "socket-design",
-					      SYSID_SM_CACHE_SOCKET + level,
+					      SI(SYSID_SM_CACHE_SOCKET),
 					      NULL);
 	/* @level counts from 0, as the level field of the configuration does */
 	t->config.data = smbios_get_val_si(ctx, "config",
-					   SYSID_SM_CACHE_CONFIG + level,
+					   SI(SYSID_SM_CACHE_CONFIG),
 					   level | SMBIOS_CACHE_ENABLED |
 					   SMBIOS_CACHE_OP_UND);
 	t->max_size.data = smbios_get_val_si(ctx, "max-size",
-					     SYSID_SM_CACHE_MAX_SIZE + level,
+					     SI(SYSID_SM_CACHE_MAX_SIZE),
 					     0);
 	t->inst_size.data = smbios_get_val_si(ctx, "installed-size",
-					      SYSID_SM_CACHE_INST_SIZE + level,
+					      SI(SYSID_SM_CACHE_INST_SIZE),
 					      0);
 	t->supp_sram_type.data =
 		smbios_get_val_si(ctx, "supported-sram-type",
-				  SYSID_SM_CACHE_SUPSRAM_TYPE + level,
+				  SI(SYSID_SM_CACHE_SUPSRAM_TYPE),
 				  SMBIOS_CACHE_SRAM_TYPE_UNKNOWN);
 	t->curr_sram_type.data =
 		smbios_get_val_si(ctx, "current-sram-type",
-				  SYSID_SM_CACHE_CURSRAM_TYPE + level,
+				  SI(SYSID_SM_CACHE_CURSRAM_TYPE),
 				  SMBIOS_CACHE_SRAM_TYPE_UNKNOWN);
-	t->speed = smbios_get_val_si(ctx, "speed", SYSID_SM_CACHE_SPEED + level,
+	t->speed = smbios_get_val_si(ctx, "speed", SI(SYSID_SM_CACHE_SPEED),
 				     0);
 	t->err_corr_type = smbios_get_val_si(ctx, "error-correction-type",
-					     SYSID_SM_CACHE_ERRCOR_TYPE + level,
+					     SI(SYSID_SM_CACHE_ERRCOR_TYPE),
 					     SMBIOS_CACHE_ERRCORR_UNKNOWN);
 	t->sys_cache_type =
 		smbios_get_val_si(ctx, "system-cache-type",
-				  SYSID_SM_CACHE_SCACHE_TYPE + level,
+				  SI(SYSID_SM_CACHE_SCACHE_TYPE),
 				  SMBIOS_CACHE_SYSCACHE_TYPE_UNKNOWN);
 	t->associativity = smbios_get_val_si(ctx, "associativity",
-					     SYSID_SM_CACHE_ASSOC + level,
+					     SI(SYSID_SM_CACHE_ASSOC),
 					     SMBIOS_CACHE_ASSOC_UNKNOWN);
 	t->max_size2.data = smbios_get_val_si(ctx, "max-size2",
-					      SYSID_SM_CACHE_MAX_SIZE2 + level,
+					      SI(SYSID_SM_CACHE_MAX_SIZE2),
 					      0);
 	t->inst_size2.data =
 		smbios_get_val_si(ctx, "installed-size2",
-				  SYSID_SM_CACHE_INST_SIZE2 + level, 0);
+				  SI(SYSID_SM_CACHE_INST_SIZE2), 0);
 
 	/* Save the cache handles */
 	if (!sysinfo_get_data(ctx->dev, SYSID_SM_CACHE_HANDLE, &hdl,
@@ -958,6 +960,7 @@ static int smbios_write_type7_1level(ulong *current, int handle,
 
 	return len;
 }
+#undef SI
 
 static int smbios_write_type7(ulong *current, int *handle,
 			      struct smbios_ctx *ctx)
@@ -973,15 +976,24 @@ static int smbios_write_type7(ulong *current, int *handle,
 	memcpy(&ctx_bak, ctx, sizeof(ctx_bak));
 
 	/*
-	 * Get the number of levels from the CPU. When it describes none, write
-	 * the levels the device tree describes, as l<n>-cache nodes.
+	 * A device tree that describes caches, as l<n>-cache nodes, describes
+	 * all of them and replaces what the CPU registers say: some cores, such
+	 * as Apple's, report cache geometry that does not match the caches.
+	 * Otherwise take the levels from the CPU.
 	 */
-	if (ctx->dev && !sysinfo_get_int(ctx->dev, SYSID_SM_CACHE_LEVEL, &level)) {
-		dt_only = false;
-	} else {
-		dt_only = true;
-		level = SYSINFO_CACHE_LVL_MAX - 1;
+	dt_only = false;
+	for (i = 0; i < SYSINFO_CACHE_LVL_MAX && !dt_only; i++) {
+		char buf[9] = "";
+
+		snprintf(buf, sizeof(buf), "l%d-cache", i + 1);
+		if (ofnode_valid(ofnode_find_subnode(parent, buf)))
+			dt_only = true;
 	}
+	if (dt_only)
+		level = SYSINFO_CACHE_LVL_MAX - 1;
+	else if (!ctx->dev ||
+		 sysinfo_get_int(ctx->dev, SYSID_SM_CACHE_LEVEL, &level))
+		return 0;	/* no cache described */
 	if (level >= SYSINFO_CACHE_LVL_MAX) /* Error, return 0-length */
 		return 0;
 
@@ -997,7 +1009,7 @@ static int smbios_write_type7(ulong *current, int *handle,
 			continue;
 		}
 		*handle = hdl_base + written++;
-		len += smbios_write_type7_1level(current, *handle, ctx, i);
+		len += smbios_write_type7_1level(current, *handle, ctx, i, !dt_only);
 		memcpy(ctx, &ctx_bak, sizeof(*ctx));
 	}
 	if (written)

@@ -64,6 +64,25 @@ config BLOCK_CACHE
 	  it will prevent repeated reads from directory structures and other
 	  filesystem data structures.
 
+config BLOCK_READAHEAD
+	bool "Read ahead on sequential block reads"
+	depends on BLK
+	help
+	  After two reads in a row from a block device, read a larger window
+	  and serve the following reads from memory. This helps a reader that
+	  walks a file a few blocks at a time, such as an EFI boot loader
+	  reading a kernel through its own filesystem driver, which would
+	  otherwise send one small command per call. A write or erase to the
+	  device drops the window.
+
+config BLOCK_READAHEAD_SIZE
+	hex "Size of the read-ahead window in bytes"
+	depends on BLOCK_READAHEAD
+	default 0x100000
+	help
+	  The amount read ahead in one command once a sequential read is
+	  detected. Reads larger than half the window bypass it.
+
 config BLKMAP
 	bool "Composable virtual block devices (blkmap)"
 	depends on BLK

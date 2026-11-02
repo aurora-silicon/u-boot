@@ -1613,7 +1613,8 @@ int board_late_init(void)
 	/* T6040: the MTP stays with Linux (apple_rtkit_helper_allowed()). */
 	if (of_machine_is_compatible("apple,t6040"))
 		start_keyboard = false;
-	if (of_machine_is_compatible("apple,t8140") ||
+	if (of_machine_is_compatible("apple,j613") ||
+	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);

@@ -631,6 +631,7 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 
 static const struct udevice_id rtkit_helper_ids[] = {
 	{ .compatible = "apple,rtk-helper-asc4" },
+	{ .compatible = "apple,t8122-rtk-helper-asc4" },
 	{ /* sentinel */ }
 };
 

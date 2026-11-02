@@ -240,6 +240,7 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 	case DCHID_EVENT_READY:
 		if (len >= 2 && p[1] == priv->kbd_iface && !priv->ready) {
 			priv->ready = true;
+			apple_rtkit_helper_input_ready(priv->helper);
 			debug("mtpkbd: keyboard ready\n");
 		}
 		break;
@@ -513,7 +514,8 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 * Preserve every INIT packet for Linux, including STM and trackpad.
 	 */
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
-			 of_machine_is_compatible("apple,j713");
+			 of_machine_is_compatible("apple,j713") ||
+			 of_machine_is_compatible("apple,j613");
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {

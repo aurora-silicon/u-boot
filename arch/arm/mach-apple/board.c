@@ -1530,12 +1530,14 @@ static int j713_prepare_input(void)
 	ulong start;
 	int ret, index;
 
-	node = ofnode_by_compatible(ofnode_null(), "apple,t8132-rtk-helper-asc4");
+	node = ofnode_by_compatible(ofnode_null(),
+		of_machine_is_compatible("apple,j614s") ?
+		"apple,t6041-rtk-helper-asc4" : "apple,t8132-rtk-helper-asc4");
 	if (!ofnode_valid(node))
 		return -ENODEV;
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
 	if (ret) {
-		printf("J713: failed to initialize input helper (%d)\n", ret);
+		printf("MTP: failed to initialize input helper (%d)\n", ret);
 		return ret;
 	}
 	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
@@ -1603,15 +1605,17 @@ int board_late_init(void)
 	env_set("fw_dev_part", asahi_esp_devpart());
 
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	    of_machine_is_compatible("apple,j713")) {
+	    (of_machine_is_compatible("apple,j713") ||
+	     of_machine_is_compatible("apple,j614s"))) {
 		int ret = j713_prepare_input();
 
 		start_keyboard = !ret;
 		if (ret)
-			printf("J713: input unavailable (%d); continuing boot\n", ret);
+			printf("MTP: input unavailable (%d); continuing boot\n", ret);
 	}
-	/* T6040: the MTP stays with Linux (apple_rtkit_helper_allowed()). */
-	if (of_machine_is_compatible("apple,t6040"))
+	/* T6040 stays with Linux except for the J614s retained handoff. */
+	if (of_machine_is_compatible("apple,t6040") &&
+	    !of_machine_is_compatible("apple,j614s"))
 		start_keyboard = false;
 	if (of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
@@ -1666,7 +1670,8 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
 		 * fixup only costs the OS the running session: keep booting.
 		 */
-		if (ret && of_machine_is_compatible("apple,j713"))
+		if (ret && (of_machine_is_compatible("apple,j713") ||
+			    of_machine_is_compatible("apple,j614s")))
 			return ret;
 		if (ret)
 			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",

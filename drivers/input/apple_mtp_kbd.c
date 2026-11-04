@@ -415,8 +415,9 @@ static int get_rtkit_helper(struct udevice *dev)
 		return ret;
 
 	of_mtp = ofnode_get_by_phandle(phandle);
-	if (of_machine_is_compatible("apple,j713")) {
-		/* Never retry an unprepared or failed J713 coprocessor boot. */
+	if (of_machine_is_compatible("apple,j713") ||
+	    of_machine_is_compatible("apple,j614s")) {
+		/* Never retry an unprepared or failed retained coprocessor boot. */
 		ret = uclass_find_device_by_ofnode(UCLASS_MISC, of_mtp, &priv->helper);
 		if (ret)
 			return ret;
@@ -445,7 +446,8 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 */
 	if (of_machine_is_compatible("apple,j813"))
 		return -ENODEV;
-	priv->j713 = of_machine_is_compatible("apple,j713");
+	priv->j713 = of_machine_is_compatible("apple,j713") ||
+		     of_machine_is_compatible("apple,j614s");
 	if (priv->j713) {
 		ret = get_rtkit_helper(dev);
 		if (ret)
@@ -513,7 +515,8 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 * Preserve every INIT packet for Linux, including STM and trackpad.
 	 */
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
-			 of_machine_is_compatible("apple,j713");
+			 (of_machine_is_compatible("apple,j713") ||
+			  of_machine_is_compatible("apple,j614s"));
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {
@@ -638,7 +641,7 @@ static int apple_mtp_kbd_remove(struct udevice *dev)
 	/* EFI and booti discard device-remove errors. A published session
 	 * must not enter Linux with missing or interleaved startup packets. */
 	if (ret && priv->j713)
-		panic("J713: refusing OS entry after MTP handoff error %d", ret);
+		panic("MTP: refusing OS entry after handoff error %d", ret);
 	return ret;
 }
 

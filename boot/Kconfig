@@ -51,6 +51,20 @@ config SPL_LIB_BOOTM
 config SPL_LIB_BOOTZ
 	bool
 
+config CTXR_EXEC_WINDOW
+	bool "Keep Linux inside the CTXR window the device tree advertises"
+	depends on ARM64 && OF_CONTROL && LMB
+	default y if ARCH_APPLE
+	help
+	  A Linux kernel built with CONFIG_ARM64_CTXR_EXECMEM confines its
+	  executable code to the physical window advertised by
+	  /chosen/aurora,ctxr-exec-window, and panics early if its image is
+	  outside it. With this option, the EFI image loader and booti place
+	  the Linux image inside that window. They refuse to boot a kernel they
+	  cannot place, unless /chosen/aurora,ctxr-exec-enforce is 0.
+
+	  Nothing changes when the property is absent or its base is zero.
+
 config BUTTON_CMD
 	bool "Support for running a command if a button is held during boot"
 	depends on CMDLINE

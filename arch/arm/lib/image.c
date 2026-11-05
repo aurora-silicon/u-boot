@@ -4,10 +4,13 @@
  * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
  */
 
+#include <ctxr_exec_window.h>
 #include <image.h>
+#include <lmb.h>
 #include <mapmem.h>
 #include <asm/global_data.h>
 #include <linux/bitops.h>
+#include <linux/errno.h>
 #include <linux/sizes.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -28,9 +31,37 @@ struct Image_header {
 	uint32_t	res5;
 };
 
+/**
+ * ctxr_exec_window_slot() - find where an image fits in the window
+ *
+ * The image is moved before booti reserves its memory, so check here that the
+ * range is free RAM.
+ *
+ * @win:	window to search
+ * @size:	bytes from the 2 MiB boundary to the end of the image
+ * @slot:	set to the lowest free 2 MiB boundary that fits
+ * Return:	0 if found, -ENOSPC if not
+ */
+static int ctxr_exec_window_slot(const struct ctxr_exec_window *win,
+				 uint64_t size, uint64_t *slot)
+{
+	uint64_t addr;
+
+	for (addr = ALIGN(win->base, SZ_2M);
+	     addr + size <= win->base + win->size; addr += SZ_2M) {
+		if (lmb_get_free_size(addr) >= size) {
+			*slot = addr;
+			return 0;
+		}
+	}
+
+	return -ENOSPC;
+}
+
 int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 		bool force_reloc)
 {
+	struct ctxr_exec_window win;
 	struct Image_header *ih;
 	uint64_t dst;
 	uint64_t image_size, text_offset;
@@ -70,6 +101,18 @@ int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 		dst = image - text_offset;
 	else
 		dst = gd->bd->bi_dram[0].start;
+
+	/* A kernel confined to a window panics if its image is outside it */
+	if (ctxr_exec_window_get(&win) &&
+	    ctxr_exec_window_slot(&win, text_offset + image_size, &dst)) {
+		printf("%sCTXR exec window [%#llx, %#llx): no free 2 MiB aligned range fits the %#llx byte Linux image\n",
+		       win.enforce ? "ERROR: " : "", win.base,
+		       win.base + win.size, image_size);
+		if (win.enforce) {
+			unmap_sysmem(ih);
+			return 1;
+		}
+	}
 
 	*relocated_addr = ALIGN(dst, SZ_2M) + text_offset;
 

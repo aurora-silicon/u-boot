@@ -119,6 +119,40 @@ optional input may still be disabled. Input qualification must separately check
 the running ASC, and physical keyboard/trackpad response. A marker alone does
 not establish that the coprocessor is live.
 
+CTXR executable window
+----------------------
+
+On T8140, iBoot locks a code execute range (CTXR) on the secondary CPUs, so a
+kernel running at EL2 has to keep all of its executable code in a fixed physical
+window. A loader that sets this up advertises the window as
+``/chosen/aurora,ctxr-exec-window = <base_hi base_lo size_hi size_lo>``. A kernel
+built with ``CONFIG_ARM64_CTXR_EXECMEM`` panics early if its image is outside it,
+unless ``/chosen/aurora,ctxr-exec-enforce`` is 0.
+
+``CONFIG_CTXR_EXEC_WINDOW`` places Linux for such a kernel:
+
+* The EFI image loader, which serves ``bootefi`` and the ``LoadImage`` call GRUB
+  makes, recognises an arm64 Image by its header.
+* ``booti``, which the ``aurora_fallback`` boot path uses, takes any Image.
+
+Both put the image at the lowest free 2 MiB boundary in the window where it fits.
+The EFI loader installs ``LINUX_EFI_LOADED_IMAGE_FIXED_GUID`` on the kernel's
+handle, so the stub runs the image in place. The kernel's physical address is
+therefore not randomised in this mode. Its virtual address still can be.
+
+If the image does not fit, U-Boot prints an error and refuses to start it. An
+EFI zboot image is refused the same way, because its decompressor picks the
+kernel's address from the whole memory map. With enforcement off, these are
+warnings and the kernel is placed as usual. A window with base 0 is not a
+physical constraint, as the kernel anchors it on its own image, so U-Boot ignores
+it.
+
+Only the kernel's image goes in the window. The kernel allocates executable pages
+from the rest of the window without consulting reservations, so anything else
+that has to survive into Linux must stay out. U-Boot's allocators work down from
+the top of RAM, and the window sits low in DRAM, which keeps the device tree,
+initramfs and EFI tables above it. Nothing enforces this.
+
 Building U-Boot
 ---------------
 

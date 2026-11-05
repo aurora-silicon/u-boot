@@ -46,6 +46,7 @@ typedef uint16_t __le16; typedef uint32_t __le32; typedef unsigned long ulong;
 #define le16_to_cpu(v) (v)
 #define DM_REMOVE_NORMAL 0
 #define dev_err(...) ((void)0)
+#define debug(...) ((void)0)
 struct udevice { void *priv, *uc; bool retained; };
 struct input_config { struct udevice *dev; };
 struct keyboard_priv { struct input_config input; };
@@ -235,14 +236,17 @@ struct udevice { int unused; };
 struct apple_mtp_kbd_priv { struct udevice *helper; };
 static struct apple_mtp_kbd_priv priv;
 static struct udevice helper;
-static bool j713=true,prepared;
+static bool j713=true,j614,prepared;
 static int finds,gets,find_error,property_error;
 static void *dev_get_priv(struct udevice *d){(void)d;return &priv;}
 static int dev_read_u32(struct udevice *d,const char *name,u32 *v){
  (void)d;assert(!strcmp(name,"apple,helper-cpu"));*v=123;return property_error;
 }
 static ofnode ofnode_get_by_phandle(u32 phandle){assert(phandle==123);return 123;}
-static bool of_machine_is_compatible(const char *name){assert(!strcmp(name,"apple,j713"));return j713;}
+static bool of_machine_is_compatible(const char *name){
+ if(!strcmp(name,"apple,j713"))return j713;
+ assert(!strcmp(name,"apple,j614s"));return j614;
+}
 static int uclass_find_device_by_ofnode(int cls,ofnode node,struct udevice **d){
  assert(cls==1&&node==123);finds++;*d=&helper;return find_error;
 }
@@ -257,7 +261,10 @@ int main(void){
  prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==2&&!gets);
  find_error=-ENODEV;assert(get_rtkit_helper(&keyboard)==-ENODEV&&!gets);
  property_error=-EINVAL;assert(get_rtkit_helper(&keyboard)==-EINVAL&&finds==3&&!gets);
- property_error=0;j713=false;assert(!get_rtkit_helper(&keyboard)&&gets==1);
+ property_error=0;find_error=0;j713=false;j614=true;prepared=false;
+ assert(get_rtkit_helper(&keyboard)==-ENODEV&&finds==4&&!gets);
+ prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==5&&!gets);
+ j614=false;assert(!get_rtkit_helper(&keyboard)&&gets==1);
  return 0;
 }
 '''

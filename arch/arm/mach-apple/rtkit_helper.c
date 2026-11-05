@@ -71,14 +71,18 @@ static bool rtkit_helper_j613_handoff(struct udevice *dev)
 static bool rtkit_helper_uses_dram(struct udevice *dev)
 {
 	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	       device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
+	       (device_is_compatible(dev, "apple,t8140-rtk-helper-asc4") ||
+		(of_machine_is_compatible("apple,j614s") &&
+		 device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")));
 }
 
-/* J713 Linux consumes the initialized session without owning its RTKit epoch. */
+/* J713 and J614s Linux consume the initialized session without owning its RTKit epoch. */
 static bool rtkit_helper_j713_handoff(struct udevice *dev)
 {
-	return of_machine_is_compatible("apple,j713") &&
-	       device_is_compatible(dev, "apple,t8132-rtk-helper-asc4");
+	return (of_machine_is_compatible("apple,j713") &&
+		device_is_compatible(dev, "apple,t8132-rtk-helper-asc4")) ||
+	       (of_machine_is_compatible("apple,j614s") &&
+		device_is_compatible(dev, "apple,t6041-rtk-helper-asc4"));
 }
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
@@ -203,13 +207,13 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 
 /*
  * Keep T8140 MTP and its DART untouched in the default build.  Never touch
- * the T6040 MTP: Linux starts it itself, and a U-Boot keyboard there would
- * leave Linux an MTP it has not been shown to take over.
+ * T6040 MTP except for the J614s retained handoff.
  */
 bool apple_rtkit_helper_allowed(ofnode node)
 {
 	if (ofnode_device_is_compatible(node, "apple,t6041-rtk-helper-asc4"))
-		return false;
+		return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+		       of_machine_is_compatible("apple,j614s");
 
 	return !ofnode_device_is_compatible(node, "apple,t8140-rtk-helper-asc4") ||
 	       IS_ENABLED(CONFIG_APPLE_MTP_KEYB);
@@ -237,6 +241,15 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev) ||
 	    rtkit_helper_j613_handoff(dev))
 		rtkit_helper_read_dma_window(dev);
+
+	if (of_machine_is_compatible("apple,j614s") &&
+	    device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")) {
+		ret = priv->dart ? apple_dart_retain_bypass(priv->dart) : -ENODEV;
+		if (ret) {
+			printf("J614s: MTP DART bypass unavailable (%d)\n", ret);
+			return ret;
+		}
+	}
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
@@ -311,7 +324,7 @@ static int rtkit_helper_remove(struct udevice *dev)
 		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
 		if (ret && (rtkit_helper_j713_handoff(dev) ||
 			    rtkit_helper_j613_handoff(dev)))
-			panic("Refusing OS entry after MTP DART retention error %d", ret);
+			panic("MTP: refusing OS entry after DART retention error %d", ret);
 		if (ret)
 			goto stop;
 

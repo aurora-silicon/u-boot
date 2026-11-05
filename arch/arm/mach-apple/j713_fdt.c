@@ -96,7 +96,7 @@ static int j713_map_node(void *dst, const void *src, int sn)
 	static const char * const aliases[] = {
 		"gpu", "dcp", "disp0", "disp0_piodma", "ans", "ans-mbox",
 		"sart-ans", "spmi-primary", "pmu-primary", "pmp", "wifi0",
-		"keyboard", "bluetooth0", "atcphy0", "atcphy1",
+		"keyboard", "bluetooth0", "atcphy0", "atcphy1", "dcpext0", "dcpext1",
 	};
 	char path[J713_FDT_PATH];
 	unsigned int i;
@@ -233,6 +233,18 @@ static bool j713_omitted_aop(const void *dst, const void *src, int sn)
 	       j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
 }
 
+/* An OS tree without an external DCP owns none of the reservations m1n1 made
+ * for it, whatever that node in the control tree looks like.
+ */
+static bool j713_omitted_dcpext(const void *dst, const void *src, int sn)
+{
+	bool dcpext = !fdt_node_check_compatible(src, sn, "apple,t8132-dcpext") ||
+		      j713_alias_node(src, "dcpext0") == sn ||
+		      j713_alias_node(src, "dcpext1") == sn;
+
+	return dcpext && j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
+}
+
 static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 {
 	const fdt32_t *value;
@@ -271,7 +283,8 @@ static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 			break;
 		}
 		cells = 1 + na + ns;
-		if (!j713_omitted_display(dst, src, owner) && !j713_omitted_aop(dst, src, owner)) {
+		if (!j713_omitted_display(dst, src, owner) && !j713_omitted_aop(dst, src, owner) &&
+		    !j713_omitted_dcpext(dst, src, owner)) {
 			int target = j713_map_node(dst, src, owner);
 			int parent = target < 0 ? target : fdt_parent_offset(dst, target);
 
@@ -804,6 +817,56 @@ static bool j713_enabled(const void *fdt, int node)
 	return !status || !strcmp(status, "okay") || !strcmp(status, "ok");
 }
 
+/* m1n1 marks an external DCP it handed over (the opt-in
+ * chosen.asahi,j713-dcpext=1) with its firmware identity and reservations.
+ * Carry them to the same external DCP in the OS tree. Without the marker the
+ * OS tree keeps no marker either, and its kernel leaves the controller alone.
+ */
+static int j713_dcpext(void *dst, const void *src)
+{
+	static const char * const aliases[] = { "dcpext0", "dcpext1" };
+	static const char marker[] = "apple,t8132-dcpext-firmware-ready";
+	static const char compatible[] = "apple,t8132-dcpext";
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(aliases); i++) {
+		const fdt32_t *ready;
+		int dn = j713_alias_node(dst, aliases[i]);
+		int sn = j713_alias_node(src, aliases[i]);
+		int len;
+
+		if (dn == -FDT_ERR_NOTFOUND)
+			continue;
+		if (dn < 0 || fdt_node_check_compatible(dst, dn, compatible))
+			return -EINVAL;
+		ret = fdt_delprop(dst, dn, marker);
+		if (ret && ret != -FDT_ERR_NOTFOUND)
+			return ret;
+		if (sn == -FDT_ERR_NOTFOUND)
+			continue;
+		ready = sn < 0 ? NULL : fdt_getprop(src, sn, marker, &len);
+		if (!ready)
+			continue;
+		/* An optional display never costs the boot: leave it to the OS, unmarked. */
+		if (fdt_node_check_compatible(src, sn, compatible) || len != 4 ||
+		    fdt32_to_cpu(*ready) != 1)
+			continue;
+		ret = j713_copy_string(dst, dn, src, sn, "apple,firmware-uuid", 37, true);
+		ret = ret ?: j713_copy_prop(dst, dn, src, sn, "apple,firmware-version", 12);
+		ret = ret ?: j713_copy_prop(dst, dn, src, sn, "apple,firmware-compat", 12);
+		ret = ret ?: j713_phandles(dst, src, sn, "memory-region", -1);
+		if (!ret) {
+			/* The marker goes last, once everything it promises is in place. */
+			dn = j713_alias_node(dst, aliases[i]);
+			ret = fdt_setprop_u32(dst, dn, marker, 1);
+		}
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /* m1n1 programs the AOP DART's DAPF and reserves the AOP's firmware segments
  * and DAPF windows for this boot, or disables the AOP. Reference those
  * reservations from the OS tree's AOP, or disable it there too. An OS tree
@@ -988,6 +1051,7 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = ret ?: j713_pcie_admission(scratch, source);
 	ret = ret ?: j713_display_refs(scratch, source);
 	ret = ret ?: j713_aop(scratch, source);
+	ret = ret ?: j713_dcpext(scratch, source);
 	ret = ret ?: j713_chosen(scratch, source);
 	if (!ret) {
 		/* All helper paths must resolve before its real hardware fixup runs. */

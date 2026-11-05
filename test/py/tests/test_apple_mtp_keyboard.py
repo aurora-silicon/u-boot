@@ -92,7 +92,8 @@ static int dockchannel_read(struct udevice *dev,void *p,size_t size) {
     assert(size==wire_size);memcpy(p,wire,size);rx_pending-=rx_pending ? size : 0;return size;
 }
 static int apple_rtkit_helper_poll(struct udevice *d,int timeout) { assert(d&&!timeout);return 0; }
-static unsigned invalidations;
+static unsigned invalidations,readies;
+static void apple_rtkit_helper_input_ready(struct udevice *d) { assert(d);readies++; }
 static void apple_rtkit_helper_input_failed(struct udevice *d) { assert(d);invalidations++; }
 static bool apple_rtkit_helper_input_retained(struct udevice *d) { return d->retained; }
 static int device_remove(struct udevice *d,int flags) {
@@ -163,7 +164,7 @@ int main(void) {
     assert(!priv.enable_pending&&priv.kbd_iface==3&&!priv.ready);
     poll_quiet(&uc.input,100);poll_quiet(&uc.input,1000);assert(tx_size==sizeof(enable));
     u8 ready[]={DCHID_EVENT_READY,2};deliver(&uc.input,0,ready,2,false,false);assert(!priv.ready);
-    ready[1]=3;deliver(&uc.input,0,ready,2,true,false);assert(priv.ready);
+    ready[1]=3;deliver(&uc.input,0,ready,2,true,false);assert(priv.ready&&readies==1);
     struct apple_kbd_report key={.reportid=1,.keycode={4}};
     deliver(&uc.input,2,&key,sizeof(key),false,false);assert(!key_count);
     deliver(&uc.input,3,&key,sizeof(key),false,false);assert(key_count==1&&keys[0]==KEY_A&&!releases[0]);

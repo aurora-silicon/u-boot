@@ -11,7 +11,7 @@ import subprocess
 
 
 def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False,
-                 dcpext=False):
+                 dcpext=False, amps=False):
     shift = 0 if runtime else 1000
     aliases = {
         'ans': '/soc/nvme', 'ans-mbox': '/soc/mailbox', 'sart-ans': '/soc/sart',
@@ -102,6 +102,14 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
                      if runtime else
                      'local-policy-manifest = [de ad]; iboot-manifest = [be ef];')
         sep_node = f'sep {{ compatible = "apple,sep"; {manifests} status = "disabled"; }};'
+    amp_nodes = ''
+    if amps:
+        config = ('apple,speaker-config = [00 15 00 02]; apple,amp-tx-zd-config = [00 00 01 00 02 00 03 00];'
+                  'apple,bop-config = [05 02 01 00 0a 0b]; apple,amp-dcblocker-config = [01];'
+                  if runtime else '')
+        amp_nodes = ('i2c@3ad01c000 { #address-cells = <1>; #size-cells = <0>;'
+                     + ''.join(f'codec@{a:x} {{ compatible = "ti,sn012776", "ti,tas2764"; reg = <{a:#x}>; {config} }};'
+                               for a in (0x38, 0x39)) + ' };')
     peripheral_nodes = ''
     if peripherals:
         bt = ('local-bd-address = [01 02 03 04 05 06];'
@@ -157,6 +165,7 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
         {aop_node}
         {sep_node}
         {dcpext_node}
+        {amp_nodes}
       }};
     }};'''
 
@@ -369,6 +378,14 @@ int main(int argc, char **argv)
    if (fault == 46) assert(!fdt_setprop_u32(source, node, marker, 2));
    if (fault == 47) assert(!fdt_setprop_string(source, node, "compatible", "apple,other"));
   }
+  if (fault >= 50 && fault <= 52) {
+   int node = fdt_path_offset(fault == 52 ? target : source, "/soc/i2c@3ad01c000/codec@38");
+   assert(node >= 0);
+   /* An older m1n1 without the level; a malformed level; an OS node that is not the amp. */
+   if (fault == 50) assert(!fdt_delprop(source, node, "apple,speaker-config"));
+   if (fault == 51) assert(!fdt_setprop(source, node, "apple,speaker-config", "\x15", 1));
+   if (fault == 52) assert(!fdt_setprop_string(target, node, "compatible", "apple,other"));
+  }
   if (fault == 41 || fault == 42) {
    void *tree = fault == 41 ? target : source;
    assert(!fdt_setprop_string(tree, fdt_path_offset(tree, "sep"), "compatible", "apple,other"));
@@ -386,7 +403,7 @@ int main(int argc, char **argv)
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
-  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43 && fault != 44 && fault != 45 && fault != 46 && fault != 47) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43 && fault != 44 && fault != 45 && fault != 46 && fault != 47 && fault != 50) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -458,6 +475,20 @@ int main(int argc, char **argv)
     int expected_len;
     const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
     const void *actual = fdt_getprop(target, sep, names[i], &len);
+    if (!expected) assert(!actual);
+    else assert(actual && len == expected_len && !memcmp(expected, actual, len));
+   }
+  }
+  for (int amp = fdt_node_offset_by_compatible(target, -1, "ti,sn012776"); amp >= 0;
+       amp = fdt_node_offset_by_compatible(target, amp, "ti,sn012776")) {
+   const char *names[] = {"apple,speaker-config", "apple,amp-tx-zd-config",
+                          "apple,bop-config", "apple,amp-dcblocker-config"};
+   char path[256]; assert(!fdt_get_path(target, amp, path, sizeof(path)));
+   int sn = fdt_path_offset(source, path);
+   for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    int expected_len;
+    const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
+    const void *actual = fdt_getprop(target, amp, names[i], &len);
     if (!expected) assert(!actual);
     else assert(actual && len == expected_len && !memcmp(expected, actual, len));
    }
@@ -667,3 +698,18 @@ def test_j713_dcpext_handoff(tmp_path):
     plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
     for fault in [0, 47]:
         subprocess.run([str(binary), str(source), str(plain), str(fault)], check=True)
+
+
+def test_j713_speaker_amps(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, amps=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, amps=True))
+    # Handed over; an amp without its level (left as it is); a malformed level
+    # and an OS node at the amp's path that is not the amp (both refused).
+    for fault in [0, 50, 51, 52]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without the amps, and a control tree without them, import as before.
+    plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
+    older = compile_tree(tmp_path, 'older', fixture_tree(True))
+    subprocess.run([str(binary), str(source), str(plain), '0'], check=True)
+    subprocess.run([str(binary), str(older), str(target), '0'], check=True)

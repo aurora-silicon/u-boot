@@ -975,16 +975,19 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
  * @virt_size:		size of the image in memory, from the PE header
  * @memory_type:	usage type of the image's memory
  * @reloc:		set to the image's memory if this placed it
+ * @reloc_size:		set to the size of that memory if this placed it
  * Return:		EFI_SUCCESS unless the image must not be booted. Without
  *			a window, or for any other image, *@reloc is left NULL.
  */
 static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *handle,
 						   const void *efi, u64 virt_size,
-						   int memory_type, void **reloc)
+						   int memory_type, void **reloc,
+						   u64 *reloc_size)
 {
 	const struct linux_efi_header *hdr = efi;
 	struct ctxr_exec_window win;
 	const char *problem;
+	efi_status_t ret;
 
 	*reloc = NULL;
 
@@ -1004,9 +1007,17 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 			    (uintptr_t)__efi_runtime_stop > win.base + win.size)
 				log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it\n",
 					    win.base, win.base + win.size);
-			return efi_add_protocol(&handle->header,
-						&efi_guid_linux_image_fixed,
-						NULL);
+			ret = efi_add_protocol(&handle->header,
+					       &efi_guid_linux_image_fixed,
+					       NULL);
+			if (ret != EFI_SUCCESS) {
+				efi_free_pages((uintptr_t)*reloc,
+					       efi_size_in_pages(size));
+				*reloc = NULL;
+				return ret;
+			}
+			*reloc_size = size;
+			return EFI_SUCCESS;
 		}
 		problem = "no free 2 MiB aligned range fits the Linux image";
 	} else if (le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
@@ -1056,6 +1067,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	int rel_idx = IMAGE_DIRECTORY_ENTRY_BASERELOC;
 	uint64_t image_base;
 	unsigned long virt_size = 0;
+	u64 alloc_size;
 	int supported = 0;
 	efi_status_t ret;
 
@@ -1103,6 +1115,8 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 				  sec->VirtualAddress + section_size(sec));
 	}
 
+	alloc_size = virt_size;
+
 	/* Read 32/64bit specific header bits */
 	if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
 		IMAGE_NT_HEADERS64 *nt64 = (void *)nt;
@@ -1112,7 +1126,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 		handle->image_type = opt->Subsystem;
 		ret = efi_place_linux_in_ctxr_window(handle, efi, virt_size,
 						     loaded_image_info->image_code_type,
-						     &efi_reloc);
+						     &efi_reloc, &alloc_size);
 		if (ret != EFI_SUCCESS)
 			goto err;
 		if (!efi_reloc)
@@ -1191,7 +1205,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 				(unsigned long)image_base,
 				virt_size) != EFI_SUCCESS) {
 		efi_free_pages((uintptr_t)efi_reloc,
-			       (virt_size + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT);
+			       efi_size_in_pages(alloc_size));
 		ret = EFI_LOAD_ERROR;
 		goto err;
 	}
@@ -1209,7 +1223,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 
 	/* Populate the loaded image interface bits */
 	loaded_image_info->image_base = efi_reloc;
-	loaded_image_info->image_size = virt_size;
+	loaded_image_info->image_size = alloc_size;
 
 	if (handle->auth_status == EFI_IMAGE_AUTH_PASSED)
 		return EFI_SUCCESS;

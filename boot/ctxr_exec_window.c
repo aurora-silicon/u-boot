@@ -3,9 +3,11 @@
  * Read the physical window a Linux kernel confines its executable code to, and
  * keep U-Boot's runtime code inside it.
  *
- * The other end of this is ctxr_parse_dt() in the kernel's
- * arch/arm64/mm/ctxr_execmem.c. This accepts what that accepts, so U-Boot only
- * moves a kernel that will look for its image in the window.
+ * The other end of this is ctxr_parse_dt() and ctxr_window_valid() in the
+ * kernel's arch/arm64/mm/ctxr_execmem.c. This takes the windows a 16K-page
+ * kernel takes, so U-Boot only moves a kernel that will look for its image in
+ * the window. A kernel that rejects the window, or finds its image outside it,
+ * keeps its secondary CPUs offline and boots on the boot CPU.
  */
 
 #include <ctxr_exec_window.h>
@@ -20,6 +22,9 @@
 
 DECLARE_GLOBAL_DATA_PTR;
 
+/* The kernel wants its window page aligned, and Apple kernels use 16K pages */
+#define CTXR_EXEC_PAGE	SZ_16K
+
 bool ctxr_exec_window_get(struct ctxr_exec_window *win)
 {
 	const __be32 *prop;
@@ -33,17 +38,17 @@ bool ctxr_exec_window_get(struct ctxr_exec_window *win)
 	win->base = of_read_number(prop, 2);
 	win->size = of_read_number(prop + 2, 2);
 
-	/*
-	 * A zero base means the firmware armed no usable window: the kernel
-	 * anchors a software-only window on its image, wherever that lands.
-	 */
-	if (!win->base || !win->size)
-		return false;
+	return win->base && win->size && IS_ALIGNED(win->base, CTXR_EXEC_PAGE) &&
+	       IS_ALIGNED(win->size, CTXR_EXEC_PAGE) &&
+	       win->base + win->size > win->base;
+}
 
-	prop = ofnode_read_chosen_prop("aurora,ctxr-exec-enforce", &len);
-	win->enforce = !prop || len != sizeof(*prop) || *prop;
-
-	return true;
+void ctxr_exec_warn_outside(const struct ctxr_exec_window *win,
+			    const char *why)
+{
+	printf("WARNING: CTXR exec window [%#llx, %#llx): %s\n", win->base,
+	       win->base + win->size, why);
+	printf("WARNING: Linux will run outside it, on the boot CPU only\n");
 }
 
 /* Runtime services are 64 KiB aligned, and are part of the image */

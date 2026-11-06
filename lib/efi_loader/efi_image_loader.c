@@ -955,7 +955,7 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
  * without LoadImage, so efi_load_pe() never sees it. Without an RNG, the EFI stub
  * then runs the kernel where it is. Nothing else asks for this much loader code
  * at an address of U-Boot's choosing. If one does, it spends window space, and a
- * kernel that no longer fits is refused as usual.
+ * kernel that no longer fits gets a warning.
  *
  * @type:		type of allocation to be performed
  * @memory_type:	usage type of the allocated memory
@@ -981,8 +981,10 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(int type, int memory_type,
 
 	mem = efi_alloc_in_ctxr_window(&win, (u64)pages << EFI_PAGE_SHIFT,
 				       memory_type);
-	if (!mem)
+	if (!mem) {
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the loader code");
 		return EFI_NOT_FOUND;
+	}
 
 	log_info("CTXR exec window [%#llx, %#llx): %#llx bytes of loader code at %#llx\n",
 		 win.base, win.base + win.size, (u64)pages << EFI_PAGE_SHIFT,
@@ -995,14 +997,14 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(int type, int memory_type,
 /**
  * efi_place_linux_in_ctxr_window() - keep a kernel inside its executable window
  *
- * A kernel that the device tree confines to a physical window panics if its
- * image is outside it. Load an arm64 Image there, at a 2 MiB boundary, and tell
- * the EFI stub to run it in place: that alignment and the protocol take the
- * stub down its path that neither moves the image nor randomises its physical
- * address.
+ * A kernel whose image is outside its window keeps its secondary CPUs offline.
+ * Load an arm64 Image in the window, at a 2 MiB boundary, and tell the EFI stub
+ * to run it in place: that alignment and the protocol take the stub down its
+ * path that neither moves the image nor randomises its physical address.
  *
  * A zboot image cannot be placed like this. Its decompressor picks the kernel's
- * address from all of the memory map and does not look at the protocol.
+ * address from all of the memory map and does not look at the protocol. That,
+ * or a window with no room, only gets a warning: the kernel still boots.
  *
  * @handle:		loaded image handle
  * @efi:		the PE file, already checked to hold an MS-DOS header
@@ -1010,7 +1012,7 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(int type, int memory_type,
  * @memory_type:	usage type of the image's memory
  * @reloc:		set to the image's memory if this placed it
  * @reloc_size:		set to the size of that memory if this placed it
- * Return:		EFI_SUCCESS unless the image must not be booted. Without
+ * Return:		EFI_SUCCESS, or an error installing the protocol. Without
  *			a window, or for any other image, *@reloc is left NULL.
  */
 static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *handle,
@@ -1020,56 +1022,45 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 {
 	const struct linux_efi_header *hdr = efi;
 	struct ctxr_exec_window win;
-	const char *problem;
 	efi_status_t ret;
+	u64 size;
 
 	*reloc = NULL;
 
 	if (!ctxr_exec_window_get(&win))
 		return EFI_SUCCESS;
 
-	if (le32_to_cpu(hdr->magic) == LINUX_ARM64_IMAGE_MAGIC) {
-		u64 size = max(virt_size, le64_to_cpu(hdr->image_size));
+	if (le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
+	    le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE) {
+		ctxr_exec_warn_outside(&win, "a zboot kernel places itself, boot a plain Image");
+		return EFI_SUCCESS;
+	}
+	if (le32_to_cpu(hdr->magic) != LINUX_ARM64_IMAGE_MAGIC)
+		return EFI_SUCCESS;
 
-		*reloc = efi_alloc_in_ctxr_window(&win, size, memory_type);
-		if (*reloc) {
-			log_info("CTXR exec window [%#llx, %#llx): Linux image at %#llx, size %#llx\n",
-				 win.base, win.base + win.size,
-				 (u64)(uintptr_t)*reloc, size);
-			/* Confined cores cannot run what's outside the window */
-			if ((uintptr_t)__efi_runtime_start < win.base ||
-			    (uintptr_t)__efi_runtime_stop > win.base + win.size)
-				log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it\n",
-					    win.base, win.base + win.size);
-			ret = efi_add_protocol(&handle->header,
-					       &efi_guid_linux_image_fixed,
-					       NULL);
-			if (ret != EFI_SUCCESS) {
-				efi_free_pages((uintptr_t)*reloc,
-					       efi_size_in_pages(size));
-				*reloc = NULL;
-				return ret;
-			}
-			*reloc_size = size;
-			return EFI_SUCCESS;
-		}
-		problem = "no free 2 MiB aligned range fits the Linux image";
-	} else if (le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
-		   le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE) {
-		problem = "a zboot kernel places itself, boot a plain Image";
-	} else {
+	size = max(virt_size, le64_to_cpu(hdr->image_size));
+	*reloc = efi_alloc_in_ctxr_window(&win, size, memory_type);
+	if (!*reloc) {
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
 		return EFI_SUCCESS;
 	}
 
-	if (win.enforce) {
-		log_err("ERROR: CTXR exec window [%#llx, %#llx): %s\n",
-			win.base, win.base + win.size, problem);
-		log_err("Not starting a kernel that would panic outside the window\n");
-		return EFI_OUT_OF_RESOURCES;
-	}
+	log_info("CTXR exec window [%#llx, %#llx): Linux image at %#llx, size %#llx\n",
+		 win.base, win.base + win.size, (u64)(uintptr_t)*reloc, size);
+	/* Confined cores cannot run what's outside the window */
+	if ((uintptr_t)__efi_runtime_start < win.base ||
+	    (uintptr_t)__efi_runtime_stop > win.base + win.size)
+		log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it, so Linux turns EFI runtime services off\n",
+			    win.base, win.base + win.size);
 
-	log_warning("CTXR exec window [%#llx, %#llx): %s\n",
-		    win.base, win.base + win.size, problem);
+	ret = efi_add_protocol(&handle->header, &efi_guid_linux_image_fixed,
+			       NULL);
+	if (ret != EFI_SUCCESS) {
+		efi_free_pages((uintptr_t)*reloc, efi_size_in_pages(size));
+		*reloc = NULL;
+		return ret;
+	}
+	*reloc_size = size;
 
 	return EFI_SUCCESS;
 }

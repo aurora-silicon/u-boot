@@ -432,14 +432,15 @@ static efi_status_t efi_check_allocated(u64 addr, bool must_be_allocated)
  *
  * Confined cores can only run runtime code inside the window. An application
  * that names an address gets that address, or an error if the window holds it.
+ * If the window has no room, the code goes outside it with a warning.
  *
  * @type:		type of allocation to be performed
  * @memory_type:	usage type of the allocated memory
  * @len:		size of the allocation in bytes
  * @limit:		highest address for EFI_ALLOCATE_MAX_ADDRESS
  * @addr:		set to the address given up, if there is one
- * Return:		EFI_SUCCESS if @addr is free to allocate, EFI_NOT_FOUND
- *			if this isn't for the window, or an error
+ * Return:		EFI_SUCCESS if @addr is free to allocate, or
+ *			EFI_NOT_FOUND to allocate as usual
  */
 static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 					       enum efi_memory_type memory_type,
@@ -462,7 +463,10 @@ static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 	if (!lmb_release_ctxr_window_top(len, max, addr))
 		return EFI_SUCCESS;
 
-	return win.enforce ? EFI_OUT_OF_RESOURCES : EFI_NOT_FOUND;
+	log_warning("CTXR exec window [%#llx, %#llx): no room for %#llx bytes of runtime code, so Linux turns EFI runtime services off\n",
+		    win.base, win.base + win.size, len);
+
+	return EFI_NOT_FOUND;
 }
 
 /**

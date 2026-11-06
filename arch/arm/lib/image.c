@@ -105,17 +105,10 @@ int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 	else
 		dst = gd->bd->bi_dram[0].start;
 
-	/* A kernel confined to a window panics if its image is outside it */
+	/* Outside its window, a kernel keeps its secondary CPUs offline */
 	if (ctxr_exec_window_get(&win) &&
-	    ctxr_exec_window_slot(&win, text_offset + image_size, &dst)) {
-		printf("%sCTXR exec window [%#llx, %#llx): no free 2 MiB aligned range fits the %#llx byte Linux image\n",
-		       win.enforce ? "ERROR: " : "", win.base,
-		       win.base + win.size, image_size);
-		if (win.enforce) {
-			unmap_sysmem(ih);
-			return 1;
-		}
-	}
+	    ctxr_exec_window_slot(&win, text_offset + image_size, &dst))
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
 
 	*relocated_addr = ALIGN(dst, SZ_2M) + text_offset;
 

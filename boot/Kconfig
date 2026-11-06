@@ -64,8 +64,9 @@ config CTXR_EXEC_WINDOW
 	  cannot place, unless /chosen/aurora,ctxr-exec-enforce is 0.
 
 	  U-Boot's own image relocates to the top of the window, because it
-	  holds the EFI runtime services that kernel calls. The rest of U-Boot's
-	  memory stays outside.
+	  holds the EFI runtime services that kernel calls, and so does runtime
+	  code an EFI application allocates. The rest of U-Boot's memory and
+	  what else EFI applications allocate stay outside.
 
 	  Nothing changes when the property is absent or its base is zero.
 

@@ -904,6 +904,9 @@ struct linux_efi_header {
 #define LINUX_PE_MAGIC		0x818223cd
 #define LINUX_ZBOOT_TYPE	0x676d697a	/* "zimg" */
 
+/* More than other EFI applications load as code, less than any kernel */
+#define CTXR_KERNEL_MIN_SIZE	SZ_16M
+
 /*
  * LINUX_EFI_LOADED_IMAGE_FIXED_GUID: the kernel's EFI stub takes this protocol
  * on its image handle to mean that it must run where the loader put it.
@@ -943,6 +946,50 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 	}
 
 	return NULL;
+}
+
+/**
+ * efi_alloc_kernel_in_ctxr_window() - serve a kernel its loader allocates itself
+ *
+ * systemd-stub loads the kernel in a UKI into pages it allocates, and starts it
+ * without LoadImage, so efi_load_pe() never sees it. Without an RNG, the EFI stub
+ * then runs the kernel where it is. Nothing else asks for this much loader code
+ * at an address of U-Boot's choosing. If one does, it spends window space, and a
+ * kernel that no longer fits is refused as usual.
+ *
+ * @type:		type of allocation to be performed
+ * @memory_type:	usage type of the allocated memory
+ * @pages:		number of pages to be allocated
+ * @memory:		highest address for EFI_ALLOCATE_MAX_ADDRESS, and set to
+ *			the allocated memory
+ * Return:		EFI_SUCCESS if this allocated it, or EFI_NOT_FOUND
+ */
+efi_status_t efi_alloc_kernel_in_ctxr_window(int type, int memory_type,
+					     efi_uintn_t pages, u64 *memory)
+{
+	struct ctxr_exec_window win;
+	void *mem;
+
+	if (memory_type != EFI_LOADER_CODE || !memory ||
+	    pages < (CTXR_KERNEL_MIN_SIZE >> EFI_PAGE_SHIFT) ||
+	    (type != EFI_ALLOCATE_ANY_PAGES &&
+	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
+	    !ctxr_exec_window_get(&win) ||
+	    (type == EFI_ALLOCATE_MAX_ADDRESS &&
+	     *memory < win.base + win.size - 1))
+		return EFI_NOT_FOUND;
+
+	mem = efi_alloc_in_ctxr_window(&win, (u64)pages << EFI_PAGE_SHIFT,
+				       memory_type);
+	if (!mem)
+		return EFI_NOT_FOUND;
+
+	log_info("CTXR exec window [%#llx, %#llx): %#llx bytes of loader code at %#llx\n",
+		 win.base, win.base + win.size, (u64)pages << EFI_PAGE_SHIFT,
+		 (u64)(uintptr_t)mem);
+	*memory = (uintptr_t)mem;
+
+	return EFI_SUCCESS;
 }
 
 /**

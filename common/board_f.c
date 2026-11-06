@@ -480,7 +480,6 @@ static int reserve_uboot(void)
 	}
 
 	gd->start_addr_sp = gd->relocaddr;
-	ctxr_exec_relocate_uboot();
 
 	return 0;
 }
@@ -997,6 +996,7 @@ static void initcall_run_f(void)
 	INITCALL(reserve_bloblist);
 	INITCALL(reserve_arch);
 	INITCALL(reserve_stacks);
+	INITCALL(ctxr_exec_relocate_uboot);
 	INITCALL(dram_init_banksize);
 	INITCALL(show_dram_config);
 	WATCHDOG_RESET();

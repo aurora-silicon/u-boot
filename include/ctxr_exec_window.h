@@ -47,12 +47,14 @@ void ctxr_exec_warn_outside(const struct ctxr_exec_window *win,
 /**
  * ctxr_exec_relocate_uboot() - relocate U-Boot's image into the window
  *
- * Call this after reserving memory for the image. Only the image moves, which
- * holds runtime services. The rest of U-Boot's memory is free once the OS runs,
- * so it stays where it would be without a window, and nothing changes if the
- * window can't take the image.
+ * Call this once all of U-Boot's memory is reserved, before setup_reloc(). Only
+ * the image moves, which holds runtime services. The rest of U-Boot's memory is
+ * free once the OS runs, so it stays where it would be without a window, and
+ * nothing changes if the window can't take the image.
+ *
+ * Return:	0
  */
-void ctxr_exec_relocate_uboot(void);
+int ctxr_exec_relocate_uboot(void);
 
 /**
  * ctxr_exec_uboot_region() - find U-Boot's image if it moved into the window
@@ -78,8 +80,9 @@ static inline void ctxr_exec_warn_outside(const struct ctxr_exec_window *win,
 {
 }
 
-static inline void ctxr_exec_relocate_uboot(void)
+static inline int ctxr_exec_relocate_uboot(void)
 {
+	return 0;
 }
 
 static inline phys_size_t ctxr_exec_uboot_region(phys_addr_t *base)

@@ -14,6 +14,7 @@
 #include <env_internal.h>
 #include <fdtdec.h>
 #include <asm/global_data.h>
+#include <asm/sections.h>
 #include <dm/of.h>
 #include <dm/ofnode.h>
 #include <linux/kernel.h>
@@ -90,32 +91,43 @@ static bool ctxr_exec_reserved(const void *fdt, u64 start, u64 size)
 	return false;
 }
 
-void ctxr_exec_relocate_uboot(void)
+/* What relocate_code() reads while it copies, and the device tree */
+static bool ctxr_exec_in_use(u64 start, u64 size)
+{
+	ulong image = (ulong)__image_copy_start;
+	ulong end = max((ulong)__bss_end, (ulong)_end);
+
+	return ctxr_exec_overlaps(image, end - image, start, size) ||
+	       ctxr_exec_overlaps((ulong)gd->fdt_blob,
+				  fdt_totalsize(gd->fdt_blob), start, size);
+}
+
+int ctxr_exec_relocate_uboot(void)
 {
 	phys_size_t size = ctxr_exec_uboot_size();
 	struct ctxr_exec_window win;
-	u64 end, image, below;
+	u64 end, image, bottom;
 
 	gd->ctxr_malloc_end = gd->relocaddr;
 
 	if ((gd->flags & GD_FLG_SKIP_RELOC) ||
 	    CONFIG_IS_ENABLED(SKIP_RELOCATE_CODE) ||
 	    !ctxr_exec_window_get(&win) || win.size < size)
-		return;
+		return 0;
 
 	end = win.base + win.size;
 	image = ALIGN_DOWN(end - size, SZ_64K);
+	/* All of U-Boot's other memory is reserved by now, down to its stack */
+	bottom = ALIGN_DOWN(gd->start_addr_sp - CONFIG_STACK_SIZE, SZ_4K);
 
-	/* The rest of U-Boot's memory goes below its usual place, not here */
-	below = TOTAL_MALLOC_LEN + CONFIG_STACK_SIZE +
-		fdt_totalsize(gd->fdt_blob) + SZ_1M;
-
-	if (image < win.base || win.base < gd->ram_base ||
-	    end + below > gd->relocaddr ||
+	if (image < win.base || win.base < gd->ram_base || end > bottom ||
+	    ctxr_exec_in_use(image, size) ||
 	    ctxr_exec_reserved(gd->fdt_blob, image, size))
-		return;
+		return 0;
 
 	gd->relocaddr = image;
+
+	return 0;
 }
 
 phys_size_t ctxr_exec_uboot_region(phys_addr_t *base)

@@ -428,6 +428,44 @@ static efi_status_t efi_check_allocated(u64 addr, bool must_be_allocated)
 }
 
 /**
+ * efi_runtime_code_in_window() - find room for runtime code in the CTXR window
+ *
+ * Confined cores can only run runtime code inside the window. An application
+ * that names an address gets that address, or an error if the window holds it.
+ *
+ * @type:		type of allocation to be performed
+ * @memory_type:	usage type of the allocated memory
+ * @len:		size of the allocation in bytes
+ * @limit:		highest address for EFI_ALLOCATE_MAX_ADDRESS
+ * @addr:		set to the address given up, if there is one
+ * Return:		EFI_SUCCESS if @addr is free to allocate, EFI_NOT_FOUND
+ *			if this isn't for the window, or an error
+ */
+static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
+					       enum efi_memory_type memory_type,
+					       u64 len, u64 limit, phys_addr_t *addr)
+{
+	struct ctxr_exec_window win;
+	phys_addr_t max;
+
+	if (memory_type != EFI_RUNTIME_SERVICES_CODE ||
+	    (type != EFI_ALLOCATE_ANY_PAGES &&
+	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
+	    !ctxr_exec_window_get(&win))
+		return EFI_NOT_FOUND;
+
+	max = win.base + win.size;
+	if (type == EFI_ALLOCATE_MAX_ADDRESS)
+		max = min_t(phys_addr_t, max,
+			    map_to_sysmem((void *)(uintptr_t)limit));
+
+	if (!lmb_release_ctxr_window_top(len, max, addr))
+		return EFI_SUCCESS;
+
+	return win.enforce ? EFI_OUT_OF_RESOURCES : EFI_NOT_FOUND;
+}
+
+/**
  * efi_allocate_pages - allocate memory pages
  *
  * @type:		type of allocation to be performed
@@ -440,8 +478,6 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 				enum efi_memory_type memory_type,
 				efi_uintn_t pages, uint64_t *memory)
 {
-	struct ctxr_exec_window win;
-	bool in_window;
 	int err;
 	u64 efi_addr, len;
 	uint flags;
@@ -460,30 +496,28 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 	    (len >> EFI_PAGE_SHIFT) != (u64)pages)
 		return EFI_OUT_OF_RESOURCES;
 
-	/* Confined cores can only run runtime code inside the CTXR window */
-	in_window = memory_type == EFI_RUNTIME_SERVICES_CODE &&
-		    type != EFI_ALLOCATE_ADDRESS && ctxr_exec_window_get(&win);
-
 	flags = LMB_NOOVERWRITE | LMB_NONOTIFY;
+
+	ret = efi_runtime_code_in_window(type, memory_type, len, *memory, &addr);
+	if (ret == EFI_SUCCESS) {
+		if (lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &addr, len, flags))
+			return EFI_OUT_OF_RESOURCES;
+		goto update_map;
+	}
+	if (ret != EFI_NOT_FOUND)
+		return ret;
+
 	switch (type) {
 	case EFI_ALLOCATE_ANY_PAGES:
 		/* Any page */
-		if (in_window) {
-			addr = win.base + win.size;
-			err = lmb_alloc_mem(LMB_MEM_ALLOC_MAX, EFI_PAGE_SIZE,
-					    &addr, len, flags);
-		} else {
-			err = lmb_alloc_mem(LMB_MEM_ALLOC_ANY, EFI_PAGE_SIZE,
-					    &addr, len, flags);
-		}
+		err = lmb_alloc_mem(LMB_MEM_ALLOC_ANY, EFI_PAGE_SIZE, &addr,
+				    len, flags);
 		if (err)
 			return EFI_OUT_OF_RESOURCES;
 		break;
 	case EFI_ALLOCATE_MAX_ADDRESS:
 		/* Max address */
 		addr = map_to_sysmem((void *)(uintptr_t)*memory);
-		if (in_window)
-			addr = min_t(phys_addr_t, addr, win.base + win.size);
 
 		err = lmb_alloc_mem(LMB_MEM_ALLOC_MAX, EFI_PAGE_SIZE, &addr,
 				    len, flags);
@@ -503,12 +537,7 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 		return EFI_INVALID_PARAMETER;
 	}
 
-	/* LMB looks below its limit, and the window has a lower end too */
-	if (in_window && win.enforce && addr < win.base) {
-		lmb_free(addr, len, flags);
-		return EFI_OUT_OF_RESOURCES;
-	}
-
+update_map:
 	efi_addr = (u64)(uintptr_t)map_sysmem(addr, 0);
 	/* Reserve that map in our memory maps */
 	ret = efi_update_memory_map(efi_addr, pages, memory_type, true, false);
@@ -560,6 +589,8 @@ efi_status_t efi_free_pages(uint64_t memory, efi_uintn_t pages)
 			  LMB_NOOVERWRITE);
 	if (status)
 		return EFI_NOT_FOUND;
+
+	lmb_hold_ctxr_window(map_to_sysmem((void *)(uintptr_t)memory), len);
 
 	unmap_sysmem((void *)(uintptr_t)memory);
 

@@ -52,6 +52,15 @@
 #define LMB_NONOTIFY BIT(3)
 
 /**
+ * define LMB_CTXR_HOLD - free memory set aside in the CTXR window
+ *
+ * LMB Memory region attribute flag for free memory in the window a Linux kernel
+ * confines its executable code to. Nothing can allocate it until
+ * lmb_release_ctxr_window() gives part of it up.
+ */
+#define LMB_CTXR_HOLD BIT(4)
+
+/**
  * enum lmb_mem_type - type of memory allocation request
  * @LMB_MEM_ALLOC_ADDR:	request for a particular region of memory
  * @LMB_MEM_ALLOC_ANY:	allocate any available memory region
@@ -170,6 +179,36 @@ int lmb_is_reserved_flags(phys_addr_t addr, int flags);
  * Return: 0 on success, negative error code on failure.
  */
 long lmb_free(phys_addr_t base, phys_size_t size, u32 flags);
+
+/**
+ * lmb_hold_ctxr_window() - set aside what is free of a range in the CTXR window
+ *
+ * @base: start of the range
+ * @size: size of the range, of which only the window's part counts
+ */
+void lmb_hold_ctxr_window(phys_addr_t base, phys_size_t size);
+
+/**
+ * lmb_release_ctxr_window() - give up a range of the CTXR window for allocation
+ *
+ * @base: start of the range
+ * @size: size of the range
+ *
+ * Return: 0 if the range is now free, -ENOENT if it wasn't all set aside
+ */
+int lmb_release_ctxr_window(phys_addr_t base, phys_size_t size);
+
+/**
+ * lmb_release_ctxr_window_top() - give up the top of the CTXR window for allocation
+ *
+ * @size: size of the range
+ * @max: address the range must end below
+ * @base: set to the start of the range
+ *
+ * Return: 0 if the range is now free, -ENOENT if nothing set aside fits
+ */
+int lmb_release_ctxr_window_top(phys_size_t size, phys_addr_t max,
+				phys_addr_t *base);
 
 void lmb_dump_all(void);
 void lmb_dump_all_force(void);

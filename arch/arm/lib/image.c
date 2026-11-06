@@ -34,8 +34,10 @@ struct Image_header {
 /**
  * ctxr_exec_window_slot() - find where an image fits in the window
  *
- * The image is moved before booti reserves its memory, so check here that the
- * range is free RAM.
+ * LMB keeps the window set aside, so give up the range the image goes in. The
+ * image is moved before booti reserves its memory, so this is also what checks
+ * that the range is free RAM. A range is already free if an earlier booti got
+ * this far and stopped.
  *
  * @win:	window to search
  * @size:	bytes from the 2 MiB boundary to the end of the image
@@ -49,7 +51,8 @@ static int ctxr_exec_window_slot(const struct ctxr_exec_window *win,
 
 	for (addr = ALIGN(win->base, SZ_2M);
 	     addr + size <= win->base + win->size; addr += SZ_2M) {
-		if (lmb_get_free_size(addr) >= size) {
+		if (!lmb_release_ctxr_window(addr, size) ||
+		    lmb_get_free_size(addr) >= size) {
 			*slot = addr;
 			return 0;
 		}

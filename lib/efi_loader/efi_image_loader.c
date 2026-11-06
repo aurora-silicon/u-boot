@@ -12,6 +12,7 @@
 #include <cpu_func.h>
 #include <ctxr_exec_window.h>
 #include <efi_loader.h>
+#include <lmb.h>
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
@@ -922,40 +923,26 @@ static const efi_guid_t efi_guid_linux_image_fixed =
 static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 				      u64 size, int memory_type)
 {
-	u64 win_end = win->base + win->size;
-	struct efi_mem_desc *map, *desc;
-	efi_uintn_t map_size;
-	void *mem = NULL;
+	u64 addr;
 
 	size = ALIGN(size, EFI_PAGE_SIZE);
 
-	if (efi_get_memory_map_alloc(&map_size, &map) != EFI_SUCCESS)
-		return NULL;
+	for (addr = ALIGN(win->base, SZ_2M);
+	     addr + size <= win->base + win->size; addr += SZ_2M) {
+		u64 alloc = addr;
 
-	/* The map is in ascending order */
-	for (desc = map; !mem && (void *)desc < (void *)map + map_size; desc++) {
-		u64 end = desc->physical_start +
-			  (desc->num_pages << EFI_PAGE_SHIFT);
-		u64 addr = max(desc->physical_start, win->base);
-
-		if (desc->type != EFI_CONVENTIONAL_MEMORY)
+		if (lmb_release_ctxr_window(addr, size))
 			continue;
 
-		end = min(end, win_end);
-		for (addr = ALIGN(addr, SZ_2M); !mem && addr + size <= end;
-		     addr += SZ_2M) {
-			u64 alloc = addr;
+		if (efi_allocate_pages(EFI_ALLOCATE_ADDRESS, memory_type,
+				       size >> EFI_PAGE_SHIFT,
+				       &alloc) == EFI_SUCCESS)
+			return (void *)(uintptr_t)alloc;
 
-			if (efi_allocate_pages(EFI_ALLOCATE_ADDRESS, memory_type,
-					       size >> EFI_PAGE_SHIFT,
-					       &alloc) == EFI_SUCCESS)
-				mem = (void *)(uintptr_t)alloc;
-		}
+		lmb_hold_ctxr_window(addr, size);
 	}
 
-	efi_free_pool(map);
-
-	return mem;
+	return NULL;
 }
 
 /**

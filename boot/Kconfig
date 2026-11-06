@@ -65,8 +65,9 @@ config CTXR_EXEC_WINDOW
 
 	  U-Boot's own image relocates to the top of the window, because it
 	  holds the EFI runtime services that kernel calls, and so does runtime
-	  code an EFI application allocates. The rest of U-Boot's memory and
-	  what else EFI applications allocate stay outside.
+	  code an EFI application allocates. LMB sets aside the rest of the
+	  window, and the EFI map reports it as boot services data, so nothing
+	  else allocates it. The kernel gets it back at ExitBootServices().
 
 	  Nothing changes when the property is absent or its base is zero.
 

@@ -19,6 +19,7 @@
 #include <sort.h>
 #include <crypto/mscode.h>
 #include <crypto/pkcs7_parser.h>
+#include <asm/sections.h>
 #include <linux/err.h>
 #include <linux/sizes.h>
 
@@ -998,6 +999,11 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 			log_info("CTXR exec window [%#llx, %#llx): Linux image at %#llx, size %#llx\n",
 				 win.base, win.base + win.size,
 				 (u64)(uintptr_t)*reloc, size);
+			/* Confined cores cannot run what's outside the window */
+			if ((uintptr_t)__efi_runtime_start < win.base ||
+			    (uintptr_t)__efi_runtime_stop > win.base + win.size)
+				log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it\n",
+					    win.base, win.base + win.size);
 			return efi_add_protocol(&handle->header,
 						&efi_guid_linux_image_fixed,
 						NULL);

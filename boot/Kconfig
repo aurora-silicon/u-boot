@@ -63,6 +63,10 @@ config CTXR_EXEC_WINDOW
 	  the Linux image inside that window. They refuse to boot a kernel they
 	  cannot place, unless /chosen/aurora,ctxr-exec-enforce is 0.
 
+	  U-Boot's own image relocates to the top of the window, because it
+	  holds the EFI runtime services that kernel calls. The rest of U-Boot's
+	  memory stays outside.
+
 	  Nothing changes when the property is absent or its base is zero.
 
 config BUTTON_CMD

@@ -12,6 +12,7 @@
 #include <event.h>
 #include <image.h>
 #include <mapmem.h>
+#include <ctxr_exec_window.h>
 #include <lmb.h>
 #include <log.h>
 #include <malloc.h>
@@ -536,7 +537,8 @@ static void lmb_reserve_uboot_region(void)
 {
 	int bank;
 	ulong end, bank_end;
-	phys_addr_t rsv_start;
+	phys_addr_t rsv_start, image;
+	phys_size_t image_size;
 	ulong pram = 0;
 
 	rsv_start = gd->start_addr_sp - CONFIG_STACK_SIZE;
@@ -574,6 +576,10 @@ static void lmb_reserve_uboot_region(void)
 
 		break;
 	}
+
+	image_size = ctxr_exec_uboot_region(&image);
+	if (image_size)
+		lmb_reserve(image, image_size, LMB_NOOVERWRITE);
 }
 
 static void lmb_reserve_common(void *fdt_blob)

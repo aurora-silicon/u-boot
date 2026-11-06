@@ -30,11 +30,46 @@ struct ctxr_exec_window {
  * Return:	true if the device tree advertises a physical window
  */
 bool ctxr_exec_window_get(struct ctxr_exec_window *win);
+
+/**
+ * ctxr_exec_relocate_uboot() - relocate U-Boot's image into the window
+ *
+ * Call this after reserving memory for the image. Only the image moves, which
+ * holds runtime services. The rest of U-Boot's memory is free once the OS runs,
+ * so it stays where it would be without a window, and nothing changes if the
+ * window can't take the image.
+ */
+void ctxr_exec_relocate_uboot(void);
+
+/**
+ * ctxr_exec_uboot_region() - find U-Boot's image if it moved into the window
+ *
+ * The rest of U-Boot's memory doesn't cover the image then, so it needs
+ * reserving as well.
+ *
+ * @base:	set to the start of the image if it moved
+ * Return:	size of the image's memory, or 0 if it did not move
+ */
+phys_size_t ctxr_exec_uboot_region(phys_addr_t *base);
+
+/* Where the malloc() region ends */
+#define ctxr_exec_malloc_end()	gd->ctxr_malloc_end
 #else
 static inline bool ctxr_exec_window_get(struct ctxr_exec_window *win)
 {
 	return false;
 }
+
+static inline void ctxr_exec_relocate_uboot(void)
+{
+}
+
+static inline phys_size_t ctxr_exec_uboot_region(phys_addr_t *base)
+{
+	return 0;
+}
+
+#define ctxr_exec_malloc_end()	gd->relocaddr
 #endif
 
 #endif /* __CTXR_EXEC_WINDOW_H */

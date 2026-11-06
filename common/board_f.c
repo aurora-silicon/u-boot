@@ -16,6 +16,7 @@
 #include <console.h>
 #include <cpu.h>
 #include <cpu_func.h>
+#include <ctxr_exec_window.h>
 #include <cyclic.h>
 #include <display_options.h>
 #include <dm.h>
@@ -479,6 +480,7 @@ static int reserve_uboot(void)
 	}
 
 	gd->start_addr_sp = gd->relocaddr;
+	ctxr_exec_relocate_uboot();
 
 	return 0;
 }

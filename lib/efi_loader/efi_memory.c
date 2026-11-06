@@ -7,6 +7,7 @@
 
 #define LOG_CATEGORY LOGC_EFI
 
+#include <ctxr_exec_window.h>
 #include <efi_loader.h>
 #include <init.h>
 #include <lmb.h>
@@ -867,6 +868,8 @@ static void add_u_boot_and_runtime(void)
 	unsigned long runtime_mask = EFI_PAGE_MASK;
 	unsigned long uboot_start, uboot_pages;
 	unsigned long uboot_stack_size = CONFIG_STACK_SIZE;
+	phys_size_t image_size;
+	phys_addr_t image;
 
 	/* Add U-Boot */
 	uboot_start = ((uintptr_t)map_sysmem(gd->start_addr_sp, 0) -
@@ -875,6 +878,12 @@ static void add_u_boot_and_runtime(void)
 		       uboot_start + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT;
 	efi_update_memory_map(uboot_start, uboot_pages, EFI_BOOT_SERVICES_CODE,
 			      false, false);
+
+	image_size = ctxr_exec_uboot_region(&image);
+	if (image_size)
+		efi_update_memory_map((uintptr_t)map_sysmem(image, 0),
+				      image_size >> EFI_PAGE_SHIFT,
+				      EFI_BOOT_SERVICES_CODE, false, false);
 #if defined(__aarch64__)
 	/*
 	 * Runtime Services must be 64KiB aligned according to the

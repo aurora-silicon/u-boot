@@ -920,6 +920,41 @@ static int j713_aop(void *dst, const void *src)
 	return j713_phandles(dst, src, sn, "memory-region", -1);
 }
 
+/* m1n1 copies each speaker amp's configuration from the ADT onto the amp's
+ * node; without it the kernel keeps the speakers off. Copy it onto the OS
+ * tree's amps. An amp the OS tree doesn't have is skipped, and an amp with
+ * none of it (an older m1n1) is left as it is.
+ */
+static int j713_speaker_amps(void *dst, const void *src)
+{
+	static const struct {
+		const char *name;
+		int size;
+	} props[] = {
+		{ "apple,speaker-config", 4 }, { "apple,amp-tx-zd-config", 8 },
+		{ "apple,bop-config", -1 }, { "apple,amp-dcblocker-config", -1 },
+	};
+	static const char compatible[] = "ti,sn012776";
+	unsigned int i;
+	int sn, dn, ret;
+
+	for (sn = fdt_node_offset_by_compatible(src, -1, compatible); sn >= 0;
+	     sn = fdt_node_offset_by_compatible(src, sn, compatible)) {
+		dn = j713_map_node(dst, src, sn);
+		if (dn == -FDT_ERR_NOTFOUND)
+			continue;
+		if (dn < 0 || fdt_node_check_compatible(dst, dn, compatible))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(props); i++) {
+			ret = j713_copy_optional(dst, dn, src, sn, props[i].name,
+						 props[i].size);
+			if (ret)
+				return ret;
+		}
+	}
+	return sn == -FDT_ERR_NOTFOUND ? 0 : -EINVAL;
+}
+
 /* aura reserves this boot's ISP firmware in the control tree's
  * isp-firmware-text and isp-firmware-data, sets the platform ID and enables
  * the ISP and its DARTs, or leaves them disabled. The reservations were
@@ -1143,6 +1178,7 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = ret ?: j713_pcie_admission(scratch, source);
 	ret = ret ?: j713_display_refs(scratch, source);
 	ret = ret ?: j713_aop(scratch, source);
+	ret = ret ?: j713_speaker_amps(scratch, source);
 	ret = ret ?: j713_dcpext(scratch, source);
 	ret = ret ?: j713_isp(scratch, source);
 	ret = ret ?: j713_chosen(scratch, source);

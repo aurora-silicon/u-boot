@@ -101,11 +101,15 @@ struct lmb_region {
  * @available_mem: List of memory available to LMB
  * @used_mem: List of used/reserved memory regions
  * @test: Is structure being used for LMB tests
+ * @ctxr_base: Start of the CTXR window set aside
+ * @ctxr_size: Size of the CTXR window set aside, or 0 for none
  */
 struct lmb {
 	struct alist available_mem;
 	struct alist used_mem;
 	bool test;
+	phys_addr_t ctxr_base;
+	phys_size_t ctxr_size;
 };
 
 /**
@@ -181,6 +185,17 @@ int lmb_is_reserved_flags(phys_addr_t addr, int flags);
 long lmb_free(phys_addr_t base, phys_size_t size, u32 flags);
 
 /**
+ * lmb_ctxr_window_init() - set aside what is free of the CTXR window
+ *
+ * Call this once the memory reserved at boot is in LMB. Nothing can allocate
+ * what this sets aside until lmb_release_ctxr_window() gives part of it up.
+ *
+ * @base: start of the window
+ * @size: size of the window
+ */
+void lmb_ctxr_window_init(phys_addr_t base, phys_size_t size);
+
+/**
  * lmb_hold_ctxr_window() - set aside what is free of a range in the CTXR window
  *
  * @base: start of the range
@@ -199,16 +214,17 @@ void lmb_hold_ctxr_window(phys_addr_t base, phys_size_t size);
 int lmb_release_ctxr_window(phys_addr_t base, phys_size_t size);
 
 /**
- * lmb_release_ctxr_window_top() - give up the top of the CTXR window for allocation
+ * lmb_ctxr_window_top() - find the highest range set aside in the CTXR window
  *
  * @size: size of the range
- * @max: address the range must end below
+ * @align: alignment of its start
+ * @max: address the range must end at or below
  * @base: set to the start of the range
  *
- * Return: 0 if the range is now free, -ENOENT if nothing set aside fits
+ * Return: 0 if found, -ENOENT if nothing set aside fits
  */
-int lmb_release_ctxr_window_top(phys_size_t size, phys_addr_t max,
-				phys_addr_t *base);
+int lmb_ctxr_window_top(phys_size_t size, phys_size_t align, phys_addr_t max,
+			phys_addr_t *base);
 
 void lmb_dump_all(void);
 void lmb_dump_all_force(void);

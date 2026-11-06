@@ -460,7 +460,8 @@ static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 		max = min_t(phys_addr_t, max,
 			    map_to_sysmem((void *)(uintptr_t)limit));
 
-	if (!lmb_release_ctxr_window_top(len, max, addr))
+	if (!lmb_ctxr_window_top(len, SZ_4K, max, addr) &&
+	    !lmb_release_ctxr_window(*addr, len))
 		return EFI_SUCCESS;
 
 	log_warning("CTXR exec window [%#llx, %#llx): no room for %#llx bytes of runtime code, so Linux turns EFI runtime services off\n",

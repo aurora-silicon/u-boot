@@ -969,3 +969,117 @@ static int lib_test_lmb_flags(struct unit_test_state *uts)
 	return 0;
 }
 LIB_TEST(lib_test_lmb_flags, 0);
+
+/* Index of the reserved region starting at @base, or -1 */
+static int lmb_used_index(struct alist *used_lst, phys_addr_t base)
+{
+	struct lmb_region *used = used_lst->data;
+	int i;
+
+	for (i = 0; i < used_lst->count; i++)
+		if (used[i].base == base)
+			return i;
+
+	return -1;
+}
+
+/* The CTXR window: set aside, given up in pieces, and set aside again */
+static int lib_test_lmb_ctxr_window(struct unit_test_state *uts)
+{
+	const phys_addr_t ram = 0x40000000, win = 0x44000000;
+	const phys_size_t ram_size = 0x10000000, win_size = 0x8000000;
+	const u32 hold = LMB_CTXR_HOLD | LMB_NOOVERWRITE;
+	struct alist *mem_lst, *used_lst;
+	struct lmb_region *used;
+	phys_addr_t a, top;
+	struct lmb store;
+	int i;
+
+	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	ut_assertok(lmb_add(ram, ram_size));
+
+	/* What is reserved when it starts stays as it is */
+	ut_assertok(lmb_reserve(win, 0x200000, LMB_NOOVERWRITE));
+	ut_assertok(lmb_reserve(win + win_size - 0x100000, 0x100000,
+				LMB_NOOVERWRITE));
+	lmb_ctxr_window_init(win, win_size);
+	ASSERT_LMB(mem_lst, used_lst, ram, ram_size, 3, win, 0x200000,
+		   win + 0x200000, win_size - 0x300000,
+		   win + win_size - 0x100000, 0x100000);
+	used = used_lst->data;
+	ut_asserteq(used[0].flags, LMB_NOOVERWRITE);
+	ut_asserteq(used[1].flags, hold);
+	ut_asserteq(used[2].flags, LMB_NOOVERWRITE);
+
+	/* Allocations go around it, and a fixed address in it fails */
+	a = lmb_alloc(0x4000000, 0x200000);
+	ut_asserteq(a, win + win_size);
+	a = lmb_alloc(0x1000000, 0x200000);
+	ut_asserteq(a, win - 0x1000000);
+	ut_asserteq(-EEXIST, lmb_reserve(win + 0x400000, 0x1000, LMB_NONE));
+
+	/* Given up, used, freed and set aside again, it merges back */
+	ut_assertok(lmb_release_ctxr_window(win + 0x400000, 0x2000000));
+	ut_assertok(lmb_reserve(win + 0x400000, 0x2000000, LMB_NONE));
+	ut_asserteq(lmb_used_index(used_lst, win + 0x2400000) >= 0, 1);
+	ut_assertok(lmb_free(win + 0x400000, 0x2000000, LMB_NONE));
+	lmb_hold_ctxr_window(win + 0x400000, 0x2000000);
+	i = lmb_used_index(used_lst, win + 0x200000);
+	ut_assert(i >= 0);
+	used = used_lst->data;
+	ut_asserteq(used[i].size, win_size - 0x300000);
+	ut_asserteq(used[i].flags, hold);
+	ut_asserteq(-1, lmb_used_index(used_lst, win + 0x2400000));
+
+	/* Only a range wholly set aside can be given up */
+	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win, 0x400000));
+	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win + win_size - 0x200000,
+						     0x200000));
+
+	/* The top of what is set aside, aligned, below a limit */
+	ut_assertok(lmb_ctxr_window_top(0x10000, 0x10000, ~(phys_addr_t)0,
+					&top));
+	ut_asserteq(top, win + win_size - 0x110000);
+	ut_assertok(lmb_ctxr_window_top(0x1000, 0x10000, win + 0x1008000, &top));
+	ut_asserteq(top, win + 0x1000000);
+	ut_asserteq(-ENOENT, lmb_ctxr_window_top(0x10000, 0x10000,
+						 win + 0x200000, &top));
+
+	/* Memory outside the window is not set aside */
+	ut_assertok(lmb_free(a, 0x1000000, LMB_NONE));
+	lmb_hold_ctxr_window(a, 0x1000000);
+	ut_asserteq(-1, lmb_used_index(used_lst, a));
+
+	lmb_pop(&store);
+
+	return 0;
+}
+LIB_TEST(lib_test_lmb_ctxr_window, 0);
+
+/* Only the part of a CTXR window that has RAM behind it is set aside */
+static int lib_test_lmb_ctxr_window_ram(struct unit_test_state *uts)
+{
+	const phys_addr_t ram = 0x40000000;
+	const phys_size_t ram_size = 0x10000000;
+	struct alist *mem_lst, *used_lst;
+	struct lmb_region *used;
+	struct lmb store;
+
+	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	ut_assertok(lmb_add(ram, ram_size));
+
+	lmb_ctxr_window_init(0x4e000000, 0x4000000);
+	ASSERT_LMB(mem_lst, used_lst, ram, ram_size, 1, 0x4e000000, 0x2000000,
+		   0, 0, 0, 0);
+	used = used_lst->data;
+	ut_asserteq(used[0].flags, LMB_CTXR_HOLD | LMB_NOOVERWRITE);
+
+	/* An LMB test starts with no window */
+	lmb_pop(&store);
+	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	ut_asserteq(0, lmb_get()->ctxr_size);
+	lmb_pop(&store);
+
+	return 0;
+}
+LIB_TEST(lib_test_lmb_ctxr_window_ram, 0);

@@ -17,11 +17,17 @@
 #include <asm/sections.h>
 #include <dm/of.h>
 #include <dm/ofnode.h>
+#include <lmb.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
 
 DECLARE_GLOBAL_DATA_PTR;
+
+/* Where booti or bootm last put a kernel in the window, if it didn't start */
+static phys_addr_t ctxr_booti_base;
+static phys_size_t ctxr_booti_size;
 
 /* The kernel wants its window page aligned, and Apple kernels use 16K pages */
 #define CTXR_EXEC_PAGE	SZ_16K
@@ -138,4 +144,42 @@ phys_size_t ctxr_exec_uboot_region(phys_addr_t *base)
 	*base = gd->relocaddr;
 
 	return ctxr_exec_uboot_size();
+}
+
+int ctxr_exec_place_booti(const struct ctxr_exec_window *win, u64 size,
+			  u64 *slot)
+{
+	u64 addr;
+
+	ctxr_exec_unplace_booti();
+
+	for (addr = ALIGN(win->base, SZ_2M);
+	     addr + size <= win->base + win->size; addr += SZ_2M) {
+		phys_addr_t base = addr;
+
+		if (lmb_release_ctxr_window(addr, size))
+			continue;
+		/* booti reserves the image's part again, which merges */
+		if (lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &base, size, LMB_NONE)) {
+			lmb_hold_ctxr_window(addr, size);
+			continue;
+		}
+
+		ctxr_booti_base = addr;
+		ctxr_booti_size = size;
+		*slot = addr;
+		return 0;
+	}
+
+	return -ENOSPC;
+}
+
+void ctxr_exec_unplace_booti(void)
+{
+	if (!ctxr_booti_size)
+		return;
+
+	if (!lmb_free(ctxr_booti_base, ctxr_booti_size, LMB_NONE))
+		lmb_hold_ctxr_window(ctxr_booti_base, ctxr_booti_size);
+	ctxr_booti_size = 0;
 }

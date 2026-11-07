@@ -928,6 +928,9 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 {
 	u64 addr;
 
+	/* A booti that left its image in the window didn't start */
+	ctxr_exec_unplace_booti();
+
 	size = ALIGN(size, EFI_PAGE_SIZE);
 
 	for (addr = ALIGN(win->base, SZ_2M);

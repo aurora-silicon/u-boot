@@ -7,6 +7,7 @@
 #ifndef __CTXR_EXEC_WINDOW_H
 #define __CTXR_EXEC_WINDOW_H
 
+#include <linux/errno.h>
 #include <linux/types.h>
 
 /**
@@ -67,6 +68,28 @@ int ctxr_exec_relocate_uboot(void);
  */
 phys_size_t ctxr_exec_uboot_region(phys_addr_t *base);
 
+/**
+ * ctxr_exec_place_booti() - reserve a place in the window for booti's image
+ *
+ * The image is moved there before booti reserves its memory, so this checks
+ * that the place is free RAM. It first gives back the place an earlier booti or
+ * bootm took, since that boot didn't start.
+ *
+ * @win:	window to search
+ * @size:	bytes from the 2 MiB boundary to the end of the image
+ * @slot:	set to the lowest free 2 MiB boundary that fits
+ * Return:	0 if found, -ENOSPC if not
+ */
+int ctxr_exec_place_booti(const struct ctxr_exec_window *win, u64 size,
+			  u64 *slot);
+
+/**
+ * ctxr_exec_unplace_booti() - give back the place booti or bootm took
+ *
+ * Placing another kernel calls this: the boot that took the place didn't start.
+ */
+void ctxr_exec_unplace_booti(void);
+
 /* Where the malloc() region ends */
 #define ctxr_exec_malloc_end()	gd->ctxr_malloc_end
 #else
@@ -88,6 +111,16 @@ static inline int ctxr_exec_relocate_uboot(void)
 static inline phys_size_t ctxr_exec_uboot_region(phys_addr_t *base)
 {
 	return 0;
+}
+
+static inline int ctxr_exec_place_booti(const struct ctxr_exec_window *win,
+					u64 size, u64 *slot)
+{
+	return -ENOSPC;
+}
+
+static inline void ctxr_exec_unplace_booti(void)
+{
 }
 
 #define ctxr_exec_malloc_end()	gd->relocaddr

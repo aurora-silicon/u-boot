@@ -6,11 +6,9 @@
 
 #include <ctxr_exec_window.h>
 #include <image.h>
-#include <lmb.h>
 #include <mapmem.h>
 #include <asm/global_data.h>
 #include <linux/bitops.h>
-#include <linux/errno.h>
 #include <linux/sizes.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -30,36 +28,6 @@ struct Image_header {
 	uint32_t	magic;		/* Magic number */
 	uint32_t	res5;
 };
-
-/**
- * ctxr_exec_window_slot() - find where an image fits in the window
- *
- * LMB keeps the window set aside, so give up the range the image goes in. The
- * image is moved before booti reserves its memory, so this is also what checks
- * that the range is free RAM. A range is already free if an earlier booti got
- * this far and stopped.
- *
- * @win:	window to search
- * @size:	bytes from the 2 MiB boundary to the end of the image
- * @slot:	set to the lowest free 2 MiB boundary that fits
- * Return:	0 if found, -ENOSPC if not
- */
-static int ctxr_exec_window_slot(const struct ctxr_exec_window *win,
-				 uint64_t size, uint64_t *slot)
-{
-	uint64_t addr;
-
-	for (addr = ALIGN(win->base, SZ_2M);
-	     addr + size <= win->base + win->size; addr += SZ_2M) {
-		if (!lmb_release_ctxr_window(addr, size) ||
-		    lmb_get_free_size(addr) >= size) {
-			*slot = addr;
-			return 0;
-		}
-	}
-
-	return -ENOSPC;
-}
 
 int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 		bool force_reloc)
@@ -107,7 +75,7 @@ int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 
 	/* Outside its window, a kernel keeps its secondary CPUs offline */
 	if (ctxr_exec_window_get(&win) &&
-	    ctxr_exec_window_slot(&win, text_offset + image_size, &dst))
+	    ctxr_exec_place_booti(&win, text_offset + image_size, &dst))
 		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
 
 	*relocated_addr = ALIGN(dst, SZ_2M) + text_offset;

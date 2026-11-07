@@ -1068,7 +1068,7 @@ static int lib_test_lmb_ctxr_window_ram(struct unit_test_state *uts)
 	const phys_size_t ram_size = 0x10000000;
 	struct alist *mem_lst, *used_lst;
 	struct lmb_region *used;
-	struct lmb store;
+	struct lmb store, inner;
 
 	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
 	ut_assertok(lmb_add(ram, ram_size));
@@ -1079,10 +1079,13 @@ static int lib_test_lmb_ctxr_window_ram(struct unit_test_state *uts)
 	used = used_lst->data;
 	ut_asserteq(used[0].flags, LMB_CTXR_HOLD | LMB_NOOVERWRITE);
 
-	/* An LMB test starts with no window */
-	lmb_pop(&store);
-	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	/* A pushed LMB starts with no window, and popping brings it back */
+	ut_assertok(lmb_push(&inner));
 	ut_asserteq(0, lmb_get()->ctxr_size);
+	lmb_pop(&inner);
+	ut_asserteq(0x4e000000, lmb_get()->ctxr_base);
+	ut_asserteq(0x4000000, lmb_get()->ctxr_size);
+
 	lmb_pop(&store);
 
 	return 0;
@@ -1120,3 +1123,54 @@ static int lib_test_lmb_ctxr_window_claim(struct unit_test_state *uts)
 	return 0;
 }
 LIB_TEST(lib_test_lmb_ctxr_window_claim, 0);
+
+/* A claim that spans several regions set aside takes each part */
+static int lib_test_lmb_ctxr_window_claim_many(struct unit_test_state *uts)
+{
+	const phys_addr_t ram = 0x40000000, win = 0x44000000;
+	const phys_size_t ram_size = 0x10000000, win_size = 0x8000000;
+	const u32 hold = LMB_CTXR_HOLD | LMB_NOOVERWRITE;
+	const u32 claimed = LMB_NOOVERWRITE | LMB_NONOTIFY;
+	struct alist *mem_lst, *used_lst;
+	struct lmb_region *used;
+	struct lmb store;
+	int i;
+
+	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	ut_assertok(lmb_add(ram, ram_size));
+	/* Two reservations split what is set aside into three regions */
+	ut_assertok(lmb_reserve(win + 0x400000, 0x100000, LMB_NOOVERWRITE));
+	ut_assertok(lmb_reserve(win + 0x800000, 0x100000, LMB_NOOVERWRITE));
+	lmb_ctxr_window_init(win, win_size);
+	ut_asserteq(5, used_lst->count);
+
+	lmb_ctxr_window_claim(win + 0x200000, 0xa00000, LMB_NOOVERWRITE);
+	ut_asserteq(7, used_lst->count);
+	used = used_lst->data;
+	ut_asserteq(used[0].base, win);
+	ut_asserteq(used[0].size, 0x200000);
+	ut_asserteq(used[0].flags, hold);
+	ut_asserteq(used[1].base, win + 0x200000);
+	ut_asserteq(used[1].size, 0x200000);
+	ut_asserteq(used[1].flags, claimed);
+	ut_asserteq(used[3].base, win + 0x500000);
+	ut_asserteq(used[3].size, 0x300000);
+	ut_asserteq(used[3].flags, claimed);
+	ut_asserteq(used[5].base, win + 0x900000);
+	ut_asserteq(used[5].size, 0x300000);
+	ut_asserteq(used[5].flags, claimed);
+	ut_asserteq(used[6].base, win + 0xc00000);
+	ut_asserteq(used[6].size, win_size - 0xc00000);
+	ut_asserteq(used[6].flags, hold);
+
+	/* Nothing set aside is left in the claimed range */
+	for (i = 0; i < used_lst->count; i++)
+		ut_assert(!(used[i].flags & LMB_CTXR_HOLD) ||
+			  used[i].base + used[i].size <= win + 0x200000 ||
+			  used[i].base >= win + 0xc00000);
+
+	lmb_pop(&store);
+
+	return 0;
+}
+LIB_TEST(lib_test_lmb_ctxr_window_claim_many, 0);

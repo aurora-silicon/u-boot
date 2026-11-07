@@ -10,7 +10,9 @@
 #define LOG_CATEGORY LOGC_EFI
 
 #include <cpu_func.h>
+#include <ctxr_exec_window.h>
 #include <efi_loader.h>
+#include <lmb.h>
 #include <log.h>
 #include <malloc.h>
 #include <mapmem.h>
@@ -18,7 +20,9 @@
 #include <sort.h>
 #include <crypto/mscode.h>
 #include <crypto/pkcs7_parser.h>
+#include <asm/sections.h>
 #include <linux/err.h>
+#include <linux/sizes.h>
 
 const efi_guid_t efi_global_variable_guid = EFI_GLOBAL_VARIABLE_GUID;
 const efi_guid_t efi_guid_device_path = EFI_DEVICE_PATH_PROTOCOL_GUID;
@@ -880,6 +884,260 @@ static u32 section_size(IMAGE_SECTION_HEADER *sec)
 		return sec->SizeOfRawData;
 }
 
+/*
+ * The start of a Linux kernel PE file, which overlays the MS-DOS header. An
+ * arm64 Image is laid out as Documentation/arch/arm64/booting.rst describes. A
+ * zboot image is a small decompressor with the kernel as its payload.
+ */
+struct linux_efi_header {
+	__le32 code0;
+	__le32 zboot_type;
+	__le64 text_offset;
+	__le64 image_size;
+	__le64 flags;
+	__le64 res[3];
+	__le32 magic;
+	__le32 pe_offset;
+};
+
+#define LINUX_ARM64_IMAGE_MAGIC	0x644d5241	/* "ARM\x64" */
+#define LINUX_PE_MAGIC		0x818223cd
+#define LINUX_ZBOOT_TYPE	0x676d697a	/* "zimg" */
+
+/*
+ * LINUX_EFI_LOADED_IMAGE_FIXED_GUID: the kernel's EFI stub takes this protocol
+ * on its image handle to mean that it must run where the loader put it.
+ */
+static const efi_guid_t efi_guid_linux_image_fixed =
+	EFI_GUID(0xf5a37b6d, 0x3344, 0x42a5,
+		 0xb6, 0xbb, 0x97, 0x86, 0x48, 0xc1, 0x89, 0x0a);
+
+static bool efi_linux_is_zboot(const struct linux_efi_header *hdr)
+{
+	return le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
+	       le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE;
+}
+
+/* Confined cores cannot run runtime code outside the window */
+static void efi_warn_runtime_outside(const struct ctxr_exec_window *win)
+{
+	ulong start = ALIGN_DOWN((uintptr_t)__efi_runtime_start, SZ_64K);
+	ulong end = ALIGN((uintptr_t)__efi_runtime_stop, SZ_64K);
+
+	if (start < win->base || end > win->base + win->size)
+		log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it, so Linux turns EFI runtime services off\n",
+			    win->base, win->base + win->size);
+}
+
+/**
+ * efi_alloc_in_ctxr_window() - allocate 2 MiB aligned pages inside the window
+ *
+ * @win:		window to allocate from
+ * @size:		size of the allocation in bytes
+ * @memory_type:	usage type of the allocated memory
+ * Return:		the lowest free address that fits, or NULL if none does
+ */
+static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
+				      u64 size, int memory_type)
+{
+	u64 addr;
+
+	/* A booti that left its image in the window didn't start */
+	ctxr_exec_unplace_booti();
+
+	/* Larger than the window, the end of the image would wrap */
+	if (size > win->size)
+		return NULL;
+	size = ALIGN(size, EFI_PAGE_SIZE);
+
+	for (addr = ALIGN(win->base, SZ_2M);
+	     addr + size <= win->base + win->size; addr += SZ_2M) {
+		u64 alloc = addr;
+
+		if (lmb_release_ctxr_window(addr, size))
+			continue;
+
+		if (efi_allocate_pages(EFI_ALLOCATE_ADDRESS, memory_type,
+				       size >> EFI_PAGE_SHIFT,
+				       &alloc) == EFI_SUCCESS)
+			return (void *)(uintptr_t)alloc;
+
+		lmb_hold_ctxr_window(addr, size);
+	}
+
+	return NULL;
+}
+
+/**
+ * efi_uki_linux() - find the kernel in a unified kernel image
+ *
+ * A UKI is a PE image with a .linux section. The loaded image protocol is what
+ * a loader running an image itself, as shim does, points at that image.
+ *
+ * @handle:	image handle
+ * Return:	the Linux header at the start of the .linux section of the image
+ *		the handle describes, or NULL if it isn't a UKI
+ */
+static const struct linux_efi_header *efi_uki_linux(efi_handle_t handle)
+{
+	struct efi_loaded_image *info;
+	IMAGE_SECTION_HEADER *sec;
+	struct efi_handler *h;
+	IMAGE_NT_HEADERS32 *nt;
+	int i, n;
+
+	if (!handle ||
+	    efi_search_protocol(handle, &efi_guid_loaded_image, &h) != EFI_SUCCESS)
+		return NULL;
+	info = h->protocol_interface;
+	if (!info || !info->image_base ||
+	    efi_check_pe(info->image_base, info->image_size,
+			 (void **)&nt) != EFI_SUCCESS)
+		return NULL;
+
+	n = nt->FileHeader.NumberOfSections;
+	sec = (void *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader;
+	if ((void *)(sec + n) > info->image_base + info->image_size)
+		return NULL;
+
+	for (i = 0; i < n; i++) {
+		if (memcmp(sec[i].Name, ".linux", sizeof(".linux")))
+			continue;
+		if (section_size(&sec[i]) < sizeof(struct linux_efi_header) ||
+		    sec[i].VirtualAddress > info->image_size ||
+		    info->image_size - sec[i].VirtualAddress <
+		    sizeof(struct linux_efi_header))
+			return NULL;
+		return info->image_base + sec[i].VirtualAddress;
+	}
+
+	return NULL;
+}
+
+/**
+ * efi_alloc_kernel_in_ctxr_window() - serve a kernel its loader allocates itself
+ *
+ * systemd-stub loads the kernel in a UKI into loader code it allocates, and
+ * starts it without LoadImage, so efi_load_pe() never sees it. Without an RNG,
+ * the EFI stub then runs the kernel where it is. Serve such an allocation from
+ * the window if the image asking for it is a UKI, and warn if it doesn't fit
+ * or the UKI's kernel is a zboot image.
+ *
+ * @caller:		image that asked for the memory
+ * @type:		type of allocation to be performed
+ * @memory_type:	usage type of the allocated memory
+ * @pages:		number of pages to be allocated
+ * @memory:		highest address for EFI_ALLOCATE_MAX_ADDRESS, and set to
+ *			the allocated memory
+ * Return:		EFI_SUCCESS if this allocated it, or EFI_NOT_FOUND
+ */
+efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
+					     int memory_type, efi_uintn_t pages,
+					     u64 *memory)
+{
+	u64 size = (u64)pages << EFI_PAGE_SHIFT;
+	const struct linux_efi_header *hdr;
+	struct ctxr_exec_window win;
+	void *mem = NULL;
+
+	if (memory_type != EFI_LOADER_CODE || !memory || !pages ||
+	    size >> EFI_PAGE_SHIFT != pages ||
+	    (type != EFI_ALLOCATE_ANY_PAGES &&
+	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
+	    !ctxr_exec_window_get(&win))
+		return EFI_NOT_FOUND;
+
+	hdr = efi_uki_linux(caller);
+	if (!hdr)
+		return EFI_NOT_FOUND;
+	/* Its decompressor allocates the kernel itself, wherever it likes */
+	if (efi_linux_is_zboot(hdr)) {
+		ctxr_exec_warn_outside(&win, "a UKI's zboot kernel places itself, boot a plain Image");
+		return EFI_NOT_FOUND;
+	}
+
+	if (type == EFI_ALLOCATE_ANY_PAGES ||
+	    *memory >= win.base + win.size - 1)
+		mem = efi_alloc_in_ctxr_window(&win, size, memory_type);
+	if (!mem) {
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the kernel a UKI loads");
+		return EFI_NOT_FOUND;
+	}
+
+	log_info("CTXR exec window [%#llx, %#llx): %#llx bytes of loader code at %#llx\n",
+		 win.base, win.base + win.size, size, (u64)(uintptr_t)mem);
+	efi_warn_runtime_outside(&win);
+	*memory = (uintptr_t)mem;
+
+	return EFI_SUCCESS;
+}
+
+/**
+ * efi_place_linux_in_ctxr_window() - keep a kernel inside its executable window
+ *
+ * A kernel whose image is outside its window keeps its secondary CPUs offline.
+ * Load an arm64 Image in the window, at a 2 MiB boundary, and tell the EFI stub
+ * to run it in place: that alignment and the protocol take the stub down its
+ * path that neither moves the image nor randomises its physical address.
+ *
+ * A zboot image cannot be placed like this. Its decompressor picks the kernel's
+ * address from all of the memory map and does not look at the protocol. That,
+ * or a window with no room, only gets a warning: the kernel still boots.
+ *
+ * @handle:		loaded image handle
+ * @efi:		the PE file, already checked to hold an MS-DOS header
+ * @virt_size:		size of the image in memory, from the PE header
+ * @memory_type:	usage type of the image's memory
+ * @reloc:		set to the image's memory if this placed it
+ * @reloc_size:		set to the size of that memory if this placed it
+ * Return:		EFI_SUCCESS, or an error installing the protocol. Without
+ *			a window, or for any other image, *@reloc is left NULL.
+ */
+static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *handle,
+						   const void *efi, u64 virt_size,
+						   int memory_type, void **reloc,
+						   u64 *reloc_size)
+{
+	const struct linux_efi_header *hdr = efi;
+	struct ctxr_exec_window win;
+	efi_status_t ret;
+	u64 size;
+
+	*reloc = NULL;
+
+	if (!ctxr_exec_window_get(&win))
+		return EFI_SUCCESS;
+
+	if (efi_linux_is_zboot(hdr)) {
+		ctxr_exec_warn_outside(&win, "a zboot kernel places itself, boot a plain Image");
+		return EFI_SUCCESS;
+	}
+	if (le32_to_cpu(hdr->magic) != LINUX_ARM64_IMAGE_MAGIC)
+		return EFI_SUCCESS;
+
+	size = max(virt_size, le64_to_cpu(hdr->image_size));
+	*reloc = efi_alloc_in_ctxr_window(&win, size, memory_type);
+	if (!*reloc) {
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
+		return EFI_SUCCESS;
+	}
+
+	log_info("CTXR exec window [%#llx, %#llx): Linux image at %#llx, size %#llx\n",
+		 win.base, win.base + win.size, (u64)(uintptr_t)*reloc, size);
+	efi_warn_runtime_outside(&win);
+
+	ret = efi_add_protocol(&handle->header, &efi_guid_linux_image_fixed,
+			       NULL);
+	if (ret != EFI_SUCCESS) {
+		efi_free_pages((uintptr_t)*reloc, efi_size_in_pages(size));
+		*reloc = NULL;
+		return ret;
+	}
+	*reloc_size = size;
+
+	return EFI_SUCCESS;
+}
+
 /**
  * efi_load_pe() - relocate EFI binary
  *
@@ -907,6 +1165,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	int rel_idx = IMAGE_DIRECTORY_ENTRY_BASERELOC;
 	uint64_t image_base;
 	unsigned long virt_size = 0;
+	u64 alloc_size;
 	int supported = 0;
 	efi_status_t ret;
 
@@ -954,6 +1213,8 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 				  sec->VirtualAddress + section_size(sec));
 	}
 
+	alloc_size = virt_size;
+
 	/* Read 32/64bit specific header bits */
 	if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
 		IMAGE_NT_HEADERS64 *nt64 = (void *)nt;
@@ -961,9 +1222,15 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 		image_base = opt->ImageBase;
 		efi_set_code_and_data_type(loaded_image_info, opt->Subsystem);
 		handle->image_type = opt->Subsystem;
-		efi_reloc = efi_alloc_aligned_pages(virt_size,
-						    loaded_image_info->image_code_type,
-						    opt->SectionAlignment);
+		ret = efi_place_linux_in_ctxr_window(handle, efi, virt_size,
+						     loaded_image_info->image_code_type,
+						     &efi_reloc, &alloc_size);
+		if (ret != EFI_SUCCESS)
+			goto err;
+		if (!efi_reloc)
+			efi_reloc = efi_alloc_aligned_pages(virt_size,
+							    loaded_image_info->image_code_type,
+							    opt->SectionAlignment);
 		if (!efi_reloc) {
 			log_err("Out of memory\n");
 			ret = EFI_OUT_OF_RESOURCES;
@@ -1004,6 +1271,8 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 		 * this is not expected.
 		 */
 		log_err("PE image measurement failed, no tpm device found\n");
+		efi_free_pages((uintptr_t)efi_reloc,
+			       efi_size_in_pages(alloc_size));
 		goto err;
 	}
 
@@ -1036,7 +1305,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 				(unsigned long)image_base,
 				virt_size) != EFI_SUCCESS) {
 		efi_free_pages((uintptr_t)efi_reloc,
-			       (virt_size + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT);
+			       efi_size_in_pages(alloc_size));
 		ret = EFI_LOAD_ERROR;
 		goto err;
 	}
@@ -1054,7 +1323,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 
 	/* Populate the loaded image interface bits */
 	loaded_image_info->image_base = efi_reloc;
-	loaded_image_info->image_size = virt_size;
+	loaded_image_info->image_size = alloc_size;
 
 	if (handle->auth_status == EFI_IMAGE_AUTH_PASSED)
 		return EFI_SUCCESS;

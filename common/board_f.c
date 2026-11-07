@@ -16,6 +16,7 @@
 #include <console.h>
 #include <cpu.h>
 #include <cpu_func.h>
+#include <ctxr_exec_window.h>
 #include <cyclic.h>
 #include <display_options.h>
 #include <dm.h>
@@ -995,6 +996,7 @@ static void initcall_run_f(void)
 	INITCALL(reserve_bloblist);
 	INITCALL(reserve_arch);
 	INITCALL(reserve_stacks);
+	INITCALL(ctxr_exec_relocate_uboot);
 	INITCALL(dram_init_banksize);
 	INITCALL(show_dram_config);
 	WATCHDOG_RESET();

@@ -296,6 +296,15 @@ struct global_data {
 	 */
 	unsigned long malloc_start;
 #endif
+#if CONFIG_IS_ENABLED(CTXR_EXEC_WINDOW)
+	/**
+	 * @ctxr_malloc_end: end of malloc() region
+	 *
+	 * This is where the relocated image normally starts. It differs from
+	 * @relocaddr when the image has moved into the CTXR window.
+	 */
+	unsigned long ctxr_malloc_end;
+#endif
 #if CONFIG_IS_ENABLED(SYS_MALLOC_F)
 	/**
 	 * @malloc_base: base address of early malloc()

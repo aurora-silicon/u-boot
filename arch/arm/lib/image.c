@@ -4,6 +4,7 @@
  * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
  */
 
+#include <ctxr_exec_window.h>
 #include <image.h>
 #include <mapmem.h>
 #include <asm/global_data.h>
@@ -31,6 +32,7 @@ struct Image_header {
 int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 		bool force_reloc)
 {
+	struct ctxr_exec_window win;
 	struct Image_header *ih;
 	uint64_t dst;
 	uint64_t image_size, text_offset;
@@ -70,6 +72,12 @@ int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 		dst = image - text_offset;
 	else
 		dst = gd->bd->bi_dram[0].start;
+
+	/* Outside its window, a kernel keeps its secondary CPUs offline */
+	if (ctxr_exec_window_get(&win) &&
+	    (text_offset > win.size || image_size > win.size - text_offset ||
+	     ctxr_exec_place_booti(&win, text_offset + image_size, &dst)))
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
 
 	*relocated_addr = ALIGN(dst, SZ_2M) + text_offset;
 

@@ -896,6 +896,9 @@ void *efi_alloc(size_t len);
 efi_status_t efi_realloc(void **ptr, size_t len);
 /* Allocate pages on the specified alignment */
 void *efi_alloc_aligned_pages(u64 len, int memory_type, size_t align);
+efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
+					     int memory_type, efi_uintn_t pages,
+					     u64 *memory);
 /* More specific EFI memory allocator, called by EFI payloads */
 efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 				enum efi_memory_type memory_type,

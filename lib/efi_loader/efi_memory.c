@@ -7,6 +7,7 @@
 
 #define LOG_CATEGORY LOGC_EFI
 
+#include <ctxr_exec_window.h>
 #include <efi_loader.h>
 #include <init.h>
 #include <lmb.h>
@@ -426,6 +427,150 @@ static efi_status_t efi_check_allocated(u64 addr, bool must_be_allocated)
 	return EFI_NOT_FOUND;
 }
 
+/*
+ * Runtime code allocated in the CTXR window, in whole 64 KiB blocks: the first
+ * block still allocated, the end of what the caller has freed from there, the
+ * end of what was asked for, and the end of the blocks. An end of 0 marks a
+ * free entry.
+ */
+#define CTXR_RT_ALLOCS	16
+static struct {
+	u64 start;
+	u64 freed;
+	u64 asked;
+	u64 end;
+} ctxr_rt[CTXR_RT_ALLOCS];
+
+static int ctxr_rt_free_entry(void)
+{
+	int i;
+
+	for (i = 0; i < CTXR_RT_ALLOCS; i++) {
+		if (!ctxr_rt[i].end)
+			return i;
+	}
+
+	return -1;
+}
+
+/**
+ * efi_runtime_code_in_window() - find room for runtime code in the CTXR window
+ *
+ * Confined cores can only run runtime code inside the window. An application
+ * that names an address gets that address, or an error if the window holds it.
+ * If the window has no room, the code goes outside it with a warning.
+ *
+ * The code gets whole 64 KiB blocks, as UEFI wants for AArch64 runtime memory,
+ * so that its region stays aligned for a kernel of any page size.
+ *
+ * @type:		type of allocation to be performed
+ * @memory_type:	usage type of the allocated memory
+ * @len:		size of the allocation in bytes, rounded up if this
+ *			finds room
+ * @limit:		highest address for EFI_ALLOCATE_MAX_ADDRESS
+ * @addr:		set to the address given up, if there is one
+ * Return:		EFI_SUCCESS if @addr is free to allocate, or
+ *			EFI_NOT_FOUND to allocate as usual
+ */
+static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
+					       enum efi_memory_type memory_type,
+					       u64 *len, u64 limit,
+					       phys_addr_t *addr)
+{
+	struct ctxr_exec_window win;
+	phys_addr_t max;
+	u64 size;
+
+	if (memory_type != EFI_RUNTIME_SERVICES_CODE ||
+	    (type != EFI_ALLOCATE_ANY_PAGES &&
+	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
+	    !ctxr_exec_window_get(&win))
+		return EFI_NOT_FOUND;
+
+	max = win.base + win.size;
+	limit = map_to_sysmem((void *)(uintptr_t)limit);
+	if (type == EFI_ALLOCATE_MAX_ADDRESS && limit < max)
+		max = limit + 1;
+
+	size = ALIGN(*len, SZ_64K);
+	if (*len <= win.size && ctxr_rt_free_entry() >= 0 &&
+	    !lmb_ctxr_window_top(size, SZ_64K, max, addr) &&
+	    !lmb_release_ctxr_window(*addr, size)) {
+		*len = size;
+		return EFI_SUCCESS;
+	}
+
+	log_warning("CTXR exec window [%#llx, %#llx): no room for %#llx bytes of runtime code, so Linux turns EFI runtime services off\n",
+		    win.base, win.base + win.size, *len);
+
+	return EFI_NOT_FOUND;
+}
+
+/**
+ * efi_runtime_code_blocks() - free runtime code in the CTXR window in blocks
+ *
+ * Runtime code there comes in whole 64 KiB blocks. Free only the blocks the
+ * range covers whole, and the last block of an allocation once the range
+ * reaches the end of what was asked for. A block the range starts partway into
+ * stays, unless the caller freed the rest of it before: otherwise it is the
+ * rest of an aligned allocation being trimmed.
+ *
+ * @start:	start of the range, updated
+ * @len:	size of the range, updated, and 0 if no block is freed
+ */
+static void efi_runtime_code_blocks(u64 *start, u64 *len)
+{
+	u64 from = map_to_sysmem((void *)(uintptr_t)*start), to = from + *len;
+	u64 s, e;
+	int i;
+
+	for (i = 0; i < CTXR_RT_ALLOCS; i++) {
+		if (from >= ctxr_rt[i].start && from < ctxr_rt[i].end)
+			break;
+	}
+	if (i == CTXR_RT_ALLOCS)
+		return;
+
+	/* What the caller freed before, from the start, counts as freed */
+	if (from == ctxr_rt[i].freed)
+		from = ctxr_rt[i].start;
+	s = ALIGN(from, SZ_64K);
+	e = to >= ctxr_rt[i].asked ? ctxr_rt[i].end : ALIGN_DOWN(to, SZ_64K);
+	if (e <= s) {
+		if (from == ctxr_rt[i].start)
+			ctxr_rt[i].freed = max(ctxr_rt[i].freed, to);
+		*len = 0;
+		return;
+	}
+
+	if (s <= ctxr_rt[i].start && e >= ctxr_rt[i].end) {
+		ctxr_rt[i].end = 0;
+	} else if (s <= ctxr_rt[i].start) {
+		ctxr_rt[i].start = e;
+		ctxr_rt[i].freed = max(e, to);
+	} else if (e >= ctxr_rt[i].end) {
+		ctxr_rt[i].end = s;
+		ctxr_rt[i].asked = min(ctxr_rt[i].asked, from);
+	} else {
+		/* A hole in the middle: the part above it becomes an entry */
+		int j = ctxr_rt_free_entry();
+
+		if (j < 0) {
+			*len = 0;
+			return;
+		}
+		ctxr_rt[j].start = e;
+		ctxr_rt[j].freed = max(e, to);
+		ctxr_rt[j].asked = ctxr_rt[i].asked;
+		ctxr_rt[j].end = ctxr_rt[i].end;
+		ctxr_rt[i].asked = from;
+		ctxr_rt[i].end = s;
+	}
+
+	*start = (uintptr_t)map_sysmem(s, 0);
+	*len = e - s;
+}
+
 /**
  * efi_allocate_pages - allocate memory pages
  *
@@ -440,10 +585,11 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 				efi_uintn_t pages, uint64_t *memory)
 {
 	int err;
-	u64 efi_addr, len;
+	u64 efi_addr, len, asked;
 	uint flags;
 	efi_status_t ret;
 	phys_addr_t addr;
+	bool in_window;
 
 	/* Check import parameters */
 	if (memory_type >= EFI_PERSISTENT_MEMORY_TYPE &&
@@ -458,6 +604,20 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 		return EFI_OUT_OF_RESOURCES;
 
 	flags = LMB_NOOVERWRITE | LMB_NONOTIFY;
+
+	asked = len;
+	ret = efi_runtime_code_in_window(type, memory_type, &len, *memory,
+					 &addr);
+	in_window = ret == EFI_SUCCESS;
+	if (in_window) {
+		pages = len >> EFI_PAGE_SHIFT;
+		if (lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &addr, len, flags)) {
+			lmb_hold_ctxr_window(addr, len);
+			return EFI_OUT_OF_RESOURCES;
+		}
+		goto update_map;
+	}
+
 	switch (type) {
 	case EFI_ALLOCATE_ANY_PAGES:
 		/* Any page */
@@ -488,16 +648,27 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 		return EFI_INVALID_PARAMETER;
 	}
 
+update_map:
 	efi_addr = (u64)(uintptr_t)map_sysmem(addr, 0);
 	/* Reserve that map in our memory maps */
 	ret = efi_update_memory_map(efi_addr, pages, memory_type, true, false);
 	if (ret != EFI_SUCCESS) {
 		/* Map would overlap, bail out */
 		lmb_free(addr, (u64)pages << EFI_PAGE_SHIFT, flags);
+		lmb_hold_ctxr_window(addr, (u64)pages << EFI_PAGE_SHIFT);
 		unmap_sysmem((void *)(uintptr_t)efi_addr);
 		if (type == EFI_ALLOCATE_ADDRESS)
 			return EFI_NOT_FOUND;
 		return EFI_OUT_OF_RESOURCES;
+	}
+
+	if (in_window) {
+		int i = ctxr_rt_free_entry();
+
+		ctxr_rt[i].start = addr;
+		ctxr_rt[i].freed = addr;
+		ctxr_rt[i].asked = addr + asked;
+		ctxr_rt[i].end = addr + len;
 	}
 
 	*memory = efi_addr;
@@ -514,7 +685,7 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
  */
 efi_status_t efi_free_pages(uint64_t memory, efi_uintn_t pages)
 {
-	u64 len;
+	u64 len, start;
 	long status;
 	efi_status_t ret;
 
@@ -530,15 +701,22 @@ efi_status_t efi_free_pages(uint64_t memory, efi_uintn_t pages)
 	}
 
 	len = (u64)pages << EFI_PAGE_SHIFT;
+	start = memory;
+	efi_runtime_code_blocks(&start, &len);
+	if (!len)
+		return EFI_SUCCESS;
+
 	/*
-	 * The 'memory' variable for sandbox holds a pointer which has already
+	 * The 'start' variable for sandbox holds a pointer which has already
 	 * been mapped with map_sysmem() from efi_allocate_pages(). Convert
 	 * it back to an address LMB understands
 	 */
-	status = lmb_free(map_to_sysmem((void *)(uintptr_t)memory), len,
+	status = lmb_free(map_to_sysmem((void *)(uintptr_t)start), len,
 			  LMB_NOOVERWRITE);
 	if (status)
 		return EFI_NOT_FOUND;
+
+	lmb_hold_ctxr_window(map_to_sysmem((void *)(uintptr_t)start), len);
 
 	unmap_sysmem((void *)(uintptr_t)memory);
 
@@ -867,6 +1045,8 @@ static void add_u_boot_and_runtime(void)
 	unsigned long runtime_mask = EFI_PAGE_MASK;
 	unsigned long uboot_start, uboot_pages;
 	unsigned long uboot_stack_size = CONFIG_STACK_SIZE;
+	phys_size_t image_size;
+	phys_addr_t image;
 
 	/* Add U-Boot */
 	uboot_start = ((uintptr_t)map_sysmem(gd->start_addr_sp, 0) -
@@ -875,6 +1055,12 @@ static void add_u_boot_and_runtime(void)
 		       uboot_start + EFI_PAGE_MASK) >> EFI_PAGE_SHIFT;
 	efi_update_memory_map(uboot_start, uboot_pages, EFI_BOOT_SERVICES_CODE,
 			      false, false);
+
+	image_size = ctxr_exec_uboot_region(&image);
+	if (image_size)
+		efi_update_memory_map((uintptr_t)map_sysmem(image, 0),
+				      image_size >> EFI_PAGE_SHIFT,
+				      EFI_BOOT_SERVICES_CODE, false, false);
 #if defined(__aarch64__)
 	/*
 	 * Runtime Services must be 64KiB aligned according to the

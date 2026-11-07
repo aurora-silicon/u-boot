@@ -97,15 +97,24 @@ static bool ctxr_exec_reserved(const void *fdt, u64 start, u64 size)
 	return false;
 }
 
-/* What relocate_code() reads while it copies, and the device tree */
+/*
+ * What relocate_code() reads while it copies, the device tree, and gd with the
+ * early malloc() area above it
+ */
 static bool ctxr_exec_in_use(u64 start, u64 size)
 {
 	ulong image = (ulong)__image_copy_start;
 	ulong end = max((ulong)__bss_end, (ulong)_end);
+	ulong early = (ulong)gd, early_end = early + sizeof(*gd);
+
+#if CONFIG_IS_ENABLED(SYS_MALLOC_F)
+	early_end = max(early_end, gd->malloc_base + gd->malloc_limit);
+#endif
 
 	return ctxr_exec_overlaps(image, end - image, start, size) ||
 	       ctxr_exec_overlaps((ulong)gd->fdt_blob,
-				  fdt_totalsize(gd->fdt_blob), start, size);
+				  fdt_totalsize(gd->fdt_blob), start, size) ||
+	       ctxr_exec_overlaps(early, early_end - early, start, size);
 }
 
 int ctxr_exec_relocate_uboot(void)

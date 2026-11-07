@@ -123,35 +123,58 @@ CTXR executable window
 ----------------------
 
 On T8140, iBoot locks a code execute range (CTXR) on the secondary CPUs, so a
-kernel running at EL2 has to keep all of its executable code in a fixed physical
-window. A loader that sets this up advertises the window as
+kernel running on them at EL2 can only fetch code from a fixed physical window. A
+loader that sets this up advertises the window as
 ``/chosen/aurora,ctxr-exec-window = <base_hi base_lo size_hi size_lo>``. A kernel
-built with ``CONFIG_ARM64_CTXR_EXECMEM`` panics early if its image is outside it,
-unless ``/chosen/aurora,ctxr-exec-enforce`` is 0.
+built with ``CONFIG_ARM64_CTXR_EXECMEM`` keeps its executable code inside it. If
+its image is outside the window, or the window is unusable, the kernel keeps the
+secondary CPUs offline and boots on the boot CPU alone. It turns EFI runtime
+services off if any EFI runtime code is outside the window or not aligned to its
+pages.
 
-``CONFIG_CTXR_EXEC_WINDOW`` places Linux for such a kernel:
+U-Boot takes the window only if its base and size are non-zero and 16 KiB
+aligned and it doesn't wrap, which is what a 16K-page kernel takes. Without such
+a window, none of the following happens.
 
-* The EFI image loader, which serves ``bootefi`` and the ``LoadImage`` call GRUB
-  makes, recognises an arm64 Image by its header.
-* ``booti``, which the ``aurora_fallback`` boot path uses, takes any Image.
+``CONFIG_CTXR_EXEC_WINDOW`` keeps three things in the window:
 
-Both put the image at the lowest free 2 MiB boundary in the window where it fits.
-The EFI loader installs ``LINUX_EFI_LOADED_IMAGE_FIXED_GUID`` on the kernel's
-handle, so the stub runs the image in place. The kernel's physical address is
-therefore not randomised in this mode. Its virtual address still can be.
+* The kernel image. The EFI image loader, which serves ``bootefi`` and the
+  ``LoadImage`` call GRUB makes, recognises an arm64 Image by its header.
+  ``booti`` and ``bootm`` take any arm64 Linux image. Both put it at the lowest
+  free 2 MiB boundary that fits. The EFI loader installs
+  ``LINUX_EFI_LOADED_IMAGE_FIXED_GUID`` on the kernel's handle, so the EFI stub
+  runs the image in place. Its physical address is therefore not randomised.
+  Its virtual address still can be.
+* The kernel in a UKI. systemd-stub loads it into loader code it allocates
+  itself. U-Boot serves loader code from the window when the image asking for
+  it is a PE image with a ``.linux`` section.
+* U-Boot's own image, which holds its EFI runtime services. It relocates to the
+  top of the window once the rest of its memory is reserved. Its malloc area,
+  stacks and device tree copy stay where they would be without a window. In the
+  EFI memory map the first 64 KiB of the image is runtime code and the rest is
+  boot services code. Runtime code an EFI application allocates also comes from
+  the window, in whole 64 KiB blocks.
 
-If the image does not fit, U-Boot prints an error and refuses to start it. An
-EFI zboot image is refused the same way, because its decompressor picks the
-kernel's address from the whole memory map. With enforcement off, these are
-warnings and the kernel is placed as usual. A window with base 0 is not a
-physical constraint, as the kernel anchors it on its own image, so U-Boot ignores
-it.
+When LMB starts, it sets aside what is free of the window, after U-Boot's image
+and the device tree's reservations, so that other allocations go around it. The
+EFI memory map reports that memory as boot services data, which the OS gets back
+at ``ExitBootServices()``. Reservations in the device tree an EFI payload gets
+are taken out of it too. A fixed-address allocation inside the window fails.
 
-Only the kernel's image goes in the window. The kernel allocates executable pages
-from the rest of the window without consulting reservations, so anything else
-that has to survive into Linux must stay out. U-Boot's allocators work down from
-the top of RAM, and the window sits low in DRAM, which keeps the device tree,
-initramfs and EFI tables above it. Nothing enforces this.
+When the kernel can't be placed, U-Boot prints a warning and starts it outside
+the window, where it boots on the boot CPU. That happens when the window has no
+room, and for an EFI zboot image, whose decompressor picks the kernel's address
+from the whole memory map. A ``booti`` that fails after placing its image gives
+the place back when the next kernel is placed.
+
+Limits:
+
+* ``booti`` places the kernel before it reads the device tree it boots with, so
+  it only steps around reservations in U-Boot's own tree.
+* A loader that loads the kernel as loader data, or from an image without a
+  ``.linux`` section, misses the window.
+* An ``EFI_RNG_PROTOCOL`` would let the EFI stub move a UKI's kernel to a random
+  address outside the window. Apple U-Boot has none.
 
 Building U-Boot
 ---------------

@@ -58,10 +58,11 @@ config CTXR_EXEC_WINDOW
 	help
 	  A Linux kernel built with CONFIG_ARM64_CTXR_EXECMEM confines its
 	  executable code to the physical window advertised by
-	  /chosen/aurora,ctxr-exec-window, and panics early if its image is
-	  outside it. With this option, the EFI image loader and booti place
-	  the Linux image inside that window. They refuse to boot a kernel they
-	  cannot place, unless /chosen/aurora,ctxr-exec-enforce is 0.
+	  /chosen/aurora,ctxr-exec-window. If its image is outside it, the
+	  kernel keeps its secondary CPUs offline. With this option, the EFI
+	  image loader, booti and bootm place the Linux image inside that
+	  window, and so does the loader code a UKI allocates for its kernel.
+	  A kernel that can't be placed gets a warning and starts outside it.
 
 	  U-Boot's own image relocates to the top of the window, because it
 	  holds the EFI runtime services that kernel calls, and so does runtime
@@ -69,7 +70,9 @@ config CTXR_EXEC_WINDOW
 	  window, and the EFI map reports it as boot services data, so nothing
 	  else allocates it. The kernel gets it back at ExitBootServices().
 
-	  Nothing changes when the property is absent or its base is zero.
+	  Nothing changes when the property is absent, or isn't a window the
+	  kernel takes: a non-zero base and size, 16 KiB aligned, that don't
+	  wrap.
 
 config BUTTON_CMD
 	bool "Support for running a command if a button is held during boot"

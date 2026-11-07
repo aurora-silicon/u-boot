@@ -72,6 +72,8 @@ static bool rtkit_helper_j613_handoff(struct udevice *dev) { return false; }
 static void __attribute__((noreturn)) panic(const char *fmt, ...)
 { assert(!fmt); abort(); }
 static bool rtkit_helper_uses_dram(struct udevice *dev) { return false; }
+static bool t8140;
+static bool rtkit_helper_sleeps(struct udevice *dev) { return t8140; }
 static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob) { assert(false); return -1; }
 static void apple_dart_release_bypass(void *dart) {}
 static void rtkit_helper_stop(struct udevice *dev)
@@ -80,6 +82,26 @@ static void rtkit_helper_stop(struct udevice *dev)
 ''' + production + r'''
 int main(void)
 {
+ {
+  /* T8140 is stopped at OS entry: the fixup publishes and stops nothing. */
+  char blob[4096], before[4096];
+  struct udevice dev = {.driver = &driver_tag};
+  active_dev = &dev; stops = 0; t8140 = true;
+  assert(!fdt_create_empty_tree(blob, sizeof(blob)));
+  assert(fdt_add_subnode(blob, 0, "mtp") >= 0);
+  int resv = fdt_add_subnode(blob, 0, "reserved-memory");
+  assert(resv >= 0);
+  assert(!fdt_setprop_u32(blob, resv, "#address-cells", 2));
+  assert(!fdt_setprop_u32(blob, resv, "#size-cells", 2));
+  priv = (struct rtkit_helper_priv){.rtk = (void *)1, .dart = (void *)2, .nbufs = 2, .input_ready = true};
+  priv.bufs[0] = (struct rtkit_helper_buf){0x9ffff0000ULL, 0x4000};
+  ctrl = REG_CPU_CTRL_RUN; bypass_error = 0;
+  memcpy(before, blob, sizeof(blob));
+  assert(!apple_rtkit_helper_fdt_fixup(blob) && stops == 0);
+  assert(!memcmp(before, blob, sizeof(blob)));
+  assert(!priv.handoff_published && !dev.flags && priv.rtk);
+  t8140 = false;
+ }
  for (int fault = 0; fault < 8; fault++) {
   char blob[4096];
   struct udevice dev = {.driver = &driver_tag};
@@ -188,7 +210,9 @@ def test_helper_stops_dma_before_reclaiming(tmp_path):
 typedef uint32_t u32;
 #define REG_CPU_CTRL 0x44
 #define REG_CPU_CTRL_RUN 0x10
+#define APPLE_RTKIT_PWR_STATE_SLEEP 0x01
 #define APPLE_RTKIT_PWR_STATE_QUIESCED 0x10
+#define dev_err(dev, ...) ((void)0)
 struct udevice { int unused; };
 struct rtkit_helper_priv {
  void *rtk, *asc, *dart;
@@ -198,10 +222,12 @@ struct rtkit_helper_priv {
 };
 static struct rtkit_helper_priv priv;
 static u32 ctrl;
-static int shutdown_error, quiesces, frees, releases, flushed;
+static int shutdown_error, quiesces, frees, releases, flushed, stop_state;
+static bool t8140;
 static struct rtkit_helper_priv *dev_get_priv(struct udevice *d) { return &priv; }
+static bool rtkit_helper_sleeps(struct udevice *d) { return t8140; }
 static int apple_rtkit_shutdown(void *rtk, int state)
-{ assert(ctrl & REG_CPU_CTRL_RUN); quiesces++; return shutdown_error; }
+{ assert(ctrl & REG_CPU_CTRL_RUN); quiesces++; stop_state = state; return shutdown_error; }
 static u32 readl(void *addr) { if (!(ctrl & REG_CPU_CTRL_RUN)) flushed++; return ctrl; }
 static void writel(u32 value, void *addr) { ctrl = value; }
 static void apple_rtkit_free(void *rtk)
@@ -216,12 +242,15 @@ static void apple_dart_release_bypass(void *dart)
 int main(void)
 {
  struct udevice dev;
+ for (int soc = 0; soc < 2; soc++)
  for (shutdown_error = -1; shutdown_error <= 0; shutdown_error++) {
+  t8140 = soc;
   priv = (struct rtkit_helper_priv){.rtk = (void *)1, .asc = (void *)2,
          .dart = (void *)3, .handoff_published = true, .input_ready = true, .nbufs = 2};
   ctrl = REG_CPU_CTRL_RUN | 1;
   quiesces = frees = releases = flushed = 0;
   rtkit_helper_stop(&dev);
+  assert(stop_state == (t8140 ? APPLE_RTKIT_PWR_STATE_SLEEP : APPLE_RTKIT_PWR_STATE_QUIESCED));
   assert(ctrl == 1 && quiesces == 1 && frees == 1 && releases == 1);
   assert(!priv.nbufs && !priv.rtk);
   rtkit_helper_stop(&dev); /* Failed repeated FDT preparation is harmless. */

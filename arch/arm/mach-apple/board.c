@@ -939,7 +939,9 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 };
 
 /*
- * Apple M4 Pro (T6040; its blocks carry T6041 compatibles).  Every register
+ * Apple M4 Pro (T6040; its blocks carry T6041 compatibles), also used for the
+ * M5 Max (T6050), whose register blocks, APCIE ECAM and PCIe windows sit at
+ * the same addresses (its GPU above 0x23_0000_0000 is left unmapped).  Every register
  * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
  * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
  * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
@@ -1212,7 +1214,8 @@ void build_mem_map(void)
 		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
-	else if (of_machine_is_compatible("apple,t6040"))
+	else if (of_machine_is_compatible("apple,t6040") ||
+		 of_machine_is_compatible("apple,t6050"))
 		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
@@ -1349,7 +1352,8 @@ static char *asahi_esp_devpart(void)
 		dev = dev_get_parent(nvme_blk->bdev);
 		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
 		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
+		    !device_is_compatible(dev, "apple,t6041-nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,t6050-nvme-ans2"))
 			continue;
 
 		named = first = loader = 0;
@@ -1419,7 +1423,8 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for J700 (T8140), J713 (T8132) and J616s (T6040).
+ * Aurora Silicon boot flow for J700 (T8140), J713 (T8132), J616s (T6040) and
+ * J714c (T6050).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
@@ -1614,12 +1619,14 @@ int board_late_init(void)
 			printf("MTP: input unavailable (%d); continuing boot\n", ret);
 	}
 	/* T6040 stays with Linux except for the J614s retained handoff. */
-	if (of_machine_is_compatible("apple,t6040") &&
-	    !of_machine_is_compatible("apple,j614s"))
+	if ((of_machine_is_compatible("apple,t6040") &&
+	     !of_machine_is_compatible("apple,j614s")) ||
+	    of_machine_is_compatible("apple,t6050"))
 		start_keyboard = false;
 	if (of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
-	    of_machine_is_compatible("apple,t6040"))
+	    of_machine_is_compatible("apple,t6040") ||
+	    of_machine_is_compatible("apple,t6050"))
 		apple_efi_late_init(start_keyboard);
 	else
 		apple_typec_late_init();

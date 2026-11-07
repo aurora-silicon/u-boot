@@ -1617,7 +1617,8 @@ int board_late_init(void)
 	if (of_machine_is_compatible("apple,t6040") &&
 	    !of_machine_is_compatible("apple,j614s"))
 		start_keyboard = false;
-	if (of_machine_is_compatible("apple,t8140") ||
+	if (of_machine_is_compatible("apple,j613") ||
+	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040"))
 		apple_efi_late_init(start_keyboard);

@@ -26,10 +26,7 @@
 
 #define APPLE_RTKIT_EP_OSLOG 8
 
-/*
- * Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs:
- * T8140 MTP firmware cannot be restarted after QUIESCED or SLEEP.
- */
+/* Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs. */
 #define RTKIT_HELPER_HANDOFF	"mtp-live-v1"
 #define RTKIT_HELPER_MAX_BUFS	8
 
@@ -76,6 +73,16 @@ static bool rtkit_helper_j713_handoff(struct udevice *dev)
 		device_is_compatible(dev, "apple,t8132-rtk-helper-asc4")) ||
 	       (of_machine_is_compatible("apple,j614s") &&
 		device_is_compatible(dev, "apple,t6041-rtk-helper-asc4"));
+}
+
+/*
+ * U-Boot stops the T8140 MTP with an RTKit sleep before the OS and hands
+ * nothing over. A firmware that ran comes back only from a sleep, so the OS
+ * resets its CPU and starts it again.
+ */
+static bool rtkit_helper_sleeps(struct udevice *dev)
+{
+	return device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
 }
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
@@ -283,10 +290,16 @@ err_stop:
 static void rtkit_helper_stop(struct udevice *dev)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+	int state = rtkit_helper_sleeps(dev) ? APPLE_RTKIT_PWR_STATE_SLEEP :
+					    APPLE_RTKIT_PWR_STATE_QUIESCED;
 	u32 ctrl;
+	int ret;
 
-	if (priv->rtk)
-		apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_QUIESCED);
+	if (priv->rtk) {
+		ret = apple_rtkit_shutdown(priv->rtk, state);
+		if (ret)
+			dev_err(dev, "RTKit stop (state %#x) failed: %d\n", state, ret);
+	}
 	/* Do not release buffers or the bypass stream while the ASC can DMA. */
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl & ~REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
@@ -593,6 +606,9 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
 		    !device_active(dev) ||
 		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev)))
+			continue;
+		/* Stopped at OS entry, so the OS has nothing to adopt. */
+		if (rtkit_helper_sleeps(dev))
 			continue;
 
 		priv = dev_get_priv(dev);

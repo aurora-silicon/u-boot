@@ -639,8 +639,10 @@ static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 	if (!priv->hw->wake_disabled ||
 	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
 		return false;
+	/* T6050: an m1n1 stage 2 that received stage 1's live session says so in /chosen. */
 	if (priv->hw->keep_cc_fields)
-		return true;
+		return !ofnode_has_property(ofnode_path("/chosen"),
+					    "asahi,nvme-adopt");
 
 	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
 	       !readl(priv->base + ANS_MAX_PEND_CMDS_CTRL);

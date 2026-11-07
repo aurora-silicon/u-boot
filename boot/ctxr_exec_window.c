@@ -174,6 +174,12 @@ int ctxr_exec_place_booti(const struct ctxr_exec_window *win, u64 size,
 	return -ENOSPC;
 }
 
+bool ctxr_exec_booti_placed(phys_addr_t addr)
+{
+	return ctxr_booti_size && addr >= ctxr_booti_base &&
+	       addr - ctxr_booti_base < ctxr_booti_size;
+}
+
 void ctxr_exec_unplace_booti(void)
 {
 	if (!ctxr_booti_size)

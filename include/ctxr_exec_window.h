@@ -84,6 +84,14 @@ int ctxr_exec_place_booti(const struct ctxr_exec_window *win, u64 size,
 			  u64 *slot);
 
 /**
+ * ctxr_exec_booti_placed() - check whether booti's image is in a place it took
+ *
+ * @addr:	address the image was moved to
+ * Return:	true if that is inside the place ctxr_exec_place_booti() took
+ */
+bool ctxr_exec_booti_placed(phys_addr_t addr);
+
+/**
  * ctxr_exec_unplace_booti() - give back the place booti or bootm took
  *
  * Placing another kernel calls this: the boot that took the place didn't start.
@@ -117,6 +125,11 @@ static inline int ctxr_exec_place_booti(const struct ctxr_exec_window *win,
 					u64 size, u64 *slot)
 {
 	return -ENOSPC;
+}
+
+static inline bool ctxr_exec_booti_placed(phys_addr_t addr)
+{
+	return false;
 }
 
 static inline void ctxr_exec_unplace_booti(void)

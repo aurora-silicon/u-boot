@@ -912,6 +912,23 @@ static const efi_guid_t efi_guid_linux_image_fixed =
 	EFI_GUID(0xf5a37b6d, 0x3344, 0x42a5,
 		 0xb6, 0xbb, 0x97, 0x86, 0x48, 0xc1, 0x89, 0x0a);
 
+static bool efi_linux_is_zboot(const struct linux_efi_header *hdr)
+{
+	return le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
+	       le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE;
+}
+
+/* Confined cores cannot run runtime code outside the window */
+static void efi_warn_runtime_outside(const struct ctxr_exec_window *win)
+{
+	ulong start = ALIGN_DOWN((uintptr_t)__efi_runtime_start, SZ_64K);
+	ulong end = ALIGN((uintptr_t)__efi_runtime_stop, SZ_64K);
+
+	if (start < win->base || end > win->base + win->size)
+		log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it, so Linux turns EFI runtime services off\n",
+			    win->base, win->base + win->size);
+}
+
 /**
  * efi_alloc_in_ctxr_window() - allocate 2 MiB aligned pages inside the window
  *
@@ -949,15 +966,16 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 }
 
 /**
- * efi_image_is_uki() - check whether an image is a unified kernel image
+ * efi_uki_linux() - find the kernel in a unified kernel image
  *
  * A UKI is a PE image with a .linux section. The loaded image protocol is what
  * a loader running an image itself, as shim does, points at that image.
  *
  * @handle:	image handle
- * Return:	true if the image the handle describes has a .linux section
+ * Return:	the Linux header at the start of the .linux section of the image
+ *		the handle describes, or NULL if it isn't a UKI
  */
-static bool efi_image_is_uki(efi_handle_t handle)
+static const struct linux_efi_header *efi_uki_linux(efi_handle_t handle)
 {
 	struct efi_loaded_image *info;
 	IMAGE_SECTION_HEADER *sec;
@@ -967,24 +985,30 @@ static bool efi_image_is_uki(efi_handle_t handle)
 
 	if (!handle ||
 	    efi_search_protocol(handle, &efi_guid_loaded_image, &h) != EFI_SUCCESS)
-		return false;
+		return NULL;
 	info = h->protocol_interface;
 	if (!info || !info->image_base ||
 	    efi_check_pe(info->image_base, info->image_size,
 			 (void **)&nt) != EFI_SUCCESS)
-		return false;
+		return NULL;
 
 	n = nt->FileHeader.NumberOfSections;
 	sec = (void *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader;
 	if ((void *)(sec + n) > info->image_base + info->image_size)
-		return false;
+		return NULL;
 
 	for (i = 0; i < n; i++) {
-		if (!memcmp(sec[i].Name, ".linux", sizeof(".linux")))
-			return true;
+		if (memcmp(sec[i].Name, ".linux", sizeof(".linux")))
+			continue;
+		if (section_size(&sec[i]) < sizeof(struct linux_efi_header) ||
+		    sec[i].VirtualAddress > info->image_size ||
+		    info->image_size - sec[i].VirtualAddress <
+		    sizeof(struct linux_efi_header))
+			return NULL;
+		return info->image_base + sec[i].VirtualAddress;
 	}
 
-	return false;
+	return NULL;
 }
 
 /**
@@ -993,7 +1017,8 @@ static bool efi_image_is_uki(efi_handle_t handle)
  * systemd-stub loads the kernel in a UKI into loader code it allocates, and
  * starts it without LoadImage, so efi_load_pe() never sees it. Without an RNG,
  * the EFI stub then runs the kernel where it is. Serve such an allocation from
- * the window if the image asking for it is a UKI, and warn if it doesn't fit.
+ * the window if the image asking for it is a UKI, and warn if it doesn't fit
+ * or the UKI's kernel is a zboot image.
  *
  * @caller:		image that asked for the memory
  * @type:		type of allocation to be performed
@@ -1008,6 +1033,7 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
 					     u64 *memory)
 {
 	u64 size = (u64)pages << EFI_PAGE_SHIFT;
+	const struct linux_efi_header *hdr;
 	struct ctxr_exec_window win;
 	void *mem = NULL;
 
@@ -1015,8 +1041,17 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
 	    size >> EFI_PAGE_SHIFT != pages ||
 	    (type != EFI_ALLOCATE_ANY_PAGES &&
 	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
-	    !ctxr_exec_window_get(&win) || !efi_image_is_uki(caller))
+	    !ctxr_exec_window_get(&win))
 		return EFI_NOT_FOUND;
+
+	hdr = efi_uki_linux(caller);
+	if (!hdr)
+		return EFI_NOT_FOUND;
+	/* Its decompressor allocates the kernel itself, wherever it likes */
+	if (efi_linux_is_zboot(hdr)) {
+		ctxr_exec_warn_outside(&win, "a UKI's zboot kernel places itself, boot a plain Image");
+		return EFI_NOT_FOUND;
+	}
 
 	if (type == EFI_ALLOCATE_ANY_PAGES ||
 	    *memory >= win.base + win.size - 1)
@@ -1028,6 +1063,7 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
 
 	log_info("CTXR exec window [%#llx, %#llx): %#llx bytes of loader code at %#llx\n",
 		 win.base, win.base + win.size, size, (u64)(uintptr_t)mem);
+	efi_warn_runtime_outside(&win);
 	*memory = (uintptr_t)mem;
 
 	return EFI_SUCCESS;
@@ -1069,8 +1105,7 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 	if (!ctxr_exec_window_get(&win))
 		return EFI_SUCCESS;
 
-	if (le32_to_cpu(hdr->magic) == LINUX_PE_MAGIC &&
-	    le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE) {
+	if (efi_linux_is_zboot(hdr)) {
 		ctxr_exec_warn_outside(&win, "a zboot kernel places itself, boot a plain Image");
 		return EFI_SUCCESS;
 	}
@@ -1086,11 +1121,7 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 
 	log_info("CTXR exec window [%#llx, %#llx): Linux image at %#llx, size %#llx\n",
 		 win.base, win.base + win.size, (u64)(uintptr_t)*reloc, size);
-	/* Confined cores cannot run what's outside the window */
-	if ((uintptr_t)__efi_runtime_start < win.base ||
-	    (uintptr_t)__efi_runtime_stop > win.base + win.size)
-		log_warning("CTXR exec window [%#llx, %#llx): U-Boot's runtime code is outside it, so Linux turns EFI runtime services off\n",
-			    win.base, win.base + win.size);
+	efi_warn_runtime_outside(&win);
 
 	ret = efi_add_protocol(&handle->header, &efi_guid_linux_image_fixed,
 			       NULL);

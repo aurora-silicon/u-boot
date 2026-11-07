@@ -204,6 +204,18 @@ void lmb_ctxr_window_init(phys_addr_t base, phys_size_t size);
 void lmb_hold_ctxr_window(phys_addr_t base, phys_size_t size);
 
 /**
+ * lmb_ctxr_window_claim() - take a reservation out of the CTXR window's free space
+ *
+ * For a reservation the EFI memory map already has, such as one in the device
+ * tree an EFI payload gets. The EFI map is left as it is.
+ *
+ * @base: start of the reservation
+ * @size: size of the reservation
+ * @flags: flags to reserve it with
+ */
+void lmb_ctxr_window_claim(phys_addr_t base, phys_size_t size, u32 flags);
+
+/**
  * lmb_release_ctxr_window() - give up a range of the CTXR window for allocation
  *
  * @base: start of the range

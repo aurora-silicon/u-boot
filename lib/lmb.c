@@ -738,6 +738,32 @@ void lmb_hold_ctxr_window(phys_addr_t base, phys_size_t size)
 	}
 }
 
+void lmb_ctxr_window_claim(phys_addr_t base, phys_size_t size, u32 flags)
+{
+	struct lmb_region *used;
+	int i;
+
+	if (!lmb_ctxr_on())
+		return;
+
+	/* Each change can split or merge regions, so start over after it */
+	for (i = 0; i < lmb.used_mem.count; i++) {
+		phys_addr_t start, end;
+
+		used = lmb.used_mem.data;
+		start = max(base, used[i].base);
+		end = min((phys_addr_t)(base + size),
+			  (phys_addr_t)(used[i].base + used[i].size));
+		if (!(used[i].flags & LMB_CTXR_HOLD) || start >= end)
+			continue;
+
+		if (_lmb_free(&lmb.used_mem, start, end - start))
+			return;
+		lmb_reserve(start, end - start, flags | LMB_NONOTIFY);
+		i = -1;
+	}
+}
+
 int lmb_release_ctxr_window(phys_addr_t base, phys_size_t size)
 {
 	struct lmb_region *used = lmb.used_mem.data;

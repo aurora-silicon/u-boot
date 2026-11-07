@@ -1083,3 +1083,35 @@ static int lib_test_lmb_ctxr_window_ram(struct unit_test_state *uts)
 	return 0;
 }
 LIB_TEST(lib_test_lmb_ctxr_window_ram, 0);
+
+/* A reservation the EFI map has takes its range out of the CTXR window */
+static int lib_test_lmb_ctxr_window_claim(struct unit_test_state *uts)
+{
+	const phys_addr_t ram = 0x40000000, win = 0x44000000;
+	const phys_size_t ram_size = 0x10000000, win_size = 0x8000000;
+	const u32 hold = LMB_CTXR_HOLD | LMB_NOOVERWRITE;
+	struct alist *mem_lst, *used_lst;
+	struct lmb_region *used;
+	struct lmb store;
+
+	ut_assertok(setup_lmb_test(uts, &store, &mem_lst, &used_lst));
+	ut_assertok(lmb_add(ram, ram_size));
+	lmb_ctxr_window_init(win, win_size);
+
+	/* Across the window's start, so only the part inside it changes */
+	lmb_ctxr_window_claim(win - 0x100000, 0x900000, LMB_NOMAP);
+	ASSERT_LMB(mem_lst, used_lst, ram, ram_size, 2, win, 0x800000,
+		   win + 0x800000, win_size - 0x800000, 0, 0);
+	used = used_lst->data;
+	ut_asserteq(used[0].flags, LMB_NOMAP | LMB_NONOTIFY);
+	ut_asserteq(used[1].flags, hold);
+
+	/* Kernel placement can't take it any more */
+	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win, 0x200000));
+	ut_assertok(lmb_release_ctxr_window(win + 0x800000, 0x200000));
+
+	lmb_pop(&store);
+
+	return 0;
+}
+LIB_TEST(lib_test_lmb_ctxr_window_claim, 0);

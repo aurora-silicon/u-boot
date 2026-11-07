@@ -771,7 +771,8 @@ int lmb_release_ctxr_window(phys_addr_t base, phys_size_t size)
 
 	for (i = 0; i < lmb.used_mem.count; i++) {
 		if (!(used[i].flags & LMB_CTXR_HOLD) || base < used[i].base ||
-		    base + size > used[i].base + used[i].size)
+		    size > used[i].size ||
+		    base - used[i].base > used[i].size - size)
 			continue;
 		if (!lmb_free(base, size, LMB_NONE))
 			return 0;
@@ -794,7 +795,7 @@ int lmb_ctxr_window_top(phys_size_t size, phys_size_t align, phys_addr_t max,
 					max);
 		phys_addr_t start;
 
-		if (!(used[i].flags & LMB_CTXR_HOLD) ||
+		if (!(used[i].flags & LMB_CTXR_HOLD) || size > used[i].size ||
 		    end < used[i].base + size)
 			continue;
 

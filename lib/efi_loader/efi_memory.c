@@ -467,7 +467,7 @@ static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 		max = limit + 1;
 
 	size = ALIGN(*len, SZ_64K);
-	if (!lmb_ctxr_window_top(size, SZ_64K, max, addr) &&
+	if (*len <= win.size && !lmb_ctxr_window_top(size, SZ_64K, max, addr) &&
 	    !lmb_release_ctxr_window(*addr, size)) {
 		*len = size;
 		return EFI_SUCCESS;

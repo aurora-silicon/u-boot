@@ -75,7 +75,8 @@ int booti_setup(ulong image, ulong *relocated_addr, ulong *size,
 
 	/* Outside its window, a kernel keeps its secondary CPUs offline */
 	if (ctxr_exec_window_get(&win) &&
-	    ctxr_exec_place_booti(&win, text_offset + image_size, &dst))
+	    (text_offset > win.size || image_size > win.size - text_offset ||
+	     ctxr_exec_place_booti(&win, text_offset + image_size, &dst)))
 		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the Linux image");
 
 	*relocated_addr = ALIGN(dst, SZ_2M) + text_offset;

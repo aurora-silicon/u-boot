@@ -1035,6 +1035,11 @@ static int lib_test_lmb_ctxr_window(struct unit_test_state *uts)
 	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win, 0x400000));
 	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win + win_size - 0x200000,
 						     0x200000));
+	/* A size whose end wraps doesn't fit */
+	ut_asserteq(-ENOENT, lmb_release_ctxr_window(win + 0x400000,
+						     ~(phys_size_t)0 - 0xfff));
+	ut_asserteq(-ENOENT, lmb_ctxr_window_top(~(phys_size_t)0 - 0xfff, 0x1000,
+						 ~(phys_addr_t)0, &top));
 
 	/* The top of what is set aside, aligned, below a limit */
 	ut_assertok(lmb_ctxr_window_top(0x10000, 0x10000, ~(phys_addr_t)0,

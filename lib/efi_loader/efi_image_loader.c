@@ -945,6 +945,9 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 	/* A booti that left its image in the window didn't start */
 	ctxr_exec_unplace_booti();
 
+	/* Larger than the window, the end of the image would wrap */
+	if (size > win->size)
+		return NULL;
 	size = ALIGN(size, EFI_PAGE_SIZE);
 
 	for (addr = ALIGN(win->base, SZ_2M);

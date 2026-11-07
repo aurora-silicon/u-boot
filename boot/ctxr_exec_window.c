@@ -153,6 +153,9 @@ int ctxr_exec_place_booti(const struct ctxr_exec_window *win, u64 size,
 
 	ctxr_exec_unplace_booti();
 
+	if (size > win->size)
+		return -ENOSPC;
+
 	for (addr = ALIGN(win->base, SZ_2M);
 	     addr + size <= win->base + win->size; addr += SZ_2M) {
 		phys_addr_t base = addr;

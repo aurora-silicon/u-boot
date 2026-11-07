@@ -1237,6 +1237,8 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 		 * this is not expected.
 		 */
 		log_err("PE image measurement failed, no tpm device found\n");
+		efi_free_pages((uintptr_t)efi_reloc,
+			       efi_size_in_pages(alloc_size));
 		goto err;
 	}
 

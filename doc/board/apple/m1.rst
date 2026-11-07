@@ -179,9 +179,8 @@ Limits:
   of when it places the kernel. ``booti`` places it before it reads the tree it
   boots with, and systemd-boot installs the tree an entry's ``devicetree`` key
   names after loading the kernel.
-* Freeing part of a 64 KiB block of runtime code in the window keeps the block
-  allocated, unless the rest of it was freed before, or the free reaches the
-  end of what was allocated.
+* Freeing the start of a runtime code allocation in the window frees its whole
+  first 64 KiB block. Nothing in U-Boot frees part of an allocation that way.
 * A loader that loads the kernel as loader data, or from an image without a
   ``.linux`` section, misses the window.
 * An ``EFI_RNG_PROTOCOL`` would let the EFI stub move a UKI's kernel to a random

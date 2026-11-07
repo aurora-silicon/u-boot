@@ -434,7 +434,8 @@ static efi_status_t EFIAPI efi_allocate_pages_ext(int type, int memory_type,
 	efi_status_t r;
 
 	EFI_ENTRY("%d, %d, 0x%zx, %p", type, memory_type, pages, memory);
-	r = efi_alloc_kernel_in_ctxr_window(type, memory_type, pages, memory);
+	r = efi_alloc_kernel_in_ctxr_window(current_image, type, memory_type,
+					    pages, memory);
 	if (r != EFI_SUCCESS)
 		r = efi_allocate_pages(type, memory_type, pages, memory);
 	return EFI_EXIT(r);

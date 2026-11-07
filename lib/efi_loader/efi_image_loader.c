@@ -904,9 +904,6 @@ struct linux_efi_header {
 #define LINUX_PE_MAGIC		0x818223cd
 #define LINUX_ZBOOT_TYPE	0x676d697a	/* "zimg" */
 
-/* More than other EFI applications load as code, less than any kernel */
-#define CTXR_KERNEL_MIN_SIZE	SZ_16M
-
 /*
  * LINUX_EFI_LOADED_IMAGE_FIXED_GUID: the kernel's EFI stub takes this protocol
  * on its image handle to mean that it must run where the loader put it.
@@ -952,14 +949,53 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
 }
 
 /**
+ * efi_image_is_uki() - check whether an image is a unified kernel image
+ *
+ * A UKI is a PE image with a .linux section. The loaded image protocol is what
+ * a loader running an image itself, as shim does, points at that image.
+ *
+ * @handle:	image handle
+ * Return:	true if the image the handle describes has a .linux section
+ */
+static bool efi_image_is_uki(efi_handle_t handle)
+{
+	struct efi_loaded_image *info;
+	IMAGE_SECTION_HEADER *sec;
+	struct efi_handler *h;
+	IMAGE_NT_HEADERS32 *nt;
+	int i, n;
+
+	if (!handle ||
+	    efi_search_protocol(handle, &efi_guid_loaded_image, &h) != EFI_SUCCESS)
+		return false;
+	info = h->protocol_interface;
+	if (!info || !info->image_base ||
+	    efi_check_pe(info->image_base, info->image_size,
+			 (void **)&nt) != EFI_SUCCESS)
+		return false;
+
+	n = nt->FileHeader.NumberOfSections;
+	sec = (void *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader;
+	if ((void *)(sec + n) > info->image_base + info->image_size)
+		return false;
+
+	for (i = 0; i < n; i++) {
+		if (!memcmp(sec[i].Name, ".linux", sizeof(".linux")))
+			return true;
+	}
+
+	return false;
+}
+
+/**
  * efi_alloc_kernel_in_ctxr_window() - serve a kernel its loader allocates itself
  *
- * systemd-stub loads the kernel in a UKI into pages it allocates, and starts it
- * without LoadImage, so efi_load_pe() never sees it. Without an RNG, the EFI stub
- * then runs the kernel where it is. Nothing else asks for this much loader code
- * at an address of U-Boot's choosing. If one does, it spends window space, and a
- * kernel that no longer fits gets a warning.
+ * systemd-stub loads the kernel in a UKI into loader code it allocates, and
+ * starts it without LoadImage, so efi_load_pe() never sees it. Without an RNG,
+ * the EFI stub then runs the kernel where it is. Serve such an allocation from
+ * the window if the image asking for it is a UKI, and warn if it doesn't fit.
  *
+ * @caller:		image that asked for the memory
  * @type:		type of allocation to be performed
  * @memory_type:	usage type of the allocated memory
  * @pages:		number of pages to be allocated
@@ -967,31 +1003,31 @@ static void *efi_alloc_in_ctxr_window(const struct ctxr_exec_window *win,
  *			the allocated memory
  * Return:		EFI_SUCCESS if this allocated it, or EFI_NOT_FOUND
  */
-efi_status_t efi_alloc_kernel_in_ctxr_window(int type, int memory_type,
-					     efi_uintn_t pages, u64 *memory)
+efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
+					     int memory_type, efi_uintn_t pages,
+					     u64 *memory)
 {
+	u64 size = (u64)pages << EFI_PAGE_SHIFT;
 	struct ctxr_exec_window win;
-	void *mem;
+	void *mem = NULL;
 
-	if (memory_type != EFI_LOADER_CODE || !memory ||
-	    pages < (CTXR_KERNEL_MIN_SIZE >> EFI_PAGE_SHIFT) ||
+	if (memory_type != EFI_LOADER_CODE || !memory || !pages ||
+	    size >> EFI_PAGE_SHIFT != pages ||
 	    (type != EFI_ALLOCATE_ANY_PAGES &&
 	     type != EFI_ALLOCATE_MAX_ADDRESS) ||
-	    !ctxr_exec_window_get(&win) ||
-	    (type == EFI_ALLOCATE_MAX_ADDRESS &&
-	     *memory < win.base + win.size - 1))
+	    !ctxr_exec_window_get(&win) || !efi_image_is_uki(caller))
 		return EFI_NOT_FOUND;
 
-	mem = efi_alloc_in_ctxr_window(&win, (u64)pages << EFI_PAGE_SHIFT,
-				       memory_type);
+	if (type == EFI_ALLOCATE_ANY_PAGES ||
+	    *memory >= win.base + win.size - 1)
+		mem = efi_alloc_in_ctxr_window(&win, size, memory_type);
 	if (!mem) {
-		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the loader code");
+		ctxr_exec_warn_outside(&win, "no free 2 MiB aligned range fits the kernel a UKI loads");
 		return EFI_NOT_FOUND;
 	}
 
 	log_info("CTXR exec window [%#llx, %#llx): %#llx bytes of loader code at %#llx\n",
-		 win.base, win.base + win.size, (u64)pages << EFI_PAGE_SHIFT,
-		 (u64)(uintptr_t)mem);
+		 win.base, win.base + win.size, size, (u64)(uintptr_t)mem);
 	*memory = (uintptr_t)mem;
 
 	return EFI_SUCCESS;

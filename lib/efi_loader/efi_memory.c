@@ -427,32 +427,6 @@ static efi_status_t efi_check_allocated(u64 addr, bool must_be_allocated)
 	return EFI_NOT_FOUND;
 }
 
-/*
- * Runtime code allocated in the CTXR window, in whole 64 KiB blocks: the first
- * block still allocated, the end of what the caller has freed from there, the
- * end of what was asked for, and the end of the blocks. An end of 0 marks a
- * free entry.
- */
-#define CTXR_RT_ALLOCS	16
-static struct {
-	u64 start;
-	u64 freed;
-	u64 asked;
-	u64 end;
-} ctxr_rt[CTXR_RT_ALLOCS];
-
-static int ctxr_rt_free_entry(void)
-{
-	int i;
-
-	for (i = 0; i < CTXR_RT_ALLOCS; i++) {
-		if (!ctxr_rt[i].end)
-			return i;
-	}
-
-	return -1;
-}
-
 /**
  * efi_runtime_code_in_window() - find room for runtime code in the CTXR window
  *
@@ -493,8 +467,7 @@ static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 		max = limit + 1;
 
 	size = ALIGN(*len, SZ_64K);
-	if (*len <= win.size && ctxr_rt_free_entry() >= 0 &&
-	    !lmb_ctxr_window_top(size, SZ_64K, max, addr) &&
+	if (*len <= win.size && !lmb_ctxr_window_top(size, SZ_64K, max, addr) &&
 	    !lmb_release_ctxr_window(*addr, size)) {
 		*len = size;
 		return EFI_SUCCESS;
@@ -507,68 +480,44 @@ static efi_status_t efi_runtime_code_in_window(enum efi_allocate_type type,
 }
 
 /**
- * efi_runtime_code_blocks() - free runtime code in the CTXR window in blocks
+ * efi_runtime_code_blocks() - widen a free of runtime code in the CTXR window
  *
- * Runtime code there comes in whole 64 KiB blocks. Free only the blocks the
- * range covers whole, and the last block of an allocation once the range
- * reaches the end of what was asked for. A block the range starts partway into
- * stays, unless the caller freed the rest of it before: otherwise it is the
- * rest of an aligned allocation being trimmed.
+ * Runtime code there comes in whole 64 KiB blocks. Free the block a range ends
+ * in too, but not one it starts partway into: that is the rest of an aligned
+ * allocation being trimmed.
  *
  * @start:	start of the range, updated
- * @len:	size of the range, updated, and 0 if no block is freed
+ * @len:	size of the range, updated
  */
 static void efi_runtime_code_blocks(u64 *start, u64 *len)
 {
-	u64 from = map_to_sysmem((void *)(uintptr_t)*start), to = from + *len;
-	u64 s, e;
-	int i;
+	struct ctxr_exec_window win;
+	struct efi_mem_list *item;
+	u64 addr, end;
+	bool found = false;
 
-	for (i = 0; i < CTXR_RT_ALLOCS; i++) {
-		if (from >= ctxr_rt[i].start && from < ctxr_rt[i].end)
+	addr = map_to_sysmem((void *)(uintptr_t)*start);
+	end = addr + *len;
+	if (!ctxr_exec_window_get(&win) || addr < win.base ||
+	    end > win.base + win.size)
+		return;
+
+	list_for_each_entry(item, &efi_mem, link) {
+		u64 base = item->desc.physical_start;
+
+		if (*start >= base &&
+		    *start < base + (item->desc.num_pages << EFI_PAGE_SHIFT)) {
+			found = item->desc.type == EFI_RUNTIME_SERVICES_CODE;
 			break;
-	}
-	if (i == CTXR_RT_ALLOCS)
-		return;
-
-	/* What the caller freed before, from the start, counts as freed */
-	if (from == ctxr_rt[i].freed)
-		from = ctxr_rt[i].start;
-	s = ALIGN(from, SZ_64K);
-	e = to >= ctxr_rt[i].asked ? ctxr_rt[i].end : ALIGN_DOWN(to, SZ_64K);
-	if (e <= s) {
-		if (from == ctxr_rt[i].start)
-			ctxr_rt[i].freed = max(ctxr_rt[i].freed, to);
-		*len = 0;
-		return;
-	}
-
-	if (s <= ctxr_rt[i].start && e >= ctxr_rt[i].end) {
-		ctxr_rt[i].end = 0;
-	} else if (s <= ctxr_rt[i].start) {
-		ctxr_rt[i].start = e;
-		ctxr_rt[i].freed = max(e, to);
-	} else if (e >= ctxr_rt[i].end) {
-		ctxr_rt[i].end = s;
-		ctxr_rt[i].asked = min(ctxr_rt[i].asked, from);
-	} else {
-		/* A hole in the middle: the part above it becomes an entry */
-		int j = ctxr_rt_free_entry();
-
-		if (j < 0) {
-			*len = 0;
-			return;
 		}
-		ctxr_rt[j].start = e;
-		ctxr_rt[j].freed = max(e, to);
-		ctxr_rt[j].asked = ctxr_rt[i].asked;
-		ctxr_rt[j].end = ctxr_rt[i].end;
-		ctxr_rt[i].asked = from;
-		ctxr_rt[i].end = s;
 	}
+	if (!found)
+		return;
 
-	*start = (uintptr_t)map_sysmem(s, 0);
-	*len = e - s;
+	addr = ALIGN(addr, SZ_64K);
+	end = ALIGN(end, SZ_64K);
+	*start = (uintptr_t)map_sysmem(addr, 0);
+	*len = end > addr ? end - addr : 0;
 }
 
 /**
@@ -585,11 +534,10 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 				efi_uintn_t pages, uint64_t *memory)
 {
 	int err;
-	u64 efi_addr, len, asked;
+	u64 efi_addr, len;
 	uint flags;
 	efi_status_t ret;
 	phys_addr_t addr;
-	bool in_window;
 
 	/* Check import parameters */
 	if (memory_type >= EFI_PERSISTENT_MEMORY_TYPE &&
@@ -605,11 +553,9 @@ efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 
 	flags = LMB_NOOVERWRITE | LMB_NONOTIFY;
 
-	asked = len;
 	ret = efi_runtime_code_in_window(type, memory_type, &len, *memory,
 					 &addr);
-	in_window = ret == EFI_SUCCESS;
-	if (in_window) {
+	if (ret == EFI_SUCCESS) {
 		pages = len >> EFI_PAGE_SHIFT;
 		if (lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &addr, len, flags)) {
 			lmb_hold_ctxr_window(addr, len);
@@ -660,15 +606,6 @@ update_map:
 		if (type == EFI_ALLOCATE_ADDRESS)
 			return EFI_NOT_FOUND;
 		return EFI_OUT_OF_RESOURCES;
-	}
-
-	if (in_window) {
-		int i = ctxr_rt_free_entry();
-
-		ctxr_rt[i].start = addr;
-		ctxr_rt[i].freed = addr;
-		ctxr_rt[i].asked = addr + asked;
-		ctxr_rt[i].end = addr + len;
 	}
 
 	*memory = efi_addr;

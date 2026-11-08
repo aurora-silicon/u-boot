@@ -458,7 +458,8 @@ wait_epmap:
 	if (ret < 0)
 		return ret;
 
-	if (reply & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)
+	/* Not from bit 0: a warm start's last reply echoes the map there. */
+	if (!(reply & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		goto wait_epmap;
 
 	for (i = 0; i < nendpoints && !warm; i++) {

@@ -557,62 +557,6 @@ static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
 }
 
 /*
- * Post-M4: take over the ANS session the previous boot stage left running.
- * HELLO and the endpoint map are one-time messages of an RTKit session, so
- * the firmware is left alone -- no RTKit handshake, no SART, no reset; we
- * only answer what it waits for -- and only the NVMe controller and its
- * queues are reprogrammed.  An enabled controller is disabled first,
- * exactly as Linux does when it adopts the session.
- */
-static int apple_nvme_adopt(struct udevice *dev)
-{
-	struct apple_nvme_priv *priv = dev_get_priv(dev);
-	u32 csts, cc;
-	int ret;
-
-	if (!apple_nvme_ans_running(priv)) {
-		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x): post-M4 ANS can only be adopted from the boot loader\n",
-			readl(priv->asc + REG_CPU_CTRL),
-			readl(priv->base + ANS_BOOT_STATUS));
-		return -ENODEV;
-	}
-
-	csts = readl(&priv->ndev.bar->csts);
-	if (csts & NVME_CSTS_CFS) {
-		dev_err(dev, "inherited controller is in a fatal state (CSTS %#x)\n",
-			csts);
-		return -EIO;
-	}
-
-	cc = readl(&priv->ndev.bar->cc);
-	debug("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
-	      dev->name, cc, csts);
-
-	/* Only answers to the firmware; the session itself is left alone. */
-	if (mbox_get_by_index(dev, 0, &priv->chan))
-		dev_warn(dev, "no ANS mailbox: firmware messages go unanswered\n");
-	else
-		priv->adopted_mbox = true;
-
-	/*
-	 * Like Linux, disable an enabled controller (the previous owner's
-	 * queues may still be live) before touching any queue register.
-	 */
-	if (cc & NVME_CC_ENABLE) {
-		ret = apple_nvme_disable_post_m4(priv);
-		if (ret)
-			return ret;
-	}
-
-	ret = apple_nvme_setup_post_m4(priv);
-	if (ret)
-		return ret;
-	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
-
-	return 0;
-}
-
-/*
  * Post-M4: the firmware takes the OS-side RTKit handshake once per boot.  A
  * boot loader stage that ran it leaves the controller programmed (NVMMU TCB
  * bases, I/O queue aperture); straight from iBoot (a chain whose earlier
@@ -916,14 +860,17 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.udev = dev;
 
 	sart_cells = dev_read_prop(dev, "apple,sart-entries", &sart_len);
-	if (priv->hw->post_m4 && sart_cells)
+	if (priv->hw->post_m4 && sart_cells) {
 		ret = apple_nvme_start_from_off(dev, sart_cells, sart_len);
-	else if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
+	} else if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv)) {
 		ret = apple_nvme_wake(dev);
-	else if (priv->hw->post_m4)
-		ret = apple_nvme_adopt(dev);
-	else
+	} else if (priv->hw->post_m4) {
+		/* An older boot loader handed its session on running instead of powering ANS off. */
+		dev_err(dev, "ANS was handed over running; this U-Boot needs an aura that powers ANS off after use (aura#107) and passes apple,sart-entries\n");
+		ret = -ENODEV;
+	} else {
 		ret = apple_nvme_boot(dev);
+	}
 	if (ret < 0) {
 		if (priv->hw->post_m4)
 			apple_nvme_adopt_failed = true;

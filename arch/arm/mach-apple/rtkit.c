@@ -379,11 +379,6 @@ static int rtkit_boot(struct apple_rtkit *rtk, u32 system_eps, bool warm, u32 la
 
 	/* Wait for protocol version negotiation message. */
 	ret = rtkit_recv_mgmt(rtk, &msg, warm);
-	/* Firmware that picked its kept session back up reports its power on and says no HELLO. */
-	if (warm && ret == -ETIMEDOUT && rtk->iop_pwr == APPLE_RTKIT_PWR_STATE_ON) {
-		debug("rtkit: the IOP resumed its session without HELLO\n");
-		return apple_rtkit_set_ap_power(rtk, APPLE_RTKIT_PWR_STATE_ON);
-	}
 	if (ret < 0)
 		return ret;
 
@@ -414,6 +409,8 @@ static int rtkit_boot(struct apple_rtkit *rtk, u32 system_eps, bool warm, u32 la
 		return -ENOTSUPP;
 	}
 
+	debug("rtkit: HELLO, version %d\n", want_ver);
+
 	/* Ack version. */
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_HELLO_REPLY) |
 		FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver) |
@@ -442,6 +439,7 @@ wait_epmap:
 
 	bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg.msg0);
 	base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg.msg0);
+	debug("rtkit: endpoint map base %u bitmap %#x\n", base, bitmap);
 	for (i = 0; i < 32; i++) {
 		if (bitmap & (1U << i))
 			endpoints[nendpoints++] = base * 32 + i;

@@ -228,3 +228,13 @@ bool sart_remove_allowed_region(struct apple_sart *sart, void *paddr, size_t sz)
 	printf("sart: could not find entry to be removed\n");
 	return false;
 }
+
+/* An entry as an earlier owner had it, written back after the SART lost its power. */
+bool sart_set_entry(struct apple_sart *sart, int index, u8 flags, void *paddr, size_t sz)
+{
+	if (index < 0 || index >= APPLE_SART_MAX_ENTRIES ||
+	    !sart->set_entry(sart, index, flags, paddr, sz))
+		return false;
+	sart->protected_entries |= 1 << index;
+	return true;
+}

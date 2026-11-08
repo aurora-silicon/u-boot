@@ -312,14 +312,45 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 			rtk->ap_pwr = FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg.msg0);
 			return 0;
 		default:
-			printf("%s: unexpected message type %d\n", __func__, msgtype);
+			printf("%s: unexpected message %#llx\n", __func__, msg.msg0);
 
 			/* Just ignore it */
 			return 0;
 	}
 }
 
-int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
+/*
+ * The next management message. After a power loss the firmware can report its power state, and
+ * an endpoint can speak, before or between the handshake's messages: record or drop those.
+ */
+static int rtkit_recv_mgmt(struct apple_rtkit *rtk, struct apple_mbox_msg *msg, bool warm)
+{
+	int ret, type, state;
+
+	for (;;) {
+		ret = mbox_recv(rtk->chan, msg, TIMEOUT_1SEC_US);
+		if (ret < 0 || !warm)
+			return ret;
+		type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg->msg0);
+		state = FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg->msg0);
+		if (msg->msg1 == APPLE_RTKIT_EP_MGMT) {
+			if (type == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK)
+				rtk->iop_pwr = state;
+			else if (type == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE)
+				rtk->ap_pwr = state;
+			else
+				return 0;
+		}
+		debug("rtkit: endpoint %#x message %#llx in the handshake\n", msg->msg1, msg->msg0);
+	}
+}
+
+/*
+ * Warm: after a power cycle under kept firmware state. The firmware says HELLO by itself, the
+ * endpoint map is answered as macOS does after a wake (bit 1 added to every part but the last,
+ * the last masked by last_mask), no endpoint is started again and AP power goes on.
+ */
+static int rtkit_boot(struct apple_rtkit *rtk, u32 system_eps, bool warm, u32 last_mask)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -339,12 +370,15 @@ int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
 		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_INIT);
 	msg.msg1 = APPLE_RTKIT_EP_MGMT;
-	ret = mbox_send(rtk->chan, &msg);
+	ret = warm ? 0 : mbox_send(rtk->chan, &msg);
 	if (ret < 0)
 		return ret;
 
+	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
+	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
+
 	/* Wait for protocol version negotiation message. */
-	ret = mbox_recv(rtk->chan, &msg, TIMEOUT_1SEC_US);
+	ret = rtkit_recv_mgmt(rtk, &msg, warm);
 	if (ret < 0)
 		return ret;
 
@@ -355,7 +389,7 @@ int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 		return -EINVAL;
 	}
 	if (msgtype != APPLE_RTKIT_MGMT_HELLO) {
-		printf("%s: unexpected message type %d\n", __func__, msgtype);
+		printf("%s: unexpected message %#llx\n", __func__, msg.msg0);
 		return -EINVAL;
 	}
 
@@ -375,6 +409,8 @@ int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 		return -ENOTSUPP;
 	}
 
+	debug("rtkit: HELLO, version %d\n", want_ver);
+
 	/* Ack version. */
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_HELLO_REPLY) |
 		FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver) |
@@ -386,7 +422,7 @@ int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 
 wait_epmap:
 	/* Wait for endpoint map message. */
-	ret = mbox_recv(rtk->chan, &msg, TIMEOUT_1SEC_US);
+	ret = rtkit_recv_mgmt(rtk, &msg, warm);
 	if (ret < 0)
 		return ret;
 
@@ -397,12 +433,13 @@ wait_epmap:
 		return -EINVAL;
 	}
 	if (msgtype != APPLE_RTKIT_MGMT_EPMAP) {
-		printf("%s: unexpected message type %d\n", __func__, msgtype);
+		printf("%s: unexpected message %#llx\n", __func__, msg.msg0);
 		return -EINVAL;
 	}
 
 	bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg.msg0);
 	base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg.msg0);
+	debug("rtkit: endpoint map base %u bitmap %#x\n", base, bitmap);
 	for (i = 0; i < 32; i++) {
 		if (bitmap & (1U << i))
 			endpoints[nendpoints++] = base * 32 + i;
@@ -412,19 +449,20 @@ wait_epmap:
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_EPMAP_REPLY) |
 		FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
 	if (msg.msg0 & APPLE_RTKIT_MGMT_EPMAP_LAST)
-		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
+		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST | (warm ? bitmap & last_mask : 0);
 	else
-		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
+		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE | (warm ? bitmap | BIT(1) : 0);
 	msg.msg0 = reply;
 	msg.msg1 = APPLE_RTKIT_EP_MGMT;
 	ret = mbox_send(rtk->chan, &msg);
 	if (ret < 0)
 		return ret;
 
-	if (reply & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)
+	/* Not from bit 0: a warm start's last reply echoes the map there. */
+	if (!(reply & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		goto wait_epmap;
 
-	for (i = 0; i < nendpoints; i++) {
+	for (i = 0; i < nendpoints && !warm; i++) {
 		/*
 		 * Start advertised system endpoints as Linux does. MTP waits for
 		 * them before announcing its DockChannel interfaces.
@@ -444,21 +482,28 @@ wait_epmap:
 			return ret;
 	}
 
-	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
-	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
-
 	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
 		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
 		if (ret < 0)
 			return ret;
 	}
 
-	return 0;
+	return warm ? apple_rtkit_set_ap_power(rtk, APPLE_RTKIT_PWR_STATE_ON) : 0;
+}
+
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
+{
+	return rtkit_boot(rtk, system_eps, false, 0);
 }
 
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {
 	return apple_rtkit_boot_with_sys_ep_mask(rtk, ~0U);
+}
+
+int apple_rtkit_boot_warm(struct apple_rtkit *rtk, u32 last_mask)
+{
+	return rtkit_boot(rtk, 0, true, last_mask);
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)

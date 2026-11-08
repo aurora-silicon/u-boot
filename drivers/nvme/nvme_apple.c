@@ -26,6 +26,10 @@
 /* ASC registers */
 #define REG_CPU_CTRL		0x0044
 #define  REG_CPU_CTRL_RUN	BIT(4)
+#define REG_CPU_STATUS		0x0048
+#define REG_MBOX_A2I_CTRL	0x0110
+#define REG_MBOX_I2A_CTRL	0x0114
+#define  REG_MBOX_RECV_ENABLE	BIT(0)
 
 /* Apple NVMe registers */
 #define ANS_IOSQ_BASE		0x01200	/* post-M4 */
@@ -102,12 +106,6 @@ struct apple_nvme_hw {
 	 * linear queues itself.
 	 */
 	bool lsq_in_nvmmu;
-	/*
-	 * The ANS may arrive straight from iBoot, before any OS-side RTKit
-	 * handshake: run that (one-time) handshake here, then hand the live
-	 * session on as on adoption.  See apple_nvme_needs_handshake().
-	 */
-	bool wake_disabled;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -144,7 +142,6 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.post_m4 = true,
 	.lsq_in_nvmmu = true,
-	.wake_disabled = true,
 	.max_ns_id = 1,
 };
 
@@ -286,6 +283,8 @@ static struct {
 	phys_size_t size;
 } ans_handoff_bufs[ANS_HANDOFF_MAX_BUFS];
 static int ans_handoff_nbufs;
+/* This stage started ANS from off: Linux gets it running, not off. */
+static bool ans_started_from_off;
 
 static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
 {
@@ -325,6 +324,13 @@ int apple_nvme_fdt_fixup(void *blob)
 	char name[40];
 	fdt64_t reg[2];
 
+	for (sub = fdt_next_node(blob, -1, NULL); ans_started_from_off && sub >= 0;
+	     sub = fdt_next_node(blob, sub, NULL)) {
+		if (fdt_getprop(blob, sub, "apple,sart-entries", NULL)) {
+			fdt_delprop(blob, sub, "apple,sart-entries");
+			break;
+		}
+	}
 	if (!ans_handoff_nbufs)
 		return 0;
 
@@ -607,17 +613,15 @@ static int apple_nvme_adopt(struct udevice *dev)
 }
 
 /*
- * T6040: the firmware takes the OS-side RTKit handshake once per boot; every
- * later owner must adopt the live session.  An m1n1 stage that ran the
- * handshake leaves the controller disabled but programmed (NVMMU TCB bases,
- * I/O queue aperture); straight from iBoot (a chain whose m1n1 stages never
- * used NVMe) both read zero and the controller will not become ready until
- * someone runs the handshake.
+ * Post-M4: the firmware takes the OS-side RTKit handshake once per boot.  A
+ * boot loader stage that ran it leaves the controller programmed (NVMMU TCB
+ * bases, I/O queue aperture); straight from iBoot (a chain whose earlier
+ * stages never used NVMe) both read zero and the controller will not become
+ * ready until someone runs the handshake.
  */
 static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 {
-	if (!priv->hw->wake_disabled ||
-	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+	if (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE)
 		return false;
 
 	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
@@ -625,8 +629,8 @@ static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 }
 
 /*
- * Post-M4, T6040: the boot loader hands the ANS over running, with the
- * controller disabled and before the OS-side RTKit handshake (Linux in the
+ * Post-M4, straight from iBoot: the ANS arrives running, with the controller
+ * disabled and before the OS-side RTKit handshake (on T6040, Linux in the
  * same chain logs "RTKit: Initializing" and a cold "boot: mode normal").
  * The controller never becomes ready until that handshake has run, and the
  * firmware takes it once per run: after U-Boot it can neither be repeated
@@ -688,6 +692,80 @@ static int apple_nvme_wake(struct udevice *dev)
 		return -ETIMEDOUT;
 	}
 
+	/* Answer its log traffic while commands are outstanding. */
+	priv->adopted_mbox = true;
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/*
+ * Post-M4, powered off by the boot loader stage that used it: its PCIe block
+ * is back up, ANS's CPU is stopped and the SART has lost its entries.  The
+ * stage passed them in apple,sart-entries: per entry (index << 8 | flags),
+ * address and size, 64 bits each.  Write them back and start the firmware as
+ * after a power loss.  It keeps the buffers it was given.
+ */
+static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
+				     int len)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 phandle, stat;
+	void *mbox;
+	int i, ret;
+
+	if (readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN) {
+		dev_err(dev, "ANS is running, but the boot loader passed it on powered off\n");
+		return -EIO;
+	}
+	ret = mbox_get_by_index(dev, 0, &priv->chan);
+	if (ret < 0)
+		return ret;
+	ret = dev_read_u32(dev, "apple,sart", &phandle);
+	if (ret < 0)
+		return ret;
+	priv->sart = sart_init(ofnode_get_by_phandle(phandle));
+	if (!priv->sart)
+		return -EINVAL;
+	for (i = 0; i + 3 <= len / sizeof(*cells); i += 3) {
+		u64 key = fdt64_to_cpu(cells[i]);
+
+		if (!sart_set_entry(priv->sart, key >> 8, key & 0xff,
+				    (void *)fdt64_to_cpu(cells[i + 1]),
+				    fdt64_to_cpu(cells[i + 2]))) {
+			dev_err(dev, "can't write SART entry %llu back\n", key >> 8);
+			return -EIO;
+		}
+	}
+
+	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup, NULL);
+	if (!priv->rtk)
+		return -ENOMEM;
+	/* As macOS does before the run bit after a sleep: the mailbox's receive side on. */
+	mbox = dev_read_addr_ptr(priv->chan.dev);
+	if (!mbox)
+		return -EINVAL;
+	debug("%s: before the run bit: CPU %#x status %#x, mailbox A2I %#x I2A %#x\n", dev->name,
+	      readl(priv->asc + REG_CPU_CTRL), readl(priv->asc + REG_CPU_STATUS),
+	      readl(mbox + REG_MBOX_A2I_CTRL), readl(mbox + REG_MBOX_I2A_CTRL));
+	setbits_le32(mbox + REG_MBOX_I2A_CTRL, REG_MBOX_RECV_ENABLE);
+	setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	ret = apple_rtkit_boot_warm(priv->rtk, BIT(0));
+	if (!ret)
+		ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+					       stat == ANS_BOOT_STATUS_OK, 100, 1000000);
+	if (ret) {
+		printf("%s: ANS didn't start from off (%d); it stays down until a reboot\n",
+		       dev->name, ret);
+		return ret;
+	}
+	debug("%s: ANS started from off, %d SART entries written back\n", dev->name, i / 3);
+	priv->woken = true;
+	ans_started_from_off = true;
 	/* Answer its log traffic while commands are outstanding. */
 	priv->adopted_mbox = true;
 
@@ -808,8 +886,9 @@ static bool apple_nvme_adopt_failed;
 static int apple_nvme_probe(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	const fdt64_t *sart_cells;
 	fdt_addr_t addr;
-	int ret;
+	int ret, sart_len;
 
 	if (apple_nvme_adopt_failed)
 		return -ENODEV;
@@ -836,7 +915,10 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.bar = priv->base;
 	priv->ndev.udev = dev;
 
-	if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
+	sart_cells = dev_read_prop(dev, "apple,sart-entries", &sart_len);
+	if (priv->hw->post_m4 && sart_cells)
+		ret = apple_nvme_start_from_off(dev, sart_cells, sart_len);
+	else if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
 		ret = apple_nvme_wake(dev);
 	else if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);

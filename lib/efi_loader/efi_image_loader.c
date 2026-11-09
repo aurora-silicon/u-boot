@@ -1204,6 +1204,9 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 		handle->auth_status = EFI_IMAGE_AUTH_FAILED;
 		log_err("Image not authenticated\n");
 	}
+	if (IS_ENABLED(CONFIG_EFI_AURORA_MEASURE))
+		efi_aurora_measure(efi, efi_size,
+				   handle->auth_status == EFI_IMAGE_AUTH_PASSED);
 
 	/* Calculate upper virtual address boundary */
 	for (i = num_sections - 1; i >= 0; i--) {

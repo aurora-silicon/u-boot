@@ -228,6 +228,17 @@ config EFI_VARIABLE_SF_DEVICE_INDEX
 	  The index of SPI Flash device used for storing EFI variables. This would be
 	  needed if there are more than 1 SPI Flash devices available to use.
 
+config EFI_AURORA_MEASURE
+	bool "Record loaded EFI images in the aurora,boot-security node"
+	depends on EFI_LOADER && OF_LIBFDT
+	select SHA256
+	default y if ARCH_APPLE
+	help
+	  Add a measurement@N node with the SHA-256 and the signature verdict
+	  of every EFI image U-Boot loads to /chosen/aurora,boot-security in
+	  the device tree handed to the OS. The aura stages before U-Boot
+	  start this record; Linux reads it to report how the machine booted.
+
 config EFI_VARIABLES_PRESEED
 	bool "Initial values for UEFI variables"
 	depends on !COMPILE_TEST

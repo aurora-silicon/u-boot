@@ -4,6 +4,7 @@
  * (C) Copyright 2021 Copyright The Asahi Linux Contributors
  */
 
+#include <dm/device.h>
 #include <mailbox.h>
 #include <malloc.h>
 
@@ -319,6 +320,64 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
+/*
+ * T6050: start the system endpoints the way m1n1 and Linux do there: debug,
+ * crashlog, syslog, ioreport, oslog in that order, and nothing else.  Wait
+ * for the IOP to reach ON, then send AP power ON and give its acknowledgment
+ * a short window; not every coprocessor sends it.
+ */
+static int apple_rtkit_boot_t6050(struct apple_rtkit *rtk, const int *endpoints,
+				  int nendpoints)
+{
+	static const u8 order[] = {
+		APPLE_RTKIT_EP_DEBUG, APPLE_RTKIT_EP_CRASHLOG, APPLE_RTKIT_EP_SYSLOG,
+		APPLE_RTKIT_EP_IOREPORT, APPLE_RTKIT_EP_OSLOG,
+	};
+	struct apple_mbox_msg msg;
+	int i, j, ret;
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		for (j = 0; j < nendpoints && endpoints[j] != order[i]; j++)
+			;
+		if (j == nendpoints)
+			continue;
+
+		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, order[i]) |
+			APPLE_RTKIT_MGMT_STARTEP_FLAG;
+		msg.msg1 = APPLE_RTKIT_EP_MGMT;
+		ret = mbox_send(rtk->chan, &msg);
+		if (ret < 0)
+			return ret;
+	}
+
+	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
+	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
+
+	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
+		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
+		if (ret < 0)
+			return ret;
+	}
+
+	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+	msg.msg1 = APPLE_RTKIT_EP_MGMT;
+	ret = mbox_send(rtk->chan, &msg);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 4 && rtk->ap_pwr != APPLE_RTKIT_PWR_STATE_ON; i++) {
+		ret = apple_rtkit_poll(rtk, 50000);
+		if (ret == -ETIMEDOUT)
+			continue;
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
 int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 {
 	struct apple_mbox_msg msg;
@@ -423,6 +482,9 @@ wait_epmap:
 
 	if (reply & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)
 		goto wait_epmap;
+
+	if (of_machine_is_compatible("apple,t6050"))
+		return apple_rtkit_boot_t6050(rtk, endpoints, nendpoints);
 
 	for (i = 0; i < nendpoints; i++) {
 		/*

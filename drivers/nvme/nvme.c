@@ -488,13 +488,15 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 		page_shift = dev_page_max;
 	}
 
+	if (dev->keep_cc_fields)
+		dev->ctrl_config = readl(&dev->bar->cc);
 	result = nvme_disable_ctrl(dev);
 	if (result < 0)
 		return result;
 
 	nvmeq = dev->queues[NVME_ADMIN_Q];
 	if (!nvmeq) {
-		nvmeq = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
+		nvmeq = nvme_alloc_queue(dev, 0, dev->aq_depth ?: NVME_AQ_DEPTH);
 		if (!nvmeq)
 			return -ENOMEM;
 		allocated = true;
@@ -505,14 +507,20 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 
 	dev->page_size = 1 << page_shift;
 
-	dev->ctrl_config = NVME_CC_CSS_NVM;
-	dev->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
-	dev->ctrl_config |= NVME_CC_ARB_RR | NVME_CC_SHN_NONE;
-	dev->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
+	if (dev->keep_cc_fields) {
+		nvme_writeq((ulong)nvmeq->sq_cmds, &dev->bar->asq);
+		nvme_writeq((ulong)nvmeq->cqes, &dev->bar->acq);
+		writel(aqa, &dev->bar->aqa);
+	} else {
+		dev->ctrl_config = NVME_CC_CSS_NVM;
+		dev->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
+		dev->ctrl_config |= NVME_CC_ARB_RR | NVME_CC_SHN_NONE;
+		dev->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
 
-	writel(aqa, &dev->bar->aqa);
-	nvme_writeq((ulong)nvmeq->sq_cmds, &dev->bar->asq);
-	nvme_writeq((ulong)nvmeq->cqes, &dev->bar->acq);
+		writel(aqa, &dev->bar->aqa);
+		nvme_writeq((ulong)nvmeq->sq_cmds, &dev->bar->asq);
+		nvme_writeq((ulong)nvmeq->cqes, &dev->bar->acq);
+	}
 
 	result = nvme_enable_ctrl(dev);
 	if (result)

@@ -610,6 +610,17 @@ struct nvme_dev {
 	 * this before calling nvme_init(); 0 selects the conservative default.
 	 */
 	int max_q_depth;
+	/*
+	 * Admin queue depth, 0 for the default.  Controller drivers may set
+	 * this before calling nvme_init().
+	 */
+	int aq_depth;
+	/*
+	 * Enable the controller with the CC fields its firmware set, and
+	 * program ASQ and ACQ before AQA (Apple T6050).  Controller drivers
+	 * may set this before calling nvme_init().
+	 */
+	bool keep_cc_fields;
 	u32 db_stride;
 	u32 ctrl_config;
 	struct nvme_bar __iomem *bar;

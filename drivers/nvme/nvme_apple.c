@@ -108,6 +108,13 @@ struct apple_nvme_hw {
 	 * session on as on adoption.  See apple_nvme_needs_handshake().
 	 */
 	bool wake_disabled;
+	/*
+	 * T6050: straight from iBoot whenever CC.EN is clear, the coprocessor
+	 * possibly stopped; the controller becomes ready only with the CC
+	 * fields its firmware set, a full-depth admin queue, and ASQ, ACQ and
+	 * AQA written in that order after the NVMMU TCB bases.
+	 */
+	bool keep_cc_fields;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -145,6 +152,17 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.post_m4 = true,
 	.lsq_in_nvmmu = true,
 	.wake_disabled = true,
+	.max_ns_id = 1,
+};
+
+/*
+ * T6050 (M5 Max): the T6040 handshake and handoff with the T8140 register
+ * layout, as Linux's apple,t6050-nvme-ans2 entry (keep_cc_fields).
+ */
+static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.post_m4 = true,
+	.wake_disabled = true,
+	.keep_cc_fields = true,
 	.max_ns_id = 1,
 };
 
@@ -525,7 +543,9 @@ static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
 	struct udevice *dev = priv->ndev.udev;
 	u32 ioqa;
 
-	if (!priv->hw->lsq_in_nvmmu)
+	if (priv->hw->keep_cc_fields)
+		setbits_le32(priv->base + ANS_LINEAR_SQ_CTRL, ANS_LINEAR_SQ_CTRL_EN);
+	else if (!priv->hw->lsq_in_nvmmu)
 		writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
 	if (!(readl(apple_nvme_lsq(priv) + ANS_LINEAR_SQ_CTRL) &
 	      ANS_LINEAR_SQ_CTRL_EN)) {
@@ -619,6 +639,10 @@ static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 	if (!priv->hw->wake_disabled ||
 	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
 		return false;
+	/* T6050: an m1n1 stage 2 that received stage 1's live session says so in /chosen. */
+	if (priv->hw->keep_cc_fields)
+		return !ofnode_has_property(ofnode_path("/chosen"),
+					    "asahi,nvme-adopt");
 
 	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
 	       !readl(priv->base + ANS_MAX_PEND_CMDS_CTRL);
@@ -644,7 +668,10 @@ static int apple_nvme_wake(struct udevice *dev)
 	u32 phandle, stat;
 	int ret;
 
-	if (!apple_nvme_ans_running(priv)) {
+	/* T6050: start the coprocessor if iBoot left it stopped, as m1n1 does. */
+	if (priv->hw->keep_cc_fields)
+		setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	else if (!apple_nvme_ans_running(priv)) {
 		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x)\n",
 			readl(priv->asc + REG_CPU_CTRL),
 			readl(priv->base + ANS_BOOT_STATUS));
@@ -850,6 +877,10 @@ static int apple_nvme_probe(struct udevice *dev)
 
 	strcpy(priv->ndev.vendor, "Apple");
 	priv->ndev.max_ns_id = priv->hw->max_ns_id;
+	if (priv->hw->keep_cc_fields) {
+		priv->ndev.keep_cc_fields = true;
+		priv->ndev.aq_depth = ANS_MAX_QUEUE_DEPTH;
+	}
 
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
@@ -918,6 +949,8 @@ static const struct nvme_ops apple_nvme_ops = {
 };
 
 static const struct udevice_id apple_nvme_ids[] = {
+	{ .compatible = "apple,t6050-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t6050_hw },
 	{ .compatible = "apple,t6041-nvme-ans2",
 	  .data = (ulong)&apple_nvme_t6040_hw },
 	{ .compatible = "apple,t8103-nvme-ans2",

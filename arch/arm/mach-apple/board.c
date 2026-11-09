@@ -1215,6 +1215,7 @@ void build_mem_map(void)
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
 	else if (of_machine_is_compatible("apple,t6040") ||
+		 of_machine_is_compatible("apple,t6041") ||
 		 of_machine_is_compatible("apple,t6050"))
 		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
@@ -1618,14 +1619,16 @@ int board_late_init(void)
 		if (ret)
 			printf("MTP: input unavailable (%d); continuing boot\n", ret);
 	}
-	/* T6040 stays with Linux except for the J614s retained handoff. */
+	/* T6040 and T6041 stay with Linux except for the J614s retained handoff. */
 	if ((of_machine_is_compatible("apple,t6040") &&
 	     !of_machine_is_compatible("apple,j614s")) ||
+	    of_machine_is_compatible("apple,t6041") ||
 	    of_machine_is_compatible("apple,t6050"))
 		start_keyboard = false;
 	if (of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040") ||
+	    of_machine_is_compatible("apple,t6041") ||
 	    of_machine_is_compatible("apple,t6050"))
 		apple_efi_late_init(start_keyboard);
 	else

@@ -79,6 +79,8 @@ struct vidconsole_priv {
 	char escape_buf[32];
 	char utf8_buf[5];
 	bool quiet;
+	bool quiet_boot;
+	bool clear_pending;
 };
 
 /**
@@ -593,5 +595,49 @@ int vidconsole_get_font_size(struct udevice *dev, const char **name, uint *sizep
  * @quiet: true to suppress stdout/stderr output, false to enable it
  */
 void vidconsole_set_quiet(struct udevice *dev, bool quiet);
+
+#if CONFIG_IS_ENABLED(VIDEO_QUIET_BOOT)
+/**
+ * vidconsole_quiet_boot() - Check whether a video console still holds back text
+ *
+ * See CONFIG_VIDEO_QUIET_BOOT.
+ *
+ * Return: true while at least one video console has not shown text yet
+ */
+bool vidconsole_quiet_boot(void);
+
+/**
+ * vidconsole_quiet_boot_clear() - Note a clear-screen request held back
+ *
+ * The display is cleared when the console starts showing text, so that
+ * the text does not land on the loader's picture.
+ */
+void vidconsole_quiet_boot_clear(void);
+
+/**
+ * vidconsole_quiet_boot_end() - Start showing text on every video console
+ *
+ * Clears each video console that still showed the loader's picture, if
+ * @clear or a clear-screen request was held back, and lets text through.
+ * Does nothing for a console that already shows text.
+ *
+ * @clear: clear the display before the first text
+ */
+void vidconsole_quiet_boot_end(bool clear);
+
+#else
+static inline bool vidconsole_quiet_boot(void)
+{
+	return false;
+}
+
+static inline void vidconsole_quiet_boot_clear(void)
+{
+}
+
+static inline void vidconsole_quiet_boot_end(bool clear)
+{
+}
+#endif /* VIDEO_QUIET_BOOT */
 
 #endif

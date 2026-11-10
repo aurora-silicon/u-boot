@@ -25,6 +25,7 @@
 #include <asm/global_data.h>
 #include <linux/delay.h>
 #include <u-boot/sha256.h>
+#include <video_console.h>
 #include <bootcount.h>
 #include <crypt.h>
 #include <dm/ofnode.h>
@@ -429,6 +430,9 @@ static int abortboot(int bootdelay)
 
 	if (IS_ENABLED(CONFIG_SILENT_CONSOLE) && abort)
 		gd->flags &= ~GD_FLG_SILENT;
+
+	if (abort)
+		vidconsole_quiet_boot_end(true);
 
 	return abort;
 }

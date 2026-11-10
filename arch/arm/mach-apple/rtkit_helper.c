@@ -61,6 +61,13 @@ struct rtkit_helper_priv {
 	bool input_ready;
 };
 
+/* J613 retains the first MTP epoch, with OSLog in SRAM. */
+static bool rtkit_helper_j613_handoff(struct udevice *dev)
+{
+	return of_machine_is_compatible("apple,j613") &&
+	       device_is_compatible(dev, "apple,t8122-rtk-helper-asc4");
+}
+
 static bool rtkit_helper_uses_dram(struct udevice *dev)
 {
 	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
@@ -231,7 +238,8 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (ret < 0)
 		return ret;
 
-	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev))
+	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev) ||
+	    rtkit_helper_j613_handoff(dev))
 		rtkit_helper_read_dma_window(dev);
 
 	if (of_machine_is_compatible("apple,j614s") &&
@@ -314,7 +322,8 @@ static int rtkit_helper_remove(struct udevice *dev)
 
 		/* A published J713 inventory already promises a running session.
 		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
-		if (ret && rtkit_helper_j713_handoff(dev))
+		if (ret && (rtkit_helper_j713_handoff(dev) ||
+			    rtkit_helper_j613_handoff(dev)))
 			panic("MTP: refusing OS entry after DART retention error %d", ret);
 		if (ret)
 			goto stop;
@@ -507,8 +516,12 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	char name[48];
 	u32 phandle, rphandle;
 	fdt64_t reg[2];
+	fdt32_t inventory[4 * 5];
+	struct apple_rtkit_buffer buffers[4];
+	int count;
 
-	if (!priv->rtk || !priv->dart || !priv->nbufs ||
+	if ((rtkit_helper_j613_handoff(dev) && !priv->input_ready) ||
+	    !priv->rtk || !priv->dart || !priv->nbufs ||
 	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
 		return -ENODEV;
 	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
@@ -535,12 +548,15 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 			return -ENOSPC;
 	}
 
+	fdt_delprop(blob, node, "memory-region");
 	for (i = 0; i < priv->nbufs; i++) {
 		struct rtkit_helper_buf *b = &priv->bufs[i];
 
 		snprintf(name, sizeof(name), "mtp-rtkit@%llx", b->dva);
 		resv = fdt_path_offset(blob, "/reserved-memory");
-		sub = fdt_add_subnode(blob, resv, name);
+		sub = fdt_subnode_offset(blob, resv, name);
+		if (sub == -FDT_ERR_NOTFOUND)
+			sub = fdt_add_subnode(blob, resv, name);
 		if (sub < 0)
 			return -ENOSPC;
 
@@ -565,9 +581,28 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 
 	node = rtkit_helper_fdt_node(blob, priv->dart);
 	if (node < 0 ||
-	    fdt_appendprop_u32(blob, node, "apple,bypass-handoff-streams",
+	    fdt_setprop_u32(blob, node, "apple,bypass-handoff-streams",
 			       priv->dart_sid))
 		return -ENOSPC;
+
+	if (rtkit_helper_j613_handoff(dev)) {
+		count = apple_rtkit_get_buffers(priv->rtk, buffers, ARRAY_SIZE(buffers));
+		if (count != ARRAY_SIZE(buffers))
+			return count < 0 ? count : -EINVAL;
+		for (i = 0; i < count; i++) {
+			if (buffers[i].size > (u32)-1)
+				return -EOVERFLOW;
+			inventory[5 * i] = cpu_to_fdt32(buffers[i].endpoint);
+			inventory[5 * i + 1] = cpu_to_fdt32(buffers[i].dva >> 32);
+			inventory[5 * i + 2] = cpu_to_fdt32(buffers[i].dva);
+			inventory[5 * i + 3] = cpu_to_fdt32(buffers[i].size);
+			inventory[5 * i + 4] = cpu_to_fdt32(buffers[i].is_mapped);
+		}
+		node = rtkit_helper_fdt_node(blob, dev);
+		if (node < 0 || fdt_setprop(blob, node, "apple,rtkit-buffers",
+					 inventory, sizeof(inventory)))
+			return -ENOSPC;
+	}
 
 	node = rtkit_helper_fdt_node(blob, dev);
 	if (node < 0 ||
@@ -592,7 +627,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
 		    !device_active(dev) ||
-		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev)))
+		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
+		     !rtkit_helper_j613_handoff(dev)))
 			continue;
 
 		priv = dev_get_priv(dev);
@@ -619,6 +655,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 				priv->published_fdt = blob;
 		}
 		free(scratch);
+		if (ret && rtkit_helper_j613_handoff(dev))
+			panic("J613 MTP handoff publication failed: %d", ret);
 		if (ret && was_published) {
 			/* The prior EFI table may still be selected after a later
 			 * candidate fixup fails. Its buffers/DART/session stay live. */
@@ -644,6 +682,7 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 
 static const struct udevice_id rtkit_helper_ids[] = {
 	{ .compatible = "apple,rtk-helper-asc4" },
+	{ .compatible = "apple,t8122-rtk-helper-asc4" },
 	{ /* sentinel */ }
 };
 

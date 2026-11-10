@@ -1625,7 +1625,8 @@ int board_late_init(void)
 	    of_machine_is_compatible("apple,t6041") ||
 	    of_machine_is_compatible("apple,t6050"))
 		start_keyboard = false;
-	if (of_machine_is_compatible("apple,t8140") ||
+	if (of_machine_is_compatible("apple,j613") ||
+	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
 	    of_machine_is_compatible("apple,t6040") ||
 	    of_machine_is_compatible("apple,t6041") ||

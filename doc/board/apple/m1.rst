@@ -144,7 +144,12 @@ a window, none of the following happens.
   free 2 MiB boundary that fits. The EFI loader installs
   ``LINUX_EFI_LOADED_IMAGE_FIXED_GUID`` on the kernel's handle, so the EFI stub
   runs the image in place. Its physical address is therefore not randomised.
-  Its virtual address still can be.
+  Its virtual address still can be. An EFI zboot image, whose decompressor
+  would pick the kernel's address itself, is decompressed by the loader once
+  the image is authenticated, and the arm64 Image it holds is loaded in its
+  place. That needs ``CONFIG_GZIP`` or ``CONFIG_ZSTD`` for the image's
+  compression; the window implies ``CONFIG_ZSTD``, the method distributions
+  use.
 * The kernel in a UKI. systemd-stub loads it into loader code it allocates
   itself. U-Boot serves loader code from the window when the image asking for
   it is a PE image with a ``.linux`` section.
@@ -169,8 +174,9 @@ are taken out of it too. A fixed-address allocation inside the window fails.
 
 When the kernel can't be placed, U-Boot prints a warning and starts it outside
 the window, where it boots on the boot CPU. That happens when the window has no
-room, and for an EFI zboot image, on its own or in a UKI, whose decompressor
-picks the kernel's address from the whole memory map. A ``booti`` that fails
+room, for an EFI zboot image whose compression U-Boot can't decompress, and for
+a zboot kernel in a UKI, whose decompressor picks the kernel's address from the
+whole memory map. A ``booti`` that fails
 after placing its image gives the place back when the next kernel is placed.
 
 Limits:

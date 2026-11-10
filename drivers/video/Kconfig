@@ -260,6 +260,21 @@ config NO_FB_CLEAR
 	  loads takes over the screen.  This, for example, can be used to
 	  keep splash image on screen until grub graphical boot menu starts.
 
+config VIDEO_QUIET_BOOT
+	bool "Keep the loader's picture until the console is needed"
+	depends on NO_FB_CLEAR
+	help
+	  Leave the picture the previous loader put on the display (a logo
+	  on a black screen) untouched while U-Boot boots an operating
+	  system: U-Boot's own messages and logo go to the other consoles
+	  only, and a clear-screen request is not drawn. The video console
+	  starts showing text, after clearing the display, when it is
+	  needed: a key stops the autoboot, U-Boot falls back to its
+	  command line, or an EFI application such as a boot menu writes
+	  visible text. Setting the "verbose" environment variable, or a
+	  "u-boot,verbose" property in /chosen of the control device tree,
+	  shows everything from the start.
+
 config VIDEO_SYNC_MS
 	int "Video-sync period in milliseconds for foreground processing"
 	default 300 if SANDBOX

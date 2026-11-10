@@ -194,6 +194,15 @@ static efi_status_t EFIAPI efi_cout_output_string(
 	}
 	pos = buf;
 	utf16_utf8_strcpy(&pos, string);
+	/* The first visible text of an EFI application, e.g. a boot menu */
+	if (vidconsole_quiet_boot()) {
+		for (p = string; *p; ++p) {
+			if (*p > ' ') {
+				vidconsole_quiet_boot_end(false);
+				break;
+			}
+		}
+	}
 	puts(buf);
 	free(buf);
 
@@ -500,6 +509,7 @@ static void efi_clear_screen(void)
 	 * uclass does not support <ESC>[H without coordinates, yet.
 	 */
 	printf(ESC "[2J" ESC "[1;1H");
+	vidconsole_quiet_boot_clear();
 	efi_con_mode.cursor_column = 0;
 	efi_con_mode.cursor_row = 0;
 }

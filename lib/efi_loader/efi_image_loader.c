@@ -1007,17 +1007,19 @@ static void efi_unpack_zboot_for_ctxr(void *efi, size_t efi_size, void **image,
 		return;
 	}
 
-	if (zstd) {
+	if (IS_ENABLED(CONFIG_ZSTD) && zstd) {
 		struct abuf in, out;
 
 		abuf_init_set(&in, efi + off, len);
 		abuf_init_set(&out, (void *)(uintptr_t)buf, size);
 		ret = zstd_decompress(&in, &out);
 		ret = ret == size ? 0 : -EINVAL;
-	} else {
+	} else if (IS_ENABLED(CONFIG_GZIP)) {
 		unsigned long src_len = len;
 
 		ret = gunzip((void *)(uintptr_t)buf, size, efi + off, &src_len);
+	} else {
+		ret = -ENOSYS;
 	}
 
 	if (ret || le32_to_cpu(((struct linux_efi_header *)(uintptr_t)buf)->magic) !=

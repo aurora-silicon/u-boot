@@ -346,6 +346,16 @@ void bootstage_report(void);
 int bootstage_fdt_add_report(void);
 
 /**
+ * bootstage_fdt_add() - Add the bootstage records to a device tree
+ *
+ * Adds a root "bootstage" node as described for CONFIG_BOOTSTAGE_FDT.
+ *
+ * @blob: Device tree to update, with room for the new nodes
+ * Return: 0 if ok, non-zero on error
+ */
+int bootstage_fdt_add(void *blob);
+
+/**
  * Stash bootstage data into memory
  *
  * @param base	Base address of memory buffer
@@ -441,6 +451,11 @@ static inline void bootstage_report(void)
 
 static inline void bootstage_fdt_add_report(void)
 {
+}
+
+static inline int bootstage_fdt_add(void *blob)
+{
+	return 0;
 }
 
 static inline int bootstage_stash(void *base, int size)

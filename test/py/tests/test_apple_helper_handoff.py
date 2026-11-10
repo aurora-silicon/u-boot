@@ -65,8 +65,12 @@ static int stops;
 #define DM_DRIVER_GET(x) (&driver_tag)
 #define uclass_id_foreach_dev(id, dev, uc) for (dev = active_dev, uc = NULL; dev && !uc; dev = NULL)
 #define dev_warn(dev, ...) printf(__VA_ARGS__)
+#define debug(...) ((void)0)
 static bool device_active(struct udevice *dev) { return true; }
 static bool rtkit_helper_j713_handoff(struct udevice *dev) { return true; }
+static bool rtkit_helper_j613_handoff(struct udevice *dev) { return false; }
+static void __attribute__((noreturn)) panic(const char *fmt, ...)
+{ assert(!fmt); abort(); }
 static bool rtkit_helper_uses_dram(struct udevice *dev) { return false; }
 static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob) { assert(false); return -1; }
 static void apple_dart_release_bypass(void *dart) {}
@@ -238,23 +242,28 @@ def test_j713_finishes_late_startup_requests(tmp_path):
     repo = Path(__file__).resolve().parents[3]
     text = (repo / 'arch/arm/mach-apple/board.c').read_text()
     start = text.index('static int j713_prepare_input(void)')
-    production = text[start:text.index('int board_late_init(void)', start)]
+    production = text[start:text.index('\n}', start) + 2]
     harness = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 typedef int ofnode;
 typedef uint64_t fdt_addr_t;
 typedef unsigned long ulong;
 #define UCLASS_MISC 1
 #define FDT_ADDR_T_NONE UINT64_MAX
+#define debug(...) ((void)0)
 struct udevice { int unused; };
 static struct udevice helper;
-static int polls, fault, ready;
+static int polls, fault, ready, j614;
 static ulong ticks;
+static bool of_machine_is_compatible(const char *s) { return j614 && !strcmp(s, "apple,j614s"); }
 static ofnode ofnode_null(void) { return 0; }
-static ofnode ofnode_by_compatible(ofnode n, const char *s) { return 1; }
+static ofnode ofnode_by_compatible(ofnode n, const char *s)
+{ assert(!strcmp(s, j614 ? "apple,t6041-rtk-helper-asc4" : "apple,t8132-rtk-helper-asc4")); return 1; }
 static int ofnode_valid(ofnode n) { return n != 0; }
 static int uclass_get_device_by_ofnode(int cls, ofnode n, struct udevice **dev)
 { *dev = &helper; return fault == 1 ? -EIO : 0; }
@@ -272,7 +281,7 @@ static void apple_rtkit_helper_input_ready(struct udevice *dev) { ready++; }
 ''' + production + r'''
 int main(void)
 {
- for (fault = 0; fault < 4; fault++) {
+ for (j614 = 0; j614 < 2; j614++) for (fault = 0; fault < 4; fault++) {
   polls = ticks = ready = 0;
   assert(j713_prepare_input() == (fault == 0 ? 0 : fault == 2 ? -ETIMEDOUT : -EIO));
   assert(ready == (fault == 0));
@@ -385,13 +394,15 @@ def test_published_j713_remove_never_stops_firmware_on_dart_failure(tmp_path):
 #include <stdio.h>
 #include <errno.h>
 #include <setjmp.h>
+#define debug(...) ((void)0)
 struct rtkit_helper_priv { bool handoff_published;void *rtk,*dart; };
 struct udevice { const char *name;struct rtkit_helper_priv *priv; };
-static int retention_error,stops,frees,panics;static bool j713=true;
+static int retention_error,stops,frees,panics;static bool j713=true,j613;
 static jmp_buf boundary;
 static void *dev_get_priv(struct udevice *d) { return d->priv; }
 static int apple_dart_retain_bypass(void *d) { assert(d);return retention_error; }
 static bool rtkit_helper_j713_handoff(struct udevice *d) { assert(d);return j713; }
+static bool rtkit_helper_j613_handoff(struct udevice *d) { assert(d);return j613; }
 static void apple_rtkit_free(void *r) { assert(r);frees++; }
 static void rtkit_helper_stop(struct udevice *d) { d->priv->rtk=NULL;stops++; }
 static void __attribute__((noreturn)) panic(const char *fmt,...) {
@@ -408,6 +419,9 @@ int main(void) {
  assert(!rtkit_helper_remove(&d)&&stops==1&&!p.rtk);
  p.rtk=(void *)1;p.handoff_published=true;j713=false;retention_error=-EINVAL;
  assert(!rtkit_helper_remove(&d)&&stops==2&&!p.rtk&&panics==1);
+ p.rtk=(void *)1;p.handoff_published=true;j613=true;
+ if(!setjmp(boundary)){rtkit_helper_remove(&d);assert(false);}
+ assert(panics==2&&stops==2&&p.rtk&&p.handoff_published);
  return 0;
 }
 '''
@@ -415,5 +429,45 @@ int main(void) {
     c.write_text(unit)
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                    str(c), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+def test_j614s_helper_requires_keyboard_config(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    text = (root / 'arch/arm/mach-apple/rtkit_helper.c').read_text()
+    start = text.index('bool apple_rtkit_helper_allowed(')
+    end = text.index('\n}', start) + 2
+    unit = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+typedef int ofnode;
+static bool enabled, j614;
+#define CONFIG_APPLE_MTP_KEYB 1
+#define IS_ENABLED(x) (enabled)
+static bool ofnode_device_is_compatible(ofnode node, const char *compat) {
+    return node == 1 && !strcmp(compat, "apple,t6041-rtk-helper-asc4");
+}
+static bool of_machine_is_compatible(const char *compat) {
+    assert(!strcmp(compat, "apple,j614s"));
+    return j614;
+}
+''' + text[start:end] + r'''
+int main(void) {
+    assert(!apple_rtkit_helper_allowed(1));
+    j614 = true;
+    assert(!apple_rtkit_helper_allowed(1));
+    enabled = true;
+    assert(apple_rtkit_helper_allowed(1));
+    j614 = false;
+    assert(!apple_rtkit_helper_allowed(1));
+    assert(apple_rtkit_helper_allowed(0));
+    return 0;
+}
+'''
+    c, binary = tmp_path / 'helper_allowed.c', tmp_path / 'helper_allowed'
+    c.write_text(unit)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                     str(c), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

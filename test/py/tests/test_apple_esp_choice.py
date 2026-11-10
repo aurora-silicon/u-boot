@@ -33,6 +33,8 @@ static struct blk_desc disk = { .bdev = &nvme };
 static size_t test_strlcpy(char *d, const char *s, size_t n)
 { snprintf(d, n, "%s", s); return strlen(s); }
 #define strlcpy test_strlcpy
+/* board.c reports the choice with debug(); show it here */
+#define debug printf
 static bool has(int p, char c) { return strchr(pflags[p - 1], c); }
 static bool of_machine_is_compatible(const char *s) { return false; }
 static ofnode ofnode_path(const char *s) { return 1; }

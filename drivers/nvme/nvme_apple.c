@@ -19,6 +19,7 @@
 #include <asm/arch/sart.h>
 #include <linux/apple-mailbox.h>
 #include <linux/bitfield.h>
+#include <linux/bug.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
@@ -35,8 +36,6 @@
 #define ANS_BOOT_STATUS		0x01300
 #define  ANS_BOOT_STATUS_OK	0xde71ce55
 #define ANS_MODESEL		0x01304
-#define ANS_UNKNOWN_CTRL	0x24008
-#define  ANS_PRP_NULL_CHECK	(1 << 11)
 #define ANS_LINEAR_SQ_CTRL	0x24908
 #define  ANS_LINEAR_SQ_CTRL_EN	(1 << 0)
 #define ANS_ASQ_DB		0x2490c
@@ -108,6 +107,13 @@ struct apple_nvme_hw {
 	 * session on as on adoption.  See apple_nvme_needs_handshake().
 	 */
 	bool wake_disabled;
+	/*
+	 * T6050: straight from iBoot whenever CC.EN is clear, the coprocessor
+	 * possibly stopped; the controller becomes ready only with the CC
+	 * fields its firmware set, a full-depth admin queue, and ASQ, ACQ and
+	 * AQA written in that order after the NVMMU TCB bases.
+	 */
+	bool keep_cc_fields;
 	/* Highest namespace ID to expose, 0 for all */
 	u32 max_ns_id;
 };
@@ -145,6 +151,17 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.post_m4 = true,
 	.lsq_in_nvmmu = true,
 	.wake_disabled = true,
+	.max_ns_id = 1,
+};
+
+/*
+ * T6050 (M5 Max): the T6040 handshake and handoff with the T8140 register
+ * layout, as Linux's apple,t6050-nvme-ans2 entry (keep_cc_fields).
+ */
+static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.post_m4 = true,
+	.wake_disabled = true,
+	.keep_cc_fields = true,
 	.max_ns_id = 1,
 };
 
@@ -228,23 +245,31 @@ static void apple_nvme_submit_cmd(struct nvme_queue *nvmeq,
 {
 	struct apple_nvme_priv *priv =
 		container_of(nvmeq->dev, struct apple_nvme_priv, ndev);
+	u32 page_size = nvmeq->dev->page_size;
 	struct ans_nvmmu_tcb *tcb;
 	u16 tail = nvmeq->sq_tail;
 
+	if (nvmeq->qid == NVME_ADMIN_Q) {
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp1, page_size));
+		WARN_ON_ONCE(!IS_ALIGNED(cmd->common.prp2, page_size));
+	}
+
 	tcb = ((void *)priv->tcbs[nvmeq->qid]) + tail * ANS_NVMMU_TCB_PITCH;
 	memset(tcb, 0, sizeof(*tcb));
+	/* Firmware interprets a nonzero opcode as an out-of-line command. */
+	tcb->opcode = 0;
 	if (priv->hw->post_m4) {
 		/* Post-M4 firmware checks the DMA direction against the command. */
-		tcb->opcode = 0;
 		if (!cmd->common.prp1)
 			tcb->flags = 0;
 		else if (cmd->common.opcode & 1)
 			tcb->flags = ANS_NVMMU_TCB_READ;
 		else
 			tcb->flags = ANS_NVMMU_TCB_WRITE;
-	} else {
-		tcb->opcode = cmd->common.opcode;
+	} else if (cmd->common.prp1) {
 		tcb->flags = ANS_NVMMU_TCB_WRITE | ANS_NVMMU_TCB_READ;
+	} else {
+		tcb->flags = 0;
 	}
 	tcb->slot = tail;
 	tcb->prpl_len = cmd->rw.length;
@@ -525,7 +550,9 @@ static int apple_nvme_setup_post_m4(struct apple_nvme_priv *priv)
 	struct udevice *dev = priv->ndev.udev;
 	u32 ioqa;
 
-	if (!priv->hw->lsq_in_nvmmu)
+	if (priv->hw->keep_cc_fields)
+		setbits_le32(priv->base + ANS_LINEAR_SQ_CTRL, ANS_LINEAR_SQ_CTRL_EN);
+	else if (!priv->hw->lsq_in_nvmmu)
 		writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
 	if (!(readl(apple_nvme_lsq(priv) + ANS_LINEAR_SQ_CTRL) &
 	      ANS_LINEAR_SQ_CTRL_EN)) {
@@ -579,8 +606,8 @@ static int apple_nvme_adopt(struct udevice *dev)
 	}
 
 	cc = readl(&priv->ndev.bar->cc);
-	printf("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
-	       dev->name, cc, csts);
+	debug("%s: adopting the live ANS session (CC %#x CSTS %#x)\n",
+	      dev->name, cc, csts);
 
 	/* Only answers to the firmware; the session itself is left alone. */
 	if (mbox_get_by_index(dev, 0, &priv->chan))
@@ -619,6 +646,10 @@ static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 	if (!priv->hw->wake_disabled ||
 	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
 		return false;
+	/* T6050: an m1n1 stage 2 that received stage 1's live session says so in /chosen. */
+	if (priv->hw->keep_cc_fields)
+		return !ofnode_has_property(ofnode_path("/chosen"),
+					    "asahi,nvme-adopt");
 
 	return !nvme_readq(priv->nvmmu + ANS_NVMMU_BASE_ASQ) &&
 	       !readl(priv->base + ANS_MAX_PEND_CMDS_CTRL);
@@ -644,7 +675,10 @@ static int apple_nvme_wake(struct udevice *dev)
 	u32 phandle, stat;
 	int ret;
 
-	if (!apple_nvme_ans_running(priv)) {
+	/* T6050: start the coprocessor if iBoot left it stopped, as m1n1 does. */
+	if (priv->hw->keep_cc_fields)
+		setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	else if (!apple_nvme_ans_running(priv)) {
 		dev_err(dev, "ANS is not running (CPU_CTRL %#x, boot status %#x)\n",
 			readl(priv->asc + REG_CPU_CTRL),
 			readl(priv->base + ANS_BOOT_STATUS));
@@ -671,9 +705,9 @@ static int apple_nvme_wake(struct udevice *dev)
 	if (!priv->rtk)
 		return -ENOMEM;
 
-	printf("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
-	       dev->name, readl(&priv->ndev.bar->cc),
-	       readl(&priv->ndev.bar->csts));
+	debug("%s: starting the RTKit session of the ANS (CC %#x CSTS %#x)\n",
+	      dev->name, readl(&priv->ndev.bar->cc),
+	      readl(&priv->ndev.bar->csts));
 	ret = apple_rtkit_boot(priv->rtk);
 	if (ret < 0) {
 		printf("%s: ANS RTKit handshake failed (%d)\n", dev->name, ret);
@@ -788,9 +822,6 @@ static int apple_nvme_boot(struct udevice *dev)
 	writel(((ANS_MAX_QUEUE_DEPTH << 16) | ANS_MAX_QUEUE_DEPTH),
 	       priv->base + ANS_MAX_PEND_CMDS_CTRL);
 
-	writel(readl(priv->base + ANS_UNKNOWN_CTRL) & ~ANS_PRP_NULL_CHECK,
-	       priv->base + ANS_UNKNOWN_CTRL);
-
 	writel((ANS_NVMMU_TCB_SIZE / ANS_NVMMU_TCB_PITCH) - 1,
 	       priv->nvmmu + ANS_NVMMU_NUM);
 	writel(0, priv->base + ANS_MODESEL);
@@ -850,6 +881,10 @@ static int apple_nvme_probe(struct udevice *dev)
 
 	strcpy(priv->ndev.vendor, "Apple");
 	priv->ndev.max_ns_id = priv->hw->max_ns_id;
+	if (priv->hw->keep_cc_fields) {
+		priv->ndev.keep_cc_fields = true;
+		priv->ndev.aq_depth = ANS_MAX_QUEUE_DEPTH;
+	}
 
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
@@ -883,9 +918,9 @@ static int apple_nvme_remove(struct udevice *dev)
 			printf("%s: could not delete the I/O queues\n", dev->name);
 		nvme_writeq(0, priv->base + ANS_IOSQ_BASE);
 		nvme_writeq(0, priv->base + ANS_IOCQ_BASE);
-		printf("%s: handing over the live ANS session (CC %#x CSTS %#x)\n",
-		       dev->name, readl(&priv->ndev.bar->cc),
-		       readl(&priv->ndev.bar->csts));
+		debug("%s: handing over the live ANS session (CC %#x CSTS %#x)\n",
+		      dev->name, readl(&priv->ndev.bar->cc),
+		      readl(&priv->ndev.bar->csts));
 		return 0;
 	}
 
@@ -918,6 +953,8 @@ static const struct nvme_ops apple_nvme_ops = {
 };
 
 static const struct udevice_id apple_nvme_ids[] = {
+	{ .compatible = "apple,t6050-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t6050_hw },
 	{ .compatible = "apple,t6041-nvme-ans2",
 	  .data = (ulong)&apple_nvme_t6040_hw },
 	{ .compatible = "apple,t8103-nvme-ans2",

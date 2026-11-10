@@ -240,7 +240,8 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 	case DCHID_EVENT_READY:
 		if (len >= 2 && p[1] == priv->kbd_iface && !priv->ready) {
 			priv->ready = true;
-			printf("mtpkbd: keyboard ready\n");
+			apple_rtkit_helper_input_ready(priv->helper);
+			debug("mtpkbd: keyboard ready\n");
 		}
 		break;
 	}
@@ -415,8 +416,9 @@ static int get_rtkit_helper(struct udevice *dev)
 		return ret;
 
 	of_mtp = ofnode_get_by_phandle(phandle);
-	if (of_machine_is_compatible("apple,j713")) {
-		/* Never retry an unprepared or failed J713 coprocessor boot. */
+	if (of_machine_is_compatible("apple,j713") ||
+	    of_machine_is_compatible("apple,j614s")) {
+		/* Never retry an unprepared or failed retained coprocessor boot. */
 		ret = uclass_find_device_by_ofnode(UCLASS_MISC, of_mtp, &priv->helper);
 		if (ret)
 			return ret;
@@ -440,12 +442,16 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * J813 cannot restart MTP after U-Boot shuts it down. J713 retains its
+	 * J813 and J604 cannot restart MTP after U-Boot shuts it down, and Linux
+	 * wakes the T6050 MTP from the state iBoot left it in. J713 retains its
 	 * running helper and replays discovery packets to Linux at OS handoff.
 	 */
-	if (of_machine_is_compatible("apple,j813"))
+	if (of_machine_is_compatible("apple,j813") ||
+	    of_machine_is_compatible("apple,j604") ||
+	    of_machine_is_compatible("apple,t6050"))
 		return -ENODEV;
-	priv->j713 = of_machine_is_compatible("apple,j713");
+	priv->j713 = of_machine_is_compatible("apple,j713") ||
+		     of_machine_is_compatible("apple,j614s");
 	if (priv->j713) {
 		ret = get_rtkit_helper(dev);
 		if (ret)
@@ -513,7 +519,9 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 * Preserve every INIT packet for Linux, including STM and trackpad.
 	 */
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
-			 of_machine_is_compatible("apple,j713");
+			 of_machine_is_compatible("apple,j713") ||
+			 of_machine_is_compatible("apple,j614s") ||
+			 of_machine_is_compatible("apple,j613");
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {
@@ -613,7 +621,7 @@ static int apple_mtp_kbd_handoff(struct udevice *dev)
 		ret = apple_mtp_kbd_replay_j713(priv);
 		if (ret)
 			return ret;
-		printf("mtpkbd: replayed %u startup bytes for Linux\n", priv->init_size);
+		debug("mtpkbd: replayed %u startup bytes for Linux\n", priv->init_size);
 	} else if (priv->announce) {
 		/* T8140 aborts byte writes to DATA_TX8. */
 		for (i = 0; i < priv->init_size; i += sizeof(u32))
@@ -638,7 +646,7 @@ static int apple_mtp_kbd_remove(struct udevice *dev)
 	/* EFI and booti discard device-remove errors. A published session
 	 * must not enter Linux with missing or interleaved startup packets. */
 	if (ret && priv->j713)
-		panic("J713: refusing OS entry after MTP handoff error %d", ret);
+		panic("MTP: refusing OS entry after handoff error %d", ret);
 	return ret;
 }
 

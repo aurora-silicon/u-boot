@@ -96,7 +96,7 @@ static int j713_map_node(void *dst, const void *src, int sn)
 	static const char * const aliases[] = {
 		"gpu", "dcp", "disp0", "disp0_piodma", "ans", "ans-mbox",
 		"sart-ans", "spmi-primary", "pmu-primary", "pmp", "wifi0",
-		"keyboard", "bluetooth0", "atcphy0", "atcphy1",
+		"keyboard", "bluetooth0", "atcphy0", "atcphy1", "dcpext0", "dcpext1",
 	};
 	char path[J713_FDT_PATH];
 	unsigned int i;
@@ -233,6 +233,45 @@ static bool j713_omitted_aop(const void *dst, const void *src, int sn)
 	       j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
 }
 
+/* An OS tree without an external DCP owns none of the reservations m1n1 made
+ * for it, whatever that node in the control tree looks like.
+ */
+static bool j713_omitted_dcpext(const void *dst, const void *src, int sn)
+{
+	bool dcpext = !fdt_node_check_compatible(src, sn, "apple,t8132-dcpext") ||
+		      j713_alias_node(src, "dcpext0") == sn ||
+		      j713_alias_node(src, "dcpext1") == sn;
+
+	return dcpext && j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
+}
+
+/* aura fills the ISP firmware placeholders from this boot's ADT or leaves them
+ * empty, and the ISP heap is an IOVA window without memory of its own. The OS
+ * tree describes all three itself.
+ */
+static bool j713_isp_placeholder(const void *src, int node)
+{
+	const char *name = fdt_get_name(src, node, NULL);
+	const fdt64_t *reg;
+	int len;
+
+	if (!strcmp(name, "isp-heap"))
+		return !fdt_getprop(src, node, "reg", NULL);
+	if (strcmp(name, "isp-firmware-text") && strcmp(name, "isp-firmware-data"))
+		return false;
+	reg = fdt_getprop(src, node, "reg", &len);
+	return !reg || (len == 16 && !fdt64_to_cpu(reg[0]) && !fdt64_to_cpu(reg[1]));
+}
+
+/* An OS tree without the ISP owns none of the firmware reservations aura made
+ * for it.
+ */
+static bool j713_omitted_isp(const void *dst, const void *src, int sn)
+{
+	return !fdt_node_check_compatible(src, sn, "apple,t8132-isp") &&
+	       j713_map_node((void *)dst, src, sn) == -FDT_ERR_NOTFOUND;
+}
+
 static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 {
 	const fdt32_t *value;
@@ -271,7 +310,8 @@ static int j713_iommu_addresses(void *dst, const void *src, const char *path)
 			break;
 		}
 		cells = 1 + na + ns;
-		if (!j713_omitted_display(dst, src, owner) && !j713_omitted_aop(dst, src, owner)) {
+		if (!j713_omitted_display(dst, src, owner) && !j713_omitted_aop(dst, src, owner) &&
+		    !j713_omitted_dcpext(dst, src, owner) && !j713_omitted_isp(dst, src, owner)) {
 			int target = j713_map_node(dst, src, owner);
 			int parent = target < 0 ? target : fdt_parent_offset(dst, target);
 
@@ -376,7 +416,8 @@ static int j713_reservations(void *dst, const void *src)
 		int po, dn, len;
 
 		/* The live U-Boot helper republishes its own current session below. */
-		if (!strncmp(name, "mtp-rtkit@", 10) || j713_zero_gpu_placeholder(src, sn))
+		if (!strncmp(name, "mtp-rtkit@", 10) || j713_zero_gpu_placeholder(src, sn) ||
+		    j713_isp_placeholder(src, sn))
 			continue;
 		reg = fdt_getprop(src, sn, "reg", &len);
 		if (!reg || len != 16 || !fdt64_to_cpu(reg[1]) ||
@@ -411,7 +452,8 @@ static int j713_reservations(void *dst, const void *src)
 		char path[J713_FDT_PATH];
 		const char *name = fdt_get_name(src, sn, NULL);
 
-		if (!strncmp(name, "mtp-rtkit@", 10) || j713_zero_gpu_placeholder(src, sn))
+		if (!strncmp(name, "mtp-rtkit@", 10) || j713_zero_gpu_placeholder(src, sn) ||
+		    j713_isp_placeholder(src, sn))
 			continue;
 		if (fdt_get_path(src, sn, path, sizeof(path)))
 			return -EINVAL;
@@ -804,6 +846,56 @@ static bool j713_enabled(const void *fdt, int node)
 	return !status || !strcmp(status, "okay") || !strcmp(status, "ok");
 }
 
+/* m1n1 marks an external DCP it handed over (the opt-in
+ * chosen.asahi,j713-dcpext=1) with its firmware identity and reservations.
+ * Carry them to the same external DCP in the OS tree. Without the marker the
+ * OS tree keeps no marker either, and its kernel leaves the controller alone.
+ */
+static int j713_dcpext(void *dst, const void *src)
+{
+	static const char * const aliases[] = { "dcpext0", "dcpext1" };
+	static const char marker[] = "apple,t8132-dcpext-firmware-ready";
+	static const char compatible[] = "apple,t8132-dcpext";
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(aliases); i++) {
+		const fdt32_t *ready;
+		int dn = j713_alias_node(dst, aliases[i]);
+		int sn = j713_alias_node(src, aliases[i]);
+		int len;
+
+		if (dn == -FDT_ERR_NOTFOUND)
+			continue;
+		if (dn < 0 || fdt_node_check_compatible(dst, dn, compatible))
+			return -EINVAL;
+		ret = fdt_delprop(dst, dn, marker);
+		if (ret && ret != -FDT_ERR_NOTFOUND)
+			return ret;
+		if (sn == -FDT_ERR_NOTFOUND)
+			continue;
+		ready = sn < 0 ? NULL : fdt_getprop(src, sn, marker, &len);
+		if (!ready)
+			continue;
+		/* An optional display never costs the boot: leave it to the OS, unmarked. */
+		if (fdt_node_check_compatible(src, sn, compatible) || len != 4 ||
+		    fdt32_to_cpu(*ready) != 1)
+			continue;
+		ret = j713_copy_string(dst, dn, src, sn, "apple,firmware-uuid", 37, true);
+		ret = ret ?: j713_copy_prop(dst, dn, src, sn, "apple,firmware-version", 12);
+		ret = ret ?: j713_copy_prop(dst, dn, src, sn, "apple,firmware-compat", 12);
+		ret = ret ?: j713_phandles(dst, src, sn, "memory-region", -1);
+		if (!ret) {
+			/* The marker goes last, once everything it promises is in place. */
+			dn = j713_alias_node(dst, aliases[i]);
+			ret = fdt_setprop_u32(dst, dn, marker, 1);
+		}
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /* m1n1 programs the AOP DART's DAPF and reserves the AOP's firmware segments
  * and DAPF windows for this boot, or disables the AOP. Reference those
  * reservations from the OS tree's AOP, or disable it there too. An OS tree
@@ -826,6 +918,104 @@ static int j713_aop(void *dst, const void *src)
 	    j713_map_node(dst, src, sn) != dn)
 		return fdt_setprop_string(dst, dn, "status", "disabled");
 	return j713_phandles(dst, src, sn, "memory-region", -1);
+}
+
+/* m1n1 copies each speaker amp's configuration from the ADT onto the amp's
+ * node; without it the kernel keeps the speakers off. Copy it onto the OS
+ * tree's amps. An amp the OS tree doesn't have is skipped, and an amp with
+ * none of it (an older m1n1) is left as it is.
+ */
+static int j713_speaker_amps(void *dst, const void *src)
+{
+	static const struct {
+		const char *name;
+		int size;
+	} props[] = {
+		{ "apple,speaker-config", 4 }, { "apple,amp-tx-zd-config", 8 },
+		{ "apple,bop-config", -1 }, { "apple,amp-dcblocker-config", -1 },
+	};
+	static const char compatible[] = "ti,sn012776";
+	unsigned int i;
+	int sn, dn, ret;
+
+	for (sn = fdt_node_offset_by_compatible(src, -1, compatible); sn >= 0;
+	     sn = fdt_node_offset_by_compatible(src, sn, compatible)) {
+		dn = j713_map_node(dst, src, sn);
+		if (dn == -FDT_ERR_NOTFOUND)
+			continue;
+		if (dn < 0 || fdt_node_check_compatible(dst, dn, compatible))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(props); i++) {
+			ret = j713_copy_optional(dst, dn, src, sn, props[i].name,
+						 props[i].size);
+			if (ret)
+				return ret;
+		}
+	}
+	return sn == -FDT_ERR_NOTFOUND ? 0 : -EINVAL;
+}
+
+/* aura reserves this boot's ISP firmware in the control tree's
+ * isp-firmware-text and isp-firmware-data, sets the platform ID and enables
+ * the ISP and its DARTs, or leaves them disabled. The reservations were
+ * carried over to the OS tree's placeholders of the same names, which its ISP
+ * already refers to. Carry the platform ID over and enable the ISP and its
+ * DARTs there too. An OS tree whose ISP is enabled reserves its own firmware
+ * and is left as it is.
+ */
+static int j713_isp(void *dst, const void *src)
+{
+	static const char compatible[] = "apple,t8132-isp";
+	static const char * const regions[] = {
+		"/reserved-memory/isp-firmware-text", "/reserved-memory/isp-firmware-data",
+	};
+	const fdt32_t *id, *iommus, *map;
+	unsigned int i, count;
+	int dn, sn, len, ret;
+	u32 phandle;
+
+	dn = fdt_node_offset_by_compatible(dst, -1, compatible);
+	if (dn < 0)
+		return dn == -FDT_ERR_NOTFOUND ? 0 : -EINVAL;
+	if (j713_enabled(dst, dn))
+		return 0;
+	phandle = fdt_get_phandle(dst, dn);
+	sn = fdt_node_offset_by_compatible(src, -1, compatible);
+	if (sn < 0)
+		return sn == -FDT_ERR_NOTFOUND ? 0 : -EINVAL;
+	/* An optional camera never costs the boot: without a complete handoff it stays off. */
+	id = fdt_getprop(src, sn, "apple,platform-id", &len);
+	if (!j713_enabled(src, sn) || !id || len != 4 || !fdt32_to_cpu(*id) || !phandle ||
+	    j713_map_node(dst, src, sn) != dn)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(regions); i++) {
+		int n = fdt_path_offset(dst, regions[i]);
+		const fdt64_t *reg = n < 0 ? NULL : fdt_getprop(dst, n, "reg", &len);
+
+		if (!reg || len != 16 || !fdt64_to_cpu(reg[1]) || !j713_enabled(dst, n))
+			return 0;
+		map = fdt_getprop(dst, n, "iommu-addresses", &len);
+		if (!map || len != 20 || fdt32_to_cpu(map[0]) != phandle)
+			return 0;
+	}
+	iommus = fdt_getprop(dst, dn, "iommus", &len);
+	if (!iommus || len <= 0 || len % 8)
+		return -EINVAL;
+	count = len / 8;
+	ret = fdt_setprop_u32(dst, dn, "apple,platform-id", fdt32_to_cpu(*id));
+	for (i = 0; !ret && i < count; i++) {
+		int dart;
+
+		dn = fdt_node_offset_by_phandle(dst, phandle);
+		iommus = fdt_getprop(dst, dn, "iommus", &len);
+		dart = fdt_node_offset_by_phandle(dst, fdt32_to_cpu(iommus[2 * i]));
+		ret = dart < 0 ? -EINVAL : fdt_setprop_string(dst, dart, "status", "okay");
+	}
+	if (ret)
+		return ret;
+	/* The ISP goes last, once everything it needs is in place. */
+	dn = fdt_node_offset_by_phandle(dst, phandle);
+	return fdt_setprop_string(dst, dn, "status", "okay");
 }
 
 static int j713_chosen(void *dst, const void *src)
@@ -988,6 +1178,9 @@ int apple_j713_import_fdt(void *blob, const void *source)
 	ret = ret ?: j713_pcie_admission(scratch, source);
 	ret = ret ?: j713_display_refs(scratch, source);
 	ret = ret ?: j713_aop(scratch, source);
+	ret = ret ?: j713_speaker_amps(scratch, source);
+	ret = ret ?: j713_dcpext(scratch, source);
+	ret = ret ?: j713_isp(scratch, source);
 	ret = ret ?: j713_chosen(scratch, source);
 	if (!ret) {
 		/* All helper paths must resolve before its real hardware fixup runs. */

@@ -10,7 +10,8 @@ from pathlib import Path
 import subprocess
 
 
-def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False):
+def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False,
+                 dcpext=False, amps=False, isp=False):
     shift = 0 if runtime else 1000
     aliases = {
         'ans': '/soc/nvme', 'ans-mbox': '/soc/mailbox', 'sart-ans': '/soc/sart',
@@ -25,6 +26,8 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
                        atcphy1='/soc/phy1')
     if sep:
         aliases.update(sep='/soc/sep')
+    if dcpext:
+        aliases.update(dcpext0='/soc/dcp@286e00000')
     strings = ['asahi,iboot1-version', 'asahi,iboot2-version', 'asahi,system-fw-version',
                'asahi,os-fw-version', 'asahi,m1n1-stage1-version',
                'asahi,m1n1-stage2-version', 'asahi,efi-system-partition',
@@ -55,6 +58,43 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
                      'asc-mmio@388020000 { phandle = <311>; reg = <3 0x88020000 0 0x8000>;'
                      'compatible = "apple,asc-mmio"; no-map;'
                      'iommu-addresses = <50 3 0x88020000 0 0x8000>; };')
+    if runtime and dcpext:
+        reserved += ('asc-firmware@903e14000 { phandle = <320>; reg = <9 0x3e14000 0 0x4000>;'
+                     'compatible = "apple,asc-mem"; no-map;'
+                     'iommu-addresses = <60 0x100 0x63d4000 0 0x4000>; };')
+    if isp:
+        # aura fills the control tree's placeholders; the OS tree has its own.
+        if runtime:
+            reserved += ('isp-firmware-text { phandle = <330>; reg = <0x100 0xd30000 0 0xca4000>;'
+                         'no-map; status = "okay"; iommu-addresses = <70 0x100 0 0 0xca4000>; };'
+                         'isp-firmware-data { phandle = <331>; reg = <0x100 0x1f40000 0 0x748000>;'
+                         'no-map; status = "okay";'
+                         'iommu-addresses = <70 0x100 0xca4000 0 0x748000>; };')
+        else:
+            reserved += ('isp-firmware-text { phandle = <1330>; };'
+                         'isp-firmware-data { phandle = <1331>; };')
+        reserved += (f'isp-heap {{ phandle = <{332 + shift}>;'
+                     f'iommu-addresses = <{70 + shift} 0x100 0 0 0x1400000>; }};')
+    isp_nodes = ''
+    if isp:
+        status = 'status = "okay";' if runtime else 'status = "disabled";'
+        isp_nodes = (f'isp@48c000000 {{ compatible = "apple,t8132-isp", "apple,isp";'
+                     f'phandle = <{70 + shift}>;'
+                     f'memory-region = <{330 + shift} {331 + shift} {332 + shift}>;'
+                     'memory-region-names = "text", "data", "heap";'
+                     f'iommus = <{71 + shift} 0>, <{72 + shift} 0>, <{73 + shift} 0>;'
+                     + ('apple,platform-id = <0x17>;' if runtime else '') + status + '};')
+        for n in range(3):
+            isp_nodes += (f'iommu@48e8{0xc + 2 * n:x}0000 {{ phandle = <{71 + n + shift}>;'
+                          f'#iommu-cells = <1>; {status} }};')
+    dcpext_node = ''
+    if dcpext:
+        handoff = ('memory-region = <320>; apple,firmware-version = <26 6 2>;'
+                   'apple,firmware-compat = <26 6 2>;'
+                   'apple,firmware-uuid = "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E";'
+                   'apple,t8132-dcpext-firmware-ready = <1>;' if runtime else '')
+        dcpext_node = (f'dcp@286e00000 {{ compatible = "apple,t8132-dcpext";'
+                       f'phandle = <{60 if runtime else 1060}>; {handoff} status = "disabled"; }};')
     aop_node = ''
     if aop:
         aop_node = (f'aop@390600000 {{ compatible = "apple,t8132-aop"; phandle = <{50 if runtime else 1050}>;'
@@ -87,6 +127,14 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
                      if runtime else
                      'local-policy-manifest = [de ad]; iboot-manifest = [be ef];')
         sep_node = f'sep {{ compatible = "apple,sep"; {manifests} status = "disabled"; }};'
+    amp_nodes = ''
+    if amps:
+        config = ('apple,speaker-config = [00 15 00 02]; apple,amp-tx-zd-config = [00 00 01 00 02 00 03 00];'
+                  'apple,bop-config = [05 02 01 00 0a 0b]; apple,amp-dcblocker-config = [01];'
+                  if runtime else '')
+        amp_nodes = ('i2c@3ad01c000 { #address-cells = <1>; #size-cells = <0>;'
+                     + ''.join(f'codec@{a:x} {{ compatible = "ti,sn012776", "ti,tas2764"; reg = <{a:#x}>; {config} }};'
+                               for a in (0x38, 0x39)) + ' };')
     peripheral_nodes = ''
     if peripherals:
         bt = ('local-bd-address = [01 02 03 04 05 06];'
@@ -141,6 +189,9 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
         {peripheral_nodes}
         {aop_node}
         {sep_node}
+        {dcpext_node}
+        {amp_nodes}
+        {isp_nodes}
       }};
     }};'''
 
@@ -343,6 +394,49 @@ int main(int argc, char **argv)
    int node = fdt_path_offset(source, "sep");
    assert(!fdt_delprop(source, node, fault == 40 ? "local-policy-manifest" : "iboot-manifest"));
   }
+  if (fault >= 44 && fault <= 47) {
+   const char *marker = "apple,t8132-dcpext-firmware-ready";
+   int node = fdt_path_offset(source, "dcpext0");
+   assert(node >= 0);
+   /* m1n1 did not hand it over; and with a stale marker in the OS tree. */
+   if (fault == 44 || fault == 45) assert(!fdt_delprop(source, node, marker));
+   if (fault == 45) assert(!fdt_setprop_u32(target, fdt_path_offset(target, "dcpext0"), marker, 1));
+   if (fault == 46) assert(!fdt_setprop_u32(source, node, marker, 2));
+   if (fault == 47) assert(!fdt_setprop_string(source, node, "compatible", "apple,other"));
+  }
+  if (fault == 48) {
+   const char *names[] = {"isp-firmware-text", "isp-firmware-data"};
+   const char *props[] = {"reg", "no-map", "status", "iommu-addresses"};
+   for (unsigned i = 0; i < 2; i++) {
+    /* aura refused: the placeholder is empty, as in the OS tree, or zero. */
+    int n = fdt_subnode_offset(source, fdt_path_offset(source, "/reserved-memory"), names[i]);
+    assert(n >= 0);
+    for (unsigned p = 0; p < 4; p++) assert(!fdt_delprop(source, n, props[p]));
+    if (i) {
+     fdt64_t zero[2] = {0};
+     assert(!fdt_setprop(source, n, "reg", zero, sizeof(zero)));
+    }
+   }
+   int n = fdt_node_offset_by_compatible(source, -1, "apple,t8132-isp");
+   assert(!fdt_delprop(source, n, "apple,platform-id"));
+   assert(!fdt_setprop_string(source, n, "status", "disabled"));
+  }
+  if (fault == 49) {
+   int n = fdt_node_offset_by_compatible(target, -1, "apple,t8132-isp");
+   assert(!fdt_setprop_string(target, n, "status", "okay"));
+  }
+  if (fault == 50) {
+   int n = fdt_node_offset_by_compatible(source, -1, "apple,t8132-isp");
+   assert(!fdt_setprop_u64(source, n, "apple,platform-id", 0x17));
+  }
+  if (fault >= 60 && fault <= 62) {
+   int node = fdt_path_offset(fault == 62 ? target : source, "/soc/i2c@3ad01c000/codec@38");
+   assert(node >= 0);
+   /* An older m1n1 without the level; a malformed level; an OS node that is not the amp. */
+   if (fault == 60) assert(!fdt_delprop(source, node, "apple,speaker-config"));
+   if (fault == 61) assert(!fdt_setprop(source, node, "apple,speaker-config", "\x15", 1));
+   if (fault == 62) assert(!fdt_setprop_string(target, node, "compatible", "apple,other"));
+  }
   if (fault == 41 || fault == 42) {
    void *tree = fault == 41 ? target : source;
    assert(!fdt_setprop_string(tree, fdt_path_offset(tree, "sep"), "compatible", "apple,other"));
@@ -360,7 +454,7 @@ int main(int argc, char **argv)
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
-  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43 && fault != 44 && fault != 45 && fault != 46 && fault != 47 && fault != 48 && fault != 49 && fault != 50 && fault != 51 && fault != 60) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -398,6 +492,68 @@ int main(int argc, char **argv)
     }
    }
   }
+  int isp = fdt_node_offset_by_compatible(target, -1, "apple,t8132-isp");
+  if (isp >= 0) {
+   const char *names[] = {"isp-firmware-text", "isp-firmware-data"};
+   const u64 phys[] = {0x10000d30000ULL, 0x10001f40000ULL}, sizes[] = {0xca4000, 0x748000};
+   const char *status = fdt_getprop(target, isp, "status", NULL);
+   const fdt32_t *id = fdt_getprop(target, isp, "apple,platform-id", &len);
+   u32 phandle = fdt_get_phandle(target, isp);
+   bool handed = fault != 48 && fault != 49 && fault != 50 && fault != 51;
+   if (fault == 49) assert(status && !strcmp(status, "okay") && !id);
+   else if (!handed) assert(status && !strcmp(status, "disabled") && !id);
+   else assert(status && !strcmp(status, "okay") && id && len == 4 && fdt32_to_cpu(*id) == 0x17);
+   for (unsigned i = 0; i < 3; i++) {
+    const fdt32_t *iommus = fdt_getprop(target, isp, "iommus", &len);
+    int dart = fdt_node_offset_by_phandle(target, fdt32_to_cpu(iommus[2 * i]));
+    const char *ds = fdt_getprop(target, dart, "status", NULL);
+    assert(ds && !strcmp(ds, handed ? "okay" : "disabled"));
+   }
+   for (unsigned i = 0; i < 2; i++) {
+    int n = fdt_subnode_offset(target, fdt_path_offset(target, "/reserved-memory"), names[i]), ilen;
+    const fdt64_t *reg = fdt_getprop(target, n, "reg", &len);
+    const fdt32_t *tuple = fdt_getprop(target, n, "iommu-addresses", &ilen);
+    if (fault == 48 || fault == 51) {
+     /* Not handed over: the OS tree's placeholders stay empty. */
+     assert(!reg && !tuple);
+    } else {
+     assert(reg && len == 16);
+     assert(fdt64_to_cpu(reg[0]) == phys[i] && fdt64_to_cpu(reg[1]) == sizes[i]);
+     assert(tuple && ilen == 20 && fdt32_to_cpu(tuple[0]) == phandle);
+    }
+   }
+   /* The OS tree's own heap window is kept. */
+   int heap = fdt_subnode_offset(target, fdt_path_offset(target, "/reserved-memory"), "isp-heap");
+   const fdt32_t *window = fdt_getprop(target, heap, "iommu-addresses", &len);
+   assert(window && len == 20 && fdt32_to_cpu(window[0]) == phandle &&
+          !fdt_getprop(target, heap, "reg", NULL));
+  }
+  int ext = fdt_path_offset(target, "dcpext0");
+  if (ext >= 0) {
+   const fdt32_t *ready = fdt_getprop(target, ext, "apple,t8132-dcpext-firmware-ready", &len);
+   if (fault >= 44 && fault <= 47) {
+    assert(!ready);
+   } else {
+    /* m1n1's identity and reservation, owned by the OS tree's dcpext0. */
+    const char *uuid = fdt_getprop(target, ext, "apple,firmware-uuid", &len);
+    assert(uuid && len == 37);
+    assert(fdt_getprop(target, ext, "apple,firmware-version", &len) && len == 12);
+    ready = fdt_getprop(target, ext, "apple,t8132-dcpext-firmware-ready", &len);
+    assert(ready && len == 4 && fdt32_to_cpu(*ready) == 1);
+    const fdt32_t *region = fdt_getprop(target, ext, "memory-region", &len);
+    u32 phandle = fdt_get_phandle(target, ext);
+    assert(region && len == 4 && phandle);
+    int n = fdt_node_offset_by_phandle(target, fdt32_to_cpu(region[0])), ilen;
+    assert(n >= 0 && !strcmp(fdt_get_name(target, n, NULL), "asc-firmware@903e14000"));
+    const fdt32_t *tuple = fdt_getprop(target, n, "iommu-addresses", &ilen);
+    assert(tuple && ilen == 20 && fdt32_to_cpu(tuple[0]) == phandle);
+   }
+  } else {
+   /* An OS tree without dcpext0 does not own its reservation. */
+   int n = fdt_subnode_offset(target, fdt_path_offset(target, "/reserved-memory"),
+                              "asc-firmware@903e14000");
+   if (n >= 0) assert(!fdt_getprop(target, n, "iommu-addresses", NULL));
+  }
   int sep = fdt_path_offset(target, "sep");
   if (sep >= 0) {
    const char *names[] = {"local-policy-manifest", "iboot-manifest"};
@@ -406,6 +562,20 @@ int main(int argc, char **argv)
     int expected_len;
     const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
     const void *actual = fdt_getprop(target, sep, names[i], &len);
+    if (!expected) assert(!actual);
+    else assert(actual && len == expected_len && !memcmp(expected, actual, len));
+   }
+  }
+  for (int amp = fdt_node_offset_by_compatible(target, -1, "ti,sn012776"); amp >= 0;
+       amp = fdt_node_offset_by_compatible(target, amp, "ti,sn012776")) {
+   const char *names[] = {"apple,speaker-config", "apple,amp-tx-zd-config",
+                          "apple,bop-config", "apple,amp-dcblocker-config"};
+   char path[256]; assert(!fdt_get_path(target, amp, path, sizeof(path)));
+   int sn = fdt_path_offset(source, path);
+   for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    int expected_len;
+    const void *expected = sn >= 0 ? fdt_getprop(source, sn, names[i], &expected_len) : NULL;
+    const void *actual = fdt_getprop(target, amp, names[i], &len);
     if (!expected) assert(!actual);
     else assert(actual && len == expected_len && !memcmp(expected, actual, len));
    }
@@ -599,3 +769,51 @@ def test_j713_private_captures(tmp_path):
     binary = build_importer(tmp_path)
     for target in targets.split(':'):
         subprocess.run([str(binary), source, target, '0'], check=True)
+
+
+def test_j713_dcpext_handoff(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, dcpext=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, dcpext=True))
+    # Handed over, not handed over, a stale OS marker, and a malformed marker
+    # (ignored: the OS tree is left unmarked), and a control-tree node that is not
+    # a dcpext (ignored as well).
+    for fault in [0, 44, 45, 46, 47]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without the external DCPs imports a control tree with them,
+    # also when that control-tree node is not a dcpext.
+    plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
+    for fault in [0, 47]:
+        subprocess.run([str(binary), str(source), str(plain), str(fault)], check=True)
+
+
+def test_j713_speaker_amps(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, amps=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, amps=True))
+    # Handed over; an amp without its level (left as it is); a malformed level
+    # and an OS node at the amp's path that is not the amp (both refused).
+    for fault in [0, 60, 61, 62]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without the amps, and a control tree without them, import as before.
+    plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
+    older = compile_tree(tmp_path, 'older', fixture_tree(True))
+    subprocess.run([str(binary), str(source), str(plain), '0'], check=True)
+    subprocess.run([str(binary), str(older), str(target), '0'], check=True)
+
+
+def test_j713_isp_handoff(tmp_path):
+    binary = build_importer(tmp_path)
+    source = compile_tree(tmp_path, 'runtime', fixture_tree(True, isp=True))
+    target = compile_tree(tmp_path, 'os', fixture_tree(False, isp=True))
+    # Handed over, refused by aura (empty or zero placeholders, which must not
+    # refuse the import), an OS tree that reserves its own firmware, and a malformed
+    # platform ID (the camera stays off).
+    for fault in [0, 48, 49, 50]:
+        subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
+    # An OS tree without the ISP imports a control tree with one, and an OS
+    # tree with the ISP imports a control tree without one.
+    plain = compile_tree(tmp_path, 'plain', fixture_tree(False))
+    older = compile_tree(tmp_path, 'older', fixture_tree(True))
+    subprocess.run([str(binary), str(source), str(plain), '0'], check=True)
+    subprocess.run([str(binary), str(older), str(target), '51'], check=True)

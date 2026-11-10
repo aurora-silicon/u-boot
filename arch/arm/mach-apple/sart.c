@@ -39,6 +39,16 @@
 #define APPLE_SART3_SIZE_SHIFT 12
 #define APPLE_SART3_SIZE_MAX   GENMASK(29, 0)
 
+/* SARTv4 registers (T6050) */
+#define APPLE_SART4_CONFIG(idx) (0x00 + 4 * (idx))
+
+#define APPLE_SART4_PADDR(idx)  (0x60 + 4 * (idx))
+#define APPLE_SART4_PADDR_SHIFT 12
+
+#define APPLE_SART4_SIZE(idx)  (0xc0 + 4 * (idx))
+#define APPLE_SART4_SIZE_SHIFT 12
+#define APPLE_SART4_SIZE_MAX   GENMASK(29, 0)
+
 struct apple_sart {
 	uintptr_t base;
 	u32 protected_entries;
@@ -117,6 +127,38 @@ static bool sart3_set_entry(struct apple_sart *sart, int index, u8 flags, void *
 	return true;
 }
 
+static void sart4_get_entry(struct apple_sart *sart, int index, u8 *flags, void **paddr,
+			    size_t *size)
+{
+	*flags = readl(sart->base + APPLE_SART4_CONFIG(index));
+	*size = (size_t)readl(sart->base + APPLE_SART4_SIZE(index)) << APPLE_SART4_SIZE_SHIFT;
+	*paddr = (void *)
+		((u64)readl(sart->base + APPLE_SART4_PADDR(index)) << APPLE_SART4_PADDR_SHIFT);
+}
+
+static bool sart4_set_entry(struct apple_sart *sart, int index, u8 flags, void *paddr_,
+			    size_t size)
+{
+	u64 paddr = (u64)paddr_;
+
+	if (size & ((1 << APPLE_SART4_SIZE_SHIFT) - 1))
+		return false;
+	if (paddr & ((1 << APPLE_SART4_PADDR_SHIFT) - 1))
+		return false;
+
+	paddr >>= APPLE_SART4_PADDR_SHIFT;
+	size >>= APPLE_SART4_SIZE_SHIFT;
+
+	if (size > APPLE_SART4_SIZE_MAX)
+		return false;
+
+	writel(paddr, sart->base + APPLE_SART4_PADDR(index));
+	writel(size, sart->base + APPLE_SART4_SIZE(index));
+	writel(flags, sart->base + APPLE_SART4_CONFIG(index));
+
+	return true;
+}
+
 struct apple_sart *sart_init(ofnode node)
 {
 	phys_addr_t base;
@@ -127,7 +169,9 @@ struct apple_sart *sart_init(ofnode node)
 	if (base == FDT_ADDR_T_NONE)
 		return NULL;
 
-	if (ofnode_device_is_compatible(node, "apple,t8103-sart")) {
+	if (ofnode_device_is_compatible(node, "apple,t6050-sart")) {
+		sart_version = 4;
+	} else if (ofnode_device_is_compatible(node, "apple,t8103-sart")) {
 		sart_version = 2;
 	} else if (ofnode_device_is_compatible(node, "apple,t6000-sart")) {
 		sart_version = 3;
@@ -151,6 +195,10 @@ struct apple_sart *sart_init(ofnode node)
 	case 3:
 		sart->get_entry = sart3_get_entry;
 		sart->set_entry = sart3_set_entry;
+		break;
+	case 4:
+		sart->get_entry = sart4_get_entry;
+		sart->set_entry = sart4_set_entry;
 		break;
 	default:
 		printf("sart: SART has unknown version %d\n", sart_version);

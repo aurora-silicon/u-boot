@@ -226,9 +226,10 @@ static int sysinfo_plat_probe(struct udevice *dev)
 		}
 		smbios_cache_info_dump(&priv->t7[level]);
 	}
-	if (!level) /* no cache detected */
-		return -ENOSYS;
-
+	/*
+	 * Without caches the CPU can describe, the processor and the device
+	 * tree's description still apply; leave the levels to the device tree.
+	 */
 	priv->cache_level = level;
 
 	return 0;

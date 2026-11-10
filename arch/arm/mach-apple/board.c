@@ -16,7 +16,6 @@
 #include <time.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/stringify.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
@@ -940,7 +939,9 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 };
 
 /*
- * Apple M4 Pro (T6040; its blocks carry T6041 compatibles).  Every register
+ * Apple M4 Pro (T6040; its blocks carry T6041 compatibles), also used for the
+ * M5 Max (T6050), whose register blocks, APCIE ECAM and PCIe windows sit at
+ * the same addresses (its GPU above 0x23_0000_0000 is left unmapped).  Every register
  * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
  * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
  * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
@@ -1027,29 +1028,150 @@ int board_init(void)
 	return 0;
 }
 
+/*
+ * dram_init() and dram_init_banksize() run before relocation with the data
+ * cache off, where a walk of the flattened device tree is slow: about 60 ms
+ * on the J700, whose 128 KiB tree has the memory node near its end.
+ * ofnode_read_resource() walks the tree up to the node twice for every reg
+ * entry (parent lookup and address translation), which cost about 4 s for
+ * the twelve J700 DRAM ranges. Walk the tree once in dram_init() instead
+ * and keep the result for dram_init_banksize().
+ *
+ * The result is what fdtdec_setup_mem_size_base() and
+ * fdtdec_setup_memory_banksize() give: the same banks in the same order
+ * and the same errors. Before relocation the control tree is always flat.
+ *
+ * In .data because .bss is not usable before relocation.
+ */
+static struct {
+	int ret;	/* for dram_init_banksize() */
+	int ranges;	/* reg entries over all memory nodes */
+	int banks;
+	struct {
+		phys_addr_t start;
+		phys_size_t size;
+	} bank[CONFIG_NR_DRAM_BANKS];
+} apple_dram __section(".data");
+
+/*
+ * Entry @index of the reg property of @node, as ofnode_read_resource()
+ * returns it. For a child of the root that is a plain decode: the cell
+ * counts are the root's and the address translation is an identity.
+ * Anything else takes the generic path.
+ */
+static int apple_dram_entry(const void *fdt, int node, int depth, int index,
+			    phys_addr_t *start, phys_size_t *size)
+{
+	const fdt32_t *reg;
+	struct resource res;
+	int na, ns, len;
+
+	na = fdt_address_cells(fdt, 0);
+	ns = fdt_size_cells(fdt, 0);
+	if (depth != 1 || na < 1 || na > 2 || ns < 1 || ns > 2) {
+		if (ofnode_read_resource(offset_to_ofnode(node), index, &res))
+			return -EINVAL;
+		*start = res.start;
+		*size = res.end - res.start + 1;
+		return 0;
+	}
+
+	reg = fdt_getprop(fdt, node, "reg", &len);
+	if (!reg || index >= len / (int)sizeof(*reg) / (na + ns))
+		return -EINVAL;
+	reg += index * (na + ns);
+	*start = fdt_read_number(reg, na);
+	*size = fdt_read_number(reg + na, ns);
+
+	return 0;
+}
+
+static bool apple_dram_is_memory(const void *fdt, int node)
+{
+	const char *type;
+	int len;
+
+	type = fdt_getprop(fdt, node, "device_type", &len);
+
+	return type && len == sizeof("memory") &&
+	       !memcmp(type, "memory", sizeof("memory")) &&
+	       ofnode_is_enabled(offset_to_ofnode(node));
+}
+
+/* Matches what fdt_path_offset(fdt, "/memory") finds. */
+static bool apple_dram_is_path(const void *fdt, int node)
+{
+	const char *name = fdt_get_name(fdt, node, NULL);
+
+	return name && !strncmp(name, "memory", 6) &&
+	       (!name[6] || name[6] == '@');
+}
+
 int dram_init(void)
 {
-	return fdtdec_setup_mem_size_base();
+	const void *fdt = gd->fdt_blob;
+	phys_addr_t start;
+	phys_size_t size;
+	int node, depth = -1, path = -1, nodes = 0, i;
+	bool fill = true;
+
+	apple_dram.ret = -EINVAL;
+	apple_dram.ranges = 0;
+	apple_dram.banks = 0;
+
+	for (node = fdt_next_node(fdt, -1, &depth); node >= 0 && depth >= 0;
+	     node = fdt_next_node(fdt, node, &depth)) {
+		if (path < 0 && depth == 1 && apple_dram_is_path(fdt, node))
+			path = node;
+		if (!apple_dram_is_memory(fdt, node))
+			continue;
+
+		/* fdtdec_setup_memory_banksize() needs the first node only. */
+		if (!nodes++)
+			apple_dram.ret = 0;
+		for (i = 0; !apple_dram_entry(fdt, node, depth, i, &start, &size); i++) {
+			apple_dram.ranges++;
+			if (!fill || apple_dram.banks == CONFIG_NR_DRAM_BANKS)
+				continue;
+			apple_dram.bank[apple_dram.banks].start = start;
+			apple_dram.bank[apple_dram.banks].size = size;
+			apple_dram.banks++;
+		}
+		/* ... and stops at the first empty node after that one. */
+		if (!i && nodes > 1)
+			fill = false;
+	}
+
+	if (apple_dram.ranges > CONFIG_NR_DRAM_BANKS)
+		apple_dram.ret = -E2BIG;
+
+	if (path < 0 || apple_dram_entry(fdt, path, 1, 0, &start, &size)) {
+		debug("%s: no /memory range\n", __func__);
+		return -EINVAL;
+	}
+	gd->ram_base = (unsigned long)start;
+	gd->ram_size = size;
+
+	return 0;
 }
 
 int dram_init_banksize(void)
 {
-	ofnode mem = ofnode_null();
-	struct resource res;
-	int bank = 0, reg;
+	int bank;
 
-	/* fdtdec_setup_memory_banksize() stops silently at the array limit. */
-	while (ofnode_valid(mem = fdtdec_get_next_memory_node(mem))) {
-		for (reg = 0; !ofnode_read_resource(mem, reg, &res); reg++) {
-			if (++bank > CONFIG_NR_DRAM_BANKS) {
-				log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
-					bank, CONFIG_NR_DRAM_BANKS);
-				return -E2BIG;
-			}
-		}
+	/* fdtdec_setup_memory_banksize() would stop silently at the limit. */
+	if (apple_dram.ret == -E2BIG)
+		log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
+			apple_dram.ranges, CONFIG_NR_DRAM_BANKS);
+	if (apple_dram.ret)
+		return apple_dram.ret;
+
+	for (bank = 0; bank < apple_dram.banks; bank++) {
+		gd->bd->bi_dram[bank].start = apple_dram.bank[bank].start;
+		gd->bd->bi_dram[bank].size = apple_dram.bank[bank].size;
 	}
 
-	return fdtdec_setup_memory_banksize();
+	return 0;
 }
 
 extern long fw_dtb_pointer;
@@ -1092,7 +1214,9 @@ void build_mem_map(void)
 		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
-	else if (of_machine_is_compatible("apple,t6040"))
+	else if (of_machine_is_compatible("apple,t6040") ||
+		 of_machine_is_compatible("apple,t6041") ||
+		 of_machine_is_compatible("apple,t6050"))
 		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
@@ -1283,7 +1407,8 @@ static char *asahi_esp_devpart(void)
 		dev = dev_get_parent(nvme_blk->bdev);
 		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
 		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t6041-nvme-ans2"))
+		    !device_is_compatible(dev, "apple,t6041-nvme-ans2") &&
+		    !device_is_compatible(dev, "apple,t6050-nvme-ans2"))
 			continue;
 
 		memset(&scan, 0, sizeof(scan));
@@ -1325,7 +1450,7 @@ static char *asahi_esp_devpart(void)
 		case ASAHI_ESP_NAMED:
 			part = scan.named;
 			strlcpy(asahi_esp_uuid, named_uuid, sizeof(asahi_esp_uuid));
-			printf("ESP: named ESP %d %s; %d other ESP(s) have an EFI loader; using the named ESP\n",
+			debug("ESP: named ESP %d %s; %d other ESP(s) have an EFI loader; using the named ESP\n",
 			       scan.named, asahi_esp_state(&scan, uuid),
 			       scan.others);
 			break;
@@ -1333,14 +1458,14 @@ static char *asahi_esp_devpart(void)
 			part = scan.other;
 			strlcpy(asahi_esp_uuid, other_uuid, sizeof(asahi_esp_uuid));
 			asahi_esp_moved = true;
-			printf("ESP: named ESP %.36s %s; using ESP %d %s, the only other ESP with an EFI loader, and telling the OS\n",
+			debug("ESP: named ESP %.36s %s; using ESP %d %s, the only other ESP with an EFI loader, and telling the OS\n",
 			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
 			       scan.other, other_uuid);
 			break;
 		case ASAHI_ESP_FIRST:
 			part = scan.first;
 			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
-			printf("ESP: named ESP %.36s %s; %d ESP(s) have an EFI loader; using the first ESP %d\n",
+			debug("ESP: named ESP %.36s %s; %d ESP(s) have an EFI loader; using the first ESP %d\n",
 			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
 			       scan.others, scan.first);
 			break;
@@ -1377,7 +1502,8 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for J700 (T8140), J713 (T8132) and J616s (T6040).
+ * Aurora Silicon boot flow for J700 (T8140), J713 (T8132), J616s (T6040) and
+ * J714c (T6050).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
@@ -1392,7 +1518,7 @@ char *env_fat_get_dev_part(void)
  */
 static const char * const apple_efi_env[][2] = {
 	{ "aurora_boot",
-	  "echo AURORA_UBOOT_BOOT: EFI on internal ESP; run aurora_efi; "
+	  "run aurora_efi; "
 	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
 	  "echo AURORA_UBOOT_BOOT: bootflow; bootflow scan -b; "
 	  "echo AURORA_UBOOT_BOOT_FAIL: no bootable entry; run aurora_rescue" },
@@ -1460,14 +1586,6 @@ static void apple_efi_late_init(bool start_keyboard)
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
 		env_set("preboot", "");
-	/*
-	 * Boot without a countdown.  With bootdelay 0 autoboot still polls
-	 * the console once, so a key held on the serial console (or on the
-	 * internal keyboard where U-Boot drives it) stops at the prompt.
-	 */
-	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
-		env_set("bootdelay", "0");
-
 	/* EFI ConIn uses the active stdin; keep serial input available. */
 	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
 	    IS_ENABLED(CONFIG_CMDLINE))
@@ -1496,12 +1614,14 @@ static int j713_prepare_input(void)
 	ulong start;
 	int ret, index;
 
-	node = ofnode_by_compatible(ofnode_null(), "apple,t8132-rtk-helper-asc4");
+	node = ofnode_by_compatible(ofnode_null(),
+		of_machine_is_compatible("apple,j614s") ?
+		"apple,t6041-rtk-helper-asc4" : "apple,t8132-rtk-helper-asc4");
 	if (!ofnode_valid(node))
 		return -ENODEV;
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
 	if (ret) {
-		printf("J713: failed to initialize input helper (%d)\n", ret);
+		printf("MTP: failed to initialize input helper (%d)\n", ret);
 		return ret;
 	}
 	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
@@ -1526,12 +1646,37 @@ static int j713_prepare_input(void)
 		}
 		udelay(50);
 	}
-	printf("J713: input discovery FIFO has %u bytes at handoff\n",
-	       readl((void *)(data + 0x2c)));
+	debug("J713: input discovery FIFO has %u bytes at handoff\n",
+	      readl((void *)(data + 0x2c)));
 	if (readl((void *)(data + 0x2c)) < 8)
 		return -ETIMEDOUT;
 	apple_rtkit_helper_input_ready(helper);
 	return 0;
+}
+
+/*
+ * On a machine with a built-in keyboard, leave the USB-C ports to the OS.
+ *
+ * U-Boot drives a Type-C port as a USB 2.0 host only: its SuperSpeed lanes
+ * stay on the dummy PIPE and the alternate mode set up by the Type-C
+ * controller is not followed.  A dock that is already attached and in
+ * DisplayPort alternate mode can keep the state of such a session after the
+ * OS takes over: the Plugable UD-ULTC4K on a T6000 MacBook Pro then shows
+ * only its USB 3 hub, and its USB 2.0 hub, keyboard and mouse stay absent
+ * until the cable is reconnected.  The built-in keyboard covers the boot
+ * prompt, so "usb start" is not needed to reach it.  Machines without one
+ * keep it, and "usb start" still works by hand.
+ */
+static void apple_typec_late_init(void)
+{
+	if (!ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,spi-hid-transport")) &&
+	    !ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,dockchannel-hid")))
+		return;
+
+	if (!strcmp(env_get("preboot") ?: "", "usb start"))
+		env_set("preboot", "");
 }
 
 int board_late_init(void)
@@ -1544,20 +1689,29 @@ int board_late_init(void)
 	env_set("fw_dev_part", asahi_esp_devpart());
 
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	    of_machine_is_compatible("apple,j713")) {
+	    (of_machine_is_compatible("apple,j713") ||
+	     of_machine_is_compatible("apple,j614s"))) {
 		int ret = j713_prepare_input();
 
 		start_keyboard = !ret;
 		if (ret)
-			printf("J713: input unavailable (%d); continuing boot\n", ret);
+			printf("MTP: input unavailable (%d); continuing boot\n", ret);
 	}
-	/* T6040: the MTP stays with Linux (apple_rtkit_helper_allowed()). */
-	if (of_machine_is_compatible("apple,t6040"))
+	/* T6040 and T6041 stay with Linux except for the J614s retained handoff. */
+	if ((of_machine_is_compatible("apple,t6040") &&
+	     !of_machine_is_compatible("apple,j614s")) ||
+	    of_machine_is_compatible("apple,t6041") ||
+	    of_machine_is_compatible("apple,t6050"))
 		start_keyboard = false;
-	if (of_machine_is_compatible("apple,t8140") ||
+	if (of_machine_is_compatible("apple,j613") ||
+	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
-	    of_machine_is_compatible("apple,t6040"))
+	    of_machine_is_compatible("apple,t6040") ||
+	    of_machine_is_compatible("apple,t6041") ||
+	    of_machine_is_compatible("apple,t6050"))
 		apple_efi_late_init(start_keyboard);
+	else
+		apple_typec_late_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M
@@ -1605,7 +1759,8 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
 		 * fixup only costs the OS the running session: keep booting.
 		 */
-		if (ret && of_machine_is_compatible("apple,j713"))
+		if (ret && (of_machine_is_compatible("apple,j713") ||
+			    of_machine_is_compatible("apple,j614s")))
 			return ret;
 		if (ret)
 			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",
@@ -1615,7 +1770,7 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 		ret = apple_j713_complete_fdt(blob);
 		if (ret)
 			return ret;
-		printf("J713: OS devicetree runtime import complete\n");
+		debug("J713: OS devicetree runtime import complete\n");
 	}
 
 	/* RTKit buffers of an ANS session handed on live stay the firmware's. */

@@ -13,6 +13,7 @@
 #include <api.h>
 #include <bootstage.h>
 #include <cpu_func.h>
+#include <ctxr_exec_window.h>
 #include <cyclic.h>
 #include <display_options.h>
 #include <exports.h>
@@ -229,7 +230,7 @@ static int initr_malloc(void)
 	 * This value MUST match the value of gd->start_addr_sp in board_f.c:
 	 * reserve_noncached().
 	 */
-	start = gd->relocaddr - TOTAL_MALLOC_LEN;
+	start = ctxr_exec_malloc_end() - TOTAL_MALLOC_LEN;
 	gd_set_malloc_start(start);
 	mem_malloc_init(start, TOTAL_MALLOC_LEN);
 	return 0;

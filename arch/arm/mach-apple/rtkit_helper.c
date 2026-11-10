@@ -61,17 +61,28 @@ struct rtkit_helper_priv {
 	bool input_ready;
 };
 
+/* J613 retains the first MTP epoch, with OSLog in SRAM. */
+static bool rtkit_helper_j613_handoff(struct udevice *dev)
+{
+	return of_machine_is_compatible("apple,j613") &&
+	       device_is_compatible(dev, "apple,t8122-rtk-helper-asc4");
+}
+
 static bool rtkit_helper_uses_dram(struct udevice *dev)
 {
 	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	       device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
+	       (device_is_compatible(dev, "apple,t8140-rtk-helper-asc4") ||
+		(of_machine_is_compatible("apple,j614s") &&
+		 device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")));
 }
 
-/* J713 Linux consumes the initialized session without owning its RTKit epoch. */
+/* J713 and J614s Linux consume the initialized session without owning its RTKit epoch. */
 static bool rtkit_helper_j713_handoff(struct udevice *dev)
 {
-	return of_machine_is_compatible("apple,j713") &&
-	       device_is_compatible(dev, "apple,t8132-rtk-helper-asc4");
+	return (of_machine_is_compatible("apple,j713") &&
+		device_is_compatible(dev, "apple,t8132-rtk-helper-asc4")) ||
+	       (of_machine_is_compatible("apple,j614s") &&
+		device_is_compatible(dev, "apple,t6041-rtk-helper-asc4"));
 }
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
@@ -196,13 +207,13 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 
 /*
  * Keep T8140 MTP and its DART untouched in the default build.  Never touch
- * the T6040 MTP: Linux starts it itself, and a U-Boot keyboard there would
- * leave Linux an MTP it has not been shown to take over.
+ * T6040 MTP except for the J614s retained handoff.
  */
 bool apple_rtkit_helper_allowed(ofnode node)
 {
 	if (ofnode_device_is_compatible(node, "apple,t6041-rtk-helper-asc4"))
-		return false;
+		return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+		       of_machine_is_compatible("apple,j614s");
 
 	return !ofnode_device_is_compatible(node, "apple,t8140-rtk-helper-asc4") ||
 	       IS_ENABLED(CONFIG_APPLE_MTP_KEYB);
@@ -227,8 +238,18 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (ret < 0)
 		return ret;
 
-	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev))
+	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev) ||
+	    rtkit_helper_j613_handoff(dev))
 		rtkit_helper_read_dma_window(dev);
+
+	if (of_machine_is_compatible("apple,j614s") &&
+	    device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")) {
+		ret = priv->dart ? apple_dart_retain_bypass(priv->dart) : -ENODEV;
+		if (ret) {
+			printf("J614s: MTP DART bypass unavailable (%d)\n", ret);
+			return ret;
+		}
+	}
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
@@ -301,12 +322,13 @@ static int rtkit_helper_remove(struct udevice *dev)
 
 		/* A published J713 inventory already promises a running session.
 		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
-		if (ret && rtkit_helper_j713_handoff(dev))
-			panic("J713: refusing OS entry after MTP DART retention error %d", ret);
+		if (ret && (rtkit_helper_j713_handoff(dev) ||
+			    rtkit_helper_j613_handoff(dev)))
+			panic("MTP: refusing OS entry after DART retention error %d", ret);
 		if (ret)
 			goto stop;
 
-		printf("%s: leaving RTKit running for the OS\n", dev->name);
+		debug("%s: leaving RTKit running for the OS\n", dev->name);
 		apple_rtkit_free(priv->rtk);
 		priv->rtk = NULL;
 		return 0;
@@ -455,8 +477,8 @@ static int rtkit_helper_fdt_publish_j713(struct udevice *dev, void *blob)
 		return ret;
 	priv->handoff_published = true;
 	dev_or_flags(dev, DM_FLAG_LEAVE_PD_ON);
-	printf("%s: initialized session retained for Linux (%d buffers)\n",
-	       dev->name, priv->nbufs);
+	debug("%s: initialized session retained for Linux (%d buffers)\n",
+	      dev->name, priv->nbufs);
 	return 0;
 }
 
@@ -494,8 +516,12 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	char name[48];
 	u32 phandle, rphandle;
 	fdt64_t reg[2];
+	fdt32_t inventory[4 * 5];
+	struct apple_rtkit_buffer buffers[4];
+	int count;
 
-	if (!priv->rtk || !priv->dart || !priv->nbufs ||
+	if ((rtkit_helper_j613_handoff(dev) && !priv->input_ready) ||
+	    !priv->rtk || !priv->dart || !priv->nbufs ||
 	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
 		return -ENODEV;
 	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
@@ -522,12 +548,15 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 			return -ENOSPC;
 	}
 
+	fdt_delprop(blob, node, "memory-region");
 	for (i = 0; i < priv->nbufs; i++) {
 		struct rtkit_helper_buf *b = &priv->bufs[i];
 
 		snprintf(name, sizeof(name), "mtp-rtkit@%llx", b->dva);
 		resv = fdt_path_offset(blob, "/reserved-memory");
-		sub = fdt_add_subnode(blob, resv, name);
+		sub = fdt_subnode_offset(blob, resv, name);
+		if (sub == -FDT_ERR_NOTFOUND)
+			sub = fdt_add_subnode(blob, resv, name);
 		if (sub < 0)
 			return -ENOSPC;
 
@@ -552,9 +581,28 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 
 	node = rtkit_helper_fdt_node(blob, priv->dart);
 	if (node < 0 ||
-	    fdt_appendprop_u32(blob, node, "apple,bypass-handoff-streams",
+	    fdt_setprop_u32(blob, node, "apple,bypass-handoff-streams",
 			       priv->dart_sid))
 		return -ENOSPC;
+
+	if (rtkit_helper_j613_handoff(dev)) {
+		count = apple_rtkit_get_buffers(priv->rtk, buffers, ARRAY_SIZE(buffers));
+		if (count != ARRAY_SIZE(buffers))
+			return count < 0 ? count : -EINVAL;
+		for (i = 0; i < count; i++) {
+			if (buffers[i].size > (u32)-1)
+				return -EOVERFLOW;
+			inventory[5 * i] = cpu_to_fdt32(buffers[i].endpoint);
+			inventory[5 * i + 1] = cpu_to_fdt32(buffers[i].dva >> 32);
+			inventory[5 * i + 2] = cpu_to_fdt32(buffers[i].dva);
+			inventory[5 * i + 3] = cpu_to_fdt32(buffers[i].size);
+			inventory[5 * i + 4] = cpu_to_fdt32(buffers[i].is_mapped);
+		}
+		node = rtkit_helper_fdt_node(blob, dev);
+		if (node < 0 || fdt_setprop(blob, node, "apple,rtkit-buffers",
+					 inventory, sizeof(inventory)))
+			return -ENOSPC;
+	}
 
 	node = rtkit_helper_fdt_node(blob, dev);
 	if (node < 0 ||
@@ -563,8 +611,8 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 		return -ENOSPC;
 
 	priv->handoff_published = true;
-	printf("%s: live OS handoff published (%d buffers, DART stream %u)\n",
-	       dev->name, priv->nbufs, priv->dart_sid);
+	debug("%s: live OS handoff published (%d buffers, DART stream %u)\n",
+	      dev->name, priv->nbufs, priv->dart_sid);
 	return 0;
 }
 
@@ -579,7 +627,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
 		    !device_active(dev) ||
-		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev)))
+		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
+		     !rtkit_helper_j613_handoff(dev)))
 			continue;
 
 		priv = dev_get_priv(dev);
@@ -606,6 +655,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 				priv->published_fdt = blob;
 		}
 		free(scratch);
+		if (ret && rtkit_helper_j613_handoff(dev))
+			panic("J613 MTP handoff publication failed: %d", ret);
 		if (ret && was_published) {
 			/* The prior EFI table may still be selected after a later
 			 * candidate fixup fails. Its buffers/DART/session stay live. */
@@ -631,6 +682,7 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 
 static const struct udevice_id rtkit_helper_ids[] = {
 	{ .compatible = "apple,rtk-helper-asc4" },
+	{ .compatible = "apple,t8122-rtk-helper-asc4" },
 	{ /* sentinel */ }
 };
 

@@ -46,6 +46,7 @@ typedef uint16_t __le16; typedef uint32_t __le32; typedef unsigned long ulong;
 #define le16_to_cpu(v) (v)
 #define DM_REMOVE_NORMAL 0
 #define dev_err(...) ((void)0)
+#define debug(...) ((void)0)
 struct udevice { void *priv, *uc; bool retained; };
 struct input_config { struct udevice *dev; };
 struct keyboard_priv { struct input_config input; };
@@ -91,7 +92,8 @@ static int dockchannel_read(struct udevice *dev,void *p,size_t size) {
     assert(size==wire_size);memcpy(p,wire,size);rx_pending-=rx_pending ? size : 0;return size;
 }
 static int apple_rtkit_helper_poll(struct udevice *d,int timeout) { assert(d&&!timeout);return 0; }
-static unsigned invalidations;
+static unsigned invalidations,readies;
+static void apple_rtkit_helper_input_ready(struct udevice *d) { assert(d);readies++; }
 static void apple_rtkit_helper_input_failed(struct udevice *d) { assert(d);invalidations++; }
 static bool apple_rtkit_helper_input_retained(struct udevice *d) { return d->retained; }
 static int device_remove(struct udevice *d,int flags) {
@@ -162,7 +164,7 @@ int main(void) {
     assert(!priv.enable_pending&&priv.kbd_iface==3&&!priv.ready);
     poll_quiet(&uc.input,100);poll_quiet(&uc.input,1000);assert(tx_size==sizeof(enable));
     u8 ready[]={DCHID_EVENT_READY,2};deliver(&uc.input,0,ready,2,false,false);assert(!priv.ready);
-    ready[1]=3;deliver(&uc.input,0,ready,2,true,false);assert(priv.ready);
+    ready[1]=3;deliver(&uc.input,0,ready,2,true,false);assert(priv.ready&&readies==1);
     struct apple_kbd_report key={.reportid=1,.keycode={4}};
     deliver(&uc.input,2,&key,sizeof(key),false,false);assert(!key_count);
     deliver(&uc.input,3,&key,sizeof(key),false,false);assert(key_count==1&&keys[0]==KEY_A&&!releases[0]);
@@ -235,14 +237,17 @@ struct udevice { int unused; };
 struct apple_mtp_kbd_priv { struct udevice *helper; };
 static struct apple_mtp_kbd_priv priv;
 static struct udevice helper;
-static bool j713=true,prepared;
+static bool j713=true,j614,prepared;
 static int finds,gets,find_error,property_error;
 static void *dev_get_priv(struct udevice *d){(void)d;return &priv;}
 static int dev_read_u32(struct udevice *d,const char *name,u32 *v){
  (void)d;assert(!strcmp(name,"apple,helper-cpu"));*v=123;return property_error;
 }
 static ofnode ofnode_get_by_phandle(u32 phandle){assert(phandle==123);return 123;}
-static bool of_machine_is_compatible(const char *name){assert(!strcmp(name,"apple,j713"));return j713;}
+static bool of_machine_is_compatible(const char *name){
+ if(!strcmp(name,"apple,j713"))return j713;
+ assert(!strcmp(name,"apple,j614s"));return j614;
+}
 static int uclass_find_device_by_ofnode(int cls,ofnode node,struct udevice **d){
  assert(cls==1&&node==123);finds++;*d=&helper;return find_error;
 }
@@ -257,7 +262,10 @@ int main(void){
  prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==2&&!gets);
  find_error=-ENODEV;assert(get_rtkit_helper(&keyboard)==-ENODEV&&!gets);
  property_error=-EINVAL;assert(get_rtkit_helper(&keyboard)==-EINVAL&&finds==3&&!gets);
- property_error=0;j713=false;assert(!get_rtkit_helper(&keyboard)&&gets==1);
+ property_error=0;find_error=0;j713=false;j614=true;prepared=false;
+ assert(get_rtkit_helper(&keyboard)==-ENODEV&&finds==4&&!gets);
+ prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==5&&!gets);
+ j614=false;assert(!get_rtkit_helper(&keyboard)&&gets==1);
  return 0;
 }
 '''

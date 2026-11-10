@@ -19,6 +19,7 @@
 #include <version.h>
 #include <malloc.h>
 #include <dm/ofnode.h>
+#include <u-boot/uuid.h>
 #ifdef CONFIG_CPU
 #include <cpu.h>
 #include <dm/uclass-internal.h>
@@ -471,11 +472,27 @@ static int smbios_write_type0(ulong *current, int *handle,
 	memset(t, 0, len);
 	fill_smbios_header(t, SMBIOS_BIOS_INFORMATION, len, *handle);
 	smbios_set_eos(ctx, t->eos);
-	t->vendor = smbios_add_prop_si(ctx, NULL, SYSID_SM_BIOS_VENDOR,
+	t->vendor = smbios_add_prop_si(ctx, "vendor", SYSID_SM_BIOS_VENDOR,
 				       "U-Boot");
 
-	t->bios_ver = smbios_add_prop_si(ctx, "version", SYSID_SM_BIOS_VER,
-					 PLAIN_VERSION);
+	/*
+	 * A "version" in the device tree names the firmware stages that run
+	 * before U-Boot and make up the platform firmware with it, so the
+	 * version names both, e.g. "aura 1.0.0 / U-Boot 2026.07".
+	 */
+	if (ofnode_valid(ctx->node) &&
+	    ofnode_read_string(ctx->node, "version")) {
+		char ver[SMBIOS_STR_MAX];
+
+		snprintf(ver, sizeof(ver), "%s / U-Boot %s",
+			 ofnode_read_string(ctx->node, "version"),
+			 PLAIN_VERSION);
+		t->bios_ver = smbios_add_string(ctx, ver);
+	} else {
+		t->bios_ver = smbios_add_prop_si(ctx, "version",
+						 SYSID_SM_BIOS_VER,
+						 PLAIN_VERSION);
+	}
 	if (t->bios_ver)
 		gd->smbios_version = ctx->last_str;
 	log_debug("smbios_version = %p: '%s'\n", gd->smbios_version,
@@ -484,7 +501,7 @@ static int smbios_write_type0(ulong *current, int *handle,
 	print_buffer((ulong)gd->smbios_version, gd->smbios_version,
 		     1, strlen(gd->smbios_version) + 1, 0);
 #endif
-	t->bios_release_date = smbios_add_prop_si(ctx, NULL,
+	t->bios_release_date = smbios_add_prop_si(ctx, "release-date",
 						  SYSID_SM_BIOS_REL_DATE,
 						  U_BOOT_DMI_DATE);
 #ifdef CONFIG_ROM_SIZE
@@ -553,6 +570,11 @@ static int smbios_write_type1(ulong *current, int *handle,
 			      &uuid_len) &&
 	    uuid_len == sizeof(t->uuid))
 		memcpy(t->uuid, uuid, sizeof(t->uuid));
+	else if (CONFIG_IS_ENABLED(LIB_UUID) && ofnode_valid(ctx->node) &&
+		 ofnode_read_string(ctx->node, "uuid"))
+		/* SMBIOS stores the first three fields little-endian */
+		uuid_str_to_bin(ofnode_read_string(ctx->node, "uuid"),
+				t->uuid, UUID_STR_FORMAT_GUID);
 	t->wakeup_type = smbios_get_val_si(ctx, "wakeup-type",
 					   SYSID_SM_SYSTEM_WAKEUP,
 					   SMBIOS_WAKEUP_TYPE_UNKNOWN);
@@ -840,6 +862,16 @@ static int smbios_write_type4(ulong *current, int *handle,
 		smbios_get_val_si(ctx, "characteristics",
 				  SYSID_SM_PROCESSOR_CHARA,
 				  SMBIOS_PROCESSOR_UND);
+	/*
+	 * The CPU describes what it can tell about itself; the device tree
+	 * adds what only the board knows, such as frequency control.
+	 */
+	if (ofnode_valid(ctx->node)) {
+		u32 chara;
+
+		if (!ofnode_read_u32(ctx->node, "characteristics", &chara))
+			t->processor_characteristics |= chara;
+	}
 	t->core_count2 = smbios_get_val_si(ctx, "core-count2",
 					   SYSID_SM_PROCESSOR_CORE_CNT2, 0);
 	t->core_enabled2 = smbios_get_val_si(ctx, "core-enabled2",
@@ -860,8 +892,10 @@ static int smbios_write_type4(ulong *current, int *handle,
 #if IS_ENABLED(CONFIG_GENERATE_SMBIOS_TABLE_VERBOSE)
 
 static int smbios_write_type7_1level(ulong *current, int handle,
-				     struct smbios_ctx *ctx, int level)
+				     struct smbios_ctx *ctx, int level, bool si)
 {
+	/* With si clear, the device tree describes this level alone */
+#define SI(id) (si ? (id) + level : SYSID_NONE)
 	struct smbios_type7 *t;
 	int len = sizeof(*t);
 	void *hdl;
@@ -873,43 +907,45 @@ static int smbios_write_type7_1level(ulong *current, int handle,
 	smbios_set_eos(ctx, t->eos);
 
 	t->socket_design = smbios_add_prop_si(ctx, "socket-design",
-					      SYSID_SM_CACHE_SOCKET + level,
+					      SI(SYSID_SM_CACHE_SOCKET),
 					      NULL);
+	/* @level counts from 0, as the level field of the configuration does */
 	t->config.data = smbios_get_val_si(ctx, "config",
-					   SYSID_SM_CACHE_CONFIG + level,
-					   (level - 1) | SMBIOS_CACHE_OP_UND);
+					   SI(SYSID_SM_CACHE_CONFIG),
+					   level | SMBIOS_CACHE_ENABLED |
+					   SMBIOS_CACHE_OP_UND);
 	t->max_size.data = smbios_get_val_si(ctx, "max-size",
-					     SYSID_SM_CACHE_MAX_SIZE + level,
+					     SI(SYSID_SM_CACHE_MAX_SIZE),
 					     0);
 	t->inst_size.data = smbios_get_val_si(ctx, "installed-size",
-					      SYSID_SM_CACHE_INST_SIZE + level,
+					      SI(SYSID_SM_CACHE_INST_SIZE),
 					      0);
 	t->supp_sram_type.data =
 		smbios_get_val_si(ctx, "supported-sram-type",
-				  SYSID_SM_CACHE_SUPSRAM_TYPE + level,
+				  SI(SYSID_SM_CACHE_SUPSRAM_TYPE),
 				  SMBIOS_CACHE_SRAM_TYPE_UNKNOWN);
 	t->curr_sram_type.data =
 		smbios_get_val_si(ctx, "current-sram-type",
-				  SYSID_SM_CACHE_CURSRAM_TYPE + level,
+				  SI(SYSID_SM_CACHE_CURSRAM_TYPE),
 				  SMBIOS_CACHE_SRAM_TYPE_UNKNOWN);
-	t->speed = smbios_get_val_si(ctx, "speed", SYSID_SM_CACHE_SPEED + level,
+	t->speed = smbios_get_val_si(ctx, "speed", SI(SYSID_SM_CACHE_SPEED),
 				     0);
 	t->err_corr_type = smbios_get_val_si(ctx, "error-correction-type",
-					     SYSID_SM_CACHE_ERRCOR_TYPE + level,
+					     SI(SYSID_SM_CACHE_ERRCOR_TYPE),
 					     SMBIOS_CACHE_ERRCORR_UNKNOWN);
 	t->sys_cache_type =
 		smbios_get_val_si(ctx, "system-cache-type",
-				  SYSID_SM_CACHE_SCACHE_TYPE + level,
+				  SI(SYSID_SM_CACHE_SCACHE_TYPE),
 				  SMBIOS_CACHE_SYSCACHE_TYPE_UNKNOWN);
 	t->associativity = smbios_get_val_si(ctx, "associativity",
-					     SYSID_SM_CACHE_ASSOC + level,
+					     SI(SYSID_SM_CACHE_ASSOC),
 					     SMBIOS_CACHE_ASSOC_UNKNOWN);
 	t->max_size2.data = smbios_get_val_si(ctx, "max-size2",
-					      SYSID_SM_CACHE_MAX_SIZE2 + level,
+					      SI(SYSID_SM_CACHE_MAX_SIZE2),
 					      0);
 	t->inst_size2.data =
 		smbios_get_val_si(ctx, "installed-size2",
-				  SYSID_SM_CACHE_INST_SIZE2 + level, 0);
+				  SI(SYSID_SM_CACHE_INST_SIZE2), 0);
 
 	/* Save the cache handles */
 	if (!sysinfo_get_data(ctx->dev, SYSID_SM_CACHE_HANDLE, &hdl,
@@ -924,6 +960,7 @@ static int smbios_write_type7_1level(ulong *current, int handle,
 
 	return len;
 }
+#undef SI
 
 static int smbios_write_type7(ulong *current, int *handle,
 			      struct smbios_ctx *ctx)
@@ -933,11 +970,30 @@ static int smbios_write_type7(ulong *current, int *handle,
 	ofnode parent = ctx->node;
 	struct smbios_ctx ctx_bak;
 	int hdl_base = *handle;
+	int written = 0;
+	bool dt_only;
 
 	memcpy(&ctx_bak, ctx, sizeof(ctx_bak));
 
-	/* Get the number of level */
-	level =	smbios_get_val_si(ctx, NULL, SYSID_SM_CACHE_LEVEL, 0);
+	/*
+	 * A device tree that describes caches, as l<n>-cache nodes, describes
+	 * all of them and replaces what the CPU registers say: some cores, such
+	 * as Apple's, report cache geometry that does not match the caches.
+	 * Otherwise take the levels from the CPU.
+	 */
+	dt_only = false;
+	for (i = 0; i < SYSINFO_CACHE_LVL_MAX && !dt_only; i++) {
+		char buf[9] = "";
+
+		snprintf(buf, sizeof(buf), "l%d-cache", i + 1);
+		if (ofnode_valid(ofnode_find_subnode(parent, buf)))
+			dt_only = true;
+	}
+	if (dt_only)
+		level = SYSINFO_CACHE_LVL_MAX - 1;
+	else if (!ctx->dev ||
+		 sysinfo_get_int(ctx->dev, SYSID_SM_CACHE_LEVEL, &level))
+		return 0;	/* no cache described */
 	if (level >= SYSINFO_CACHE_LVL_MAX) /* Error, return 0-length */
 		return 0;
 
@@ -948,10 +1004,16 @@ static int smbios_write_type7(ulong *current, int *handle,
 			return 0;
 		ctx->subnode_name = buf;
 		ctx->node = ofnode_find_subnode(parent, ctx->subnode_name);
-		*handle = hdl_base + i;
-		len += smbios_write_type7_1level(current, *handle, ctx, i);
+		if (dt_only && !ofnode_valid(ctx->node)) {
+			memcpy(ctx, &ctx_bak, sizeof(*ctx));
+			continue;
+		}
+		*handle = hdl_base + written++;
+		len += smbios_write_type7_1level(current, *handle, ctx, i, !dt_only);
 		memcpy(ctx, &ctx_bak, sizeof(*ctx));
 	}
+	if (written)
+		*handle = hdl_base + written - 1;
 
 	return len;
 }
@@ -1195,6 +1257,13 @@ static int smbios_write_type9(ulong *current, int *handle,
 				   SMBIOS_SYSSLOT_TYPE_UNKNOWN);
 	if (len)
 		return len;
+
+	/*
+	 * A system-slot node without slots says the machine has none: its
+	 * PCIe links are wired to built-in devices, not expansion slots.
+	 */
+	if (ofnode_valid(ctx->node))
+		return 0;
 
 	/* if no subnode under 'system-slot', try scan the entire FDT */
 	len = smbios_scan_slot_type(current, handle, ctx);
@@ -1679,6 +1748,12 @@ static int smbios_write_type17_mem(ulong *current, int handle,
 		t->phy_mem_array_hdl =
 			smbios_get_val_si(ctx, "physical-memory-array-handle",
 					  SYSID_NONE, 0);
+		/* Without one, belong to the first memory array */
+		if (!t->phy_mem_array_hdl &&
+		    !sysinfo_get_data(ctx->dev, SYSID_SM_MEMARRAY_HANDLE, &hdl,
+				      &hdl_size) &&
+		    hdl_size == SYSINFO_MEM_HANDLE_MAX * sizeof(u16))
+			t->phy_mem_array_hdl = *(u16 *)hdl;
 	} else if (type == SMBIOS_MEM_FDT_MEM_NODE) {
 		smbios_pop_type17_size_from_memory_node(ctx->node, t);
 
@@ -1929,6 +2004,12 @@ static int smbios_write_type19_mem(ulong *current, int handle,
 		smbios_pop_type19_addr_si(ctx, t);
 		t->mem_array_hdl = smbios_get_val_si(ctx, "memory-array-handle",
 						     SYSID_NONE, 0);
+		/* Without one, map the first memory array */
+		if (!t->mem_array_hdl &&
+		    !sysinfo_get_data(ctx->dev, SYSID_SM_MEMARRAY_HANDLE, &hdl,
+				      &hdl_size) &&
+		    hdl_size == SYSINFO_MEM_HANDLE_MAX * sizeof(u16))
+			t->mem_array_hdl = *(u16 *)hdl;
 	} else if (type == SMBIOS_MEM_FDT_MEM_NODE) {
 		smbios_pop_type19_addr_from_memory_node(ctx->node, t);
 		/* Read the memory array handles */
@@ -1954,6 +2035,84 @@ static int smbios_write_type19(ulong *current, int *handle,
 	return smbios_write_type1719(current, handle, ctx,
 				     smbios_write_type19_mem,
 				     smbios_write_type19_from_memctrl_node);
+}
+
+
+static int smbios_write_type45_1fw(ulong *current, int handle,
+				   struct smbios_ctx *ctx, int __maybe_unused idx,
+				   int self)
+{
+	struct smbios_type45 *t;
+	int len = sizeof(*t);
+
+	t = map_sysmem(*current, len);
+	memset(t, 0, len);
+	fill_smbios_header(t, SMBIOS_FIRMWARE_INVENTORY, len, handle);
+	smbios_set_eos(ctx, t->eos);
+
+	/* U-Boot's own entry takes its name, version and date from U-Boot */
+	t->component_name = smbios_add_prop(ctx, "component-name",
+					    self ? "U-Boot" :
+					    ofnode_get_name(ctx->node));
+	t->version = smbios_add_prop(ctx, "version",
+				     self ? PLAIN_VERSION : NULL);
+	t->version_format = smbios_get_val_si(ctx, "version-format", SYSID_NONE,
+					      SMBIOS_FW_VERSION_FORMAT_FREE);
+	t->id = smbios_add_prop(ctx, "firmware-id", NULL);
+	t->id_format = smbios_get_val_si(ctx, "firmware-id-format", SYSID_NONE,
+					 SMBIOS_FW_ID_FORMAT_FREE);
+	t->release_date = smbios_add_prop(ctx, "release-date",
+					  self ? U_BOOT_DMI_DATE : NULL);
+	t->manufacturer = smbios_add_prop(ctx, "manufacturer", NULL);
+	t->lowest_supported_version =
+		smbios_add_prop(ctx, "lowest-supported-version", NULL);
+	t->image_size = smbios_get_u64_si(ctx, "image-size", SYSID_NONE,
+					  SMBIOS_FW_IMAGE_SIZE_UNKNOWN);
+	t->characteristics = smbios_get_val_si(ctx, "characteristics",
+					       SYSID_NONE, 0);
+	t->state = smbios_get_val_si(ctx, "state", SYSID_NONE,
+				     self ? SMBIOS_FW_STATE_ENABLED :
+				     SMBIOS_FW_STATE_UNKNOWN);
+
+	len = t->hdr.length + smbios_string_table_len(ctx);
+	*current += len;
+	unmap_sysmem(t);
+
+	return len;
+}
+
+/*
+ * Firmware Inventory: one structure per subnode of the firmware-inventory
+ * node, which describes the firmware components that run before or beside
+ * U-Boot, followed by one for U-Boot. A subnode named "u-boot" adds to
+ * U-Boot's own entry what only the platform knows, such as whether it can
+ * be updated (characteristics). Nothing without the node.
+ */
+static int smbios_write_type45(ulong *current, int *handle,
+			       struct smbios_ctx *ctx)
+{
+	ofnode parent = ctx->node, self = ofnode_null(), child;
+	int hdl_base = *handle;
+	int len = 0, n = 0;
+
+	if (!IS_ENABLED(CONFIG_OF_CONTROL) || !ofnode_valid(parent))
+		return 0;
+
+	ofnode_for_each_subnode(child, parent) {
+		if (!strcmp(ofnode_get_name(child), "u-boot")) {
+			self = child;
+			continue;
+		}
+		ctx->node = child;
+		len += smbios_write_type45_1fw(current, hdl_base + n++, ctx, 0,
+					       0);
+	}
+	ctx->node = self;
+	len += smbios_write_type45_1fw(current, hdl_base + n, ctx, 0, 1);
+	*handle = hdl_base + n;
+	ctx->node = parent;
+
+	return len;
 }
 
 #endif /* #if IS_ENABLED(CONFIG_GENERATE_SMBIOS_TABLE_VERBOSE) */
@@ -2007,6 +2166,7 @@ static struct smbios_write_method smbios_write_funcs[] = {
 	{ smbios_write_type16, "memory-array"},
 	{ smbios_write_type17, "memory-device"},
 	{ smbios_write_type19, "memory-array-mapped-address"},
+	{ smbios_write_type45, "firmware-inventory"},
 #endif
 	{ smbios_write_type32, },
 	{ smbios_write_type127 },

@@ -55,6 +55,7 @@ config CTXR_EXEC_WINDOW
 	bool "Keep Linux inside the CTXR window the device tree advertises"
 	depends on ARM64 && OF_CONTROL && LMB
 	default y if ARCH_APPLE
+	imply ZSTD
 	help
 	  A Linux kernel built with CONFIG_ARM64_CTXR_EXECMEM confines its
 	  executable code to the physical window advertised by
@@ -62,7 +63,9 @@ config CTXR_EXEC_WINDOW
 	  kernel keeps its secondary CPUs offline. With this option, the EFI
 	  image loader, booti and bootm place the Linux image inside that
 	  window, and so does the loader code a UKI allocates for its kernel.
-	  A kernel that can't be placed gets a warning and starts outside it.
+	  The EFI image loader decompresses the kernel of an EFI zboot image
+	  (gzip, or zstd with ZSTD) and places it the same way. A kernel that
+	  can't be placed gets a warning and starts outside it.
 
 	  U-Boot's own image relocates to the top of the window, because it
 	  holds the EFI runtime services that kernel calls, and so does runtime

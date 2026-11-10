@@ -441,11 +441,12 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * J813 cannot restart MTP after U-Boot shuts it down, and Linux wakes the
-	 * T6050 MTP from the state iBoot left it in. J713 retains its running
-	 * helper and replays discovery packets to Linux at OS handoff.
+	 * J813 and J604 cannot restart MTP after U-Boot shuts it down, and Linux
+	 * wakes the T6050 MTP from the state iBoot left it in. J713 retains its
+	 * running helper and replays discovery packets to Linux at OS handoff.
 	 */
 	if (of_machine_is_compatible("apple,j813") ||
+	    of_machine_is_compatible("apple,j604") ||
 	    of_machine_is_compatible("apple,t6050"))
 		return -ENODEV;
 	priv->j713 = of_machine_is_compatible("apple,j713") ||

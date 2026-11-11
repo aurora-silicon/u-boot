@@ -239,6 +239,17 @@ config EFI_AURORA_MEASURE
 	  the device tree handed to the OS. The aura stages before U-Boot
 	  start this record; Linux reads it to report how the machine booted.
 
+config EFI_AURORA_SECBOOT_AUDIT
+	bool "Secure Boot audit: check and record images, start them anyway"
+	depends on EFI_SECURE_BOOT && EFI_AURORA_MEASURE
+	help
+	  With PK, KEK, db and dbx installed, authenticate every EFI image
+	  against db and dbx and record the verdict (policy "audit") in
+	  /chosen/aurora,boot-security, but start images that fail. The
+	  SecureBoot variable reads 0 and AuditMode 1, so the OS does not
+	  treat the boot as Secure Boot. Say N to enforce: images that fail
+	  authentication are refused.
+
 config EFI_VARIABLES_PRESEED
 	bool "Initial values for UEFI variables"
 	depends on !COMPILE_TEST

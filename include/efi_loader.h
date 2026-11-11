@@ -1139,6 +1139,7 @@ struct efi_signature_store *efi_build_signature_store(void *sig_list,
 struct efi_signature_store *efi_sigstore_parse_sigdb(u16 *name);
 
 bool efi_secure_boot_enabled(void);
+bool efi_secure_boot_audit(void);
 
 bool efi_capsule_auth_enabled(void);
 

@@ -19,6 +19,7 @@
 struct aurora_measurement {
 	u8 digest[SHA256_SUM_LEN];
 	bool enforcing;
+	bool audit;
 	bool authenticated;
 };
 
@@ -28,6 +29,7 @@ static int pending_cnt;
 static void *flushed_fdt;
 static int flushed_cnt;
 
+/* Under audit nothing was refused, so this link never counts as verified. */
 static const char *chain_state(const char *prev, bool enforcing, bool passed)
 {
 	if (!enforcing || !passed)
@@ -66,10 +68,11 @@ static int add_one(void *fdt, const struct aurora_measurement *m)
 		return e;
 	fdt_setprop_u32(fdt, e, "reg", idx);
 	fdt_setprop_string(fdt, e, "stage", "u-boot");
-	fdt_setprop_string(fdt, e, "policy", m->enforcing ? "enforce" : "off");
+	fdt_setprop_string(fdt, e, "policy", m->enforcing ? "enforce" :
+			   m->audit ? "audit" : "off");
 	fdt_setprop_string(fdt, e, "component", "efi-image");
 	fdt_setprop_string(fdt, e, "verdict",
-			   !m->enforcing ? "measured" :
+			   !m->enforcing && !m->audit ? "measured" :
 			   m->authenticated ? "verified" : "bad-signature");
 	fdt_setprop(fdt, e, "sha256", m->digest, sizeof(m->digest));
 
@@ -79,7 +82,8 @@ static int add_one(void *fdt, const struct aurora_measurement *m)
 	fdt_setprop_string(fdt, node, "state",
 			   chain_state(prev, m->enforcing, m->authenticated));
 	fdt_setprop_string(fdt, node, "uefi-secure-boot",
-			   m->enforcing ? "enforcing" : "off");
+			   m->enforcing ? "enforcing" :
+			   m->audit ? "audit" : "off");
 	return 0;
 }
 
@@ -117,11 +121,13 @@ void efi_aurora_measure(const void *efi, size_t efi_size, bool authenticated)
 	}
 	m = &pending[pending_cnt++];
 	m->enforcing = efi_secure_boot_enabled();
+	m->audit = efi_secure_boot_audit();
 	m->authenticated = authenticated;
 	sha256_csum_wd(efi, efi_size, m->digest, CHUNKSZ_SHA256);
 	log_info("aurora: EFI image %d sha256 %02x%02x%02x%02x... %s\n",
 		 pending_cnt - 1, m->digest[0], m->digest[1], m->digest[2],
-		 m->digest[3], !m->enforcing ? "measured" :
-		 authenticated ? "verified" : "NOT verified");
+		 m->digest[3], !m->enforcing && !m->audit ? "measured" :
+		 authenticated ? "verified" :
+		 m->audit ? "NOT verified (audit, started)" : "NOT verified");
 	efi_aurora_flush(efi_get_configuration_table(&efi_guid_fdt));
 }

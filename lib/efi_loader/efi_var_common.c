@@ -40,6 +40,7 @@ static const struct efi_auth_var_name_type name_type[] = {
 };
 
 static bool efi_secure_boot;
+static bool efi_secure_boot_audit_mode;
 static enum efi_secure_mode efi_secure_mode;
 static const efi_guid_t shim_lock_guid = SHIM_LOCK_GUID;
 
@@ -266,6 +267,7 @@ static efi_status_t efi_transfer_secure_state(enum efi_secure_mode mode)
 	EFI_PRINT("Switching secure state from %d to %d\n", efi_secure_mode,
 		  mode);
 
+	efi_secure_boot_audit_mode = false;
 	if (mode == EFI_MODE_DEPLOYED) {
 		ret = efi_set_secure_state(1, 0, 0, 1);
 		if (ret != EFI_SUCCESS)
@@ -281,6 +283,16 @@ static efi_status_t efi_transfer_secure_state(enum efi_secure_mode mode)
 		ret = efi_set_secure_state(0, 1, 1, 0);
 		if (ret != EFI_SUCCESS)
 			goto err;
+	} else if (mode == EFI_MODE_USER &&
+		   IS_ENABLED(CONFIG_EFI_AURORA_SECBOOT_AUDIT)) {
+		/*
+		 * Keys are installed, but images are only checked and
+		 * recorded: tell the OS that Secure Boot is not enforced.
+		 */
+		ret = efi_set_secure_state(0, 0, 1, 0);
+		if (ret != EFI_SUCCESS)
+			goto err;
+		efi_secure_boot_audit_mode = true;
 	} else if (mode == EFI_MODE_USER) {
 		ret = efi_set_secure_state(1, 0, 0, 0);
 		if (ret != EFI_SUCCESS)
@@ -363,6 +375,20 @@ efi_status_t efi_init_secure_state(void)
 bool efi_secure_boot_enabled(void)
 {
 	return efi_secure_boot;
+}
+
+/**
+ * efi_secure_boot_audit - return if images are checked without enforcement
+ *
+ * With CONFIG_EFI_AURORA_SECBOOT_AUDIT and keys installed, every image is
+ * authenticated against db/dbx and the result recorded, but images that fail
+ * still start and SecureBoot reads 0.
+ *
+ * Return:	true in that audit state
+ */
+bool efi_secure_boot_audit(void)
+{
+	return efi_secure_boot_audit_mode;
 }
 
 enum efi_auth_var_type efi_auth_var_get_type(const u16 *name,

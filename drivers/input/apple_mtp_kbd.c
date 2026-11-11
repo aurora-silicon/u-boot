@@ -240,6 +240,7 @@ static void dchid_handle_event(struct udevice *dev, const u8 *p, size_t len)
 	case DCHID_EVENT_READY:
 		if (len >= 2 && p[1] == priv->kbd_iface && !priv->ready) {
 			priv->ready = true;
+			apple_rtkit_helper_input_ready(priv->helper);
 			debug("mtpkbd: keyboard ready\n");
 		}
 		break;
@@ -441,11 +442,12 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * J813 cannot restart MTP after U-Boot shuts it down, and Linux wakes the
-	 * T6050 MTP from the state iBoot left it in. J713 retains its running
-	 * helper and replays discovery packets to Linux at OS handoff.
+	 * J813 and J604 cannot restart MTP after U-Boot shuts it down, and Linux
+	 * wakes the T6050 MTP from the state iBoot left it in. J713 retains its
+	 * running helper and replays discovery packets to Linux at OS handoff.
 	 */
 	if (of_machine_is_compatible("apple,j813") ||
+	    of_machine_is_compatible("apple,j604") ||
 	    of_machine_is_compatible("apple,t6050"))
 		return -ENODEV;
 	priv->j713 = of_machine_is_compatible("apple,j713") ||
@@ -517,8 +519,9 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	 * Preserve every INIT packet for Linux, including STM and trackpad.
 	 */
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
-			 (of_machine_is_compatible("apple,j713") ||
-			  of_machine_is_compatible("apple,j614s"));
+			 of_machine_is_compatible("apple,j713") ||
+			 of_machine_is_compatible("apple,j614s") ||
+			 of_machine_is_compatible("apple,j613");
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {

@@ -13,6 +13,7 @@
 #include <charset.h>
 #include <command.h>
 #include <console.h>
+#include <env.h>
 #include <log.h>
 #include <dm.h>
 #include <video.h>
@@ -748,6 +749,71 @@ static int vidconsole_pre_probe(struct udevice *dev)
 	return 0;
 }
 
+#if CONFIG_IS_ENABLED(VIDEO_QUIET_BOOT)
+/* The "verbose" variable or /chosen/u-boot,verbose shows all text */
+static bool quiet_boot_verbose(void)
+{
+	if ((gd->flags & GD_FLG_ENV_READY) && env_get("verbose"))
+		return true;
+
+	return ofnode_read_bool(ofnode_path("/chosen"), "u-boot,verbose");
+}
+
+bool vidconsole_quiet_boot(void)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+
+	if (uclass_get(UCLASS_VIDEO_CONSOLE, &uc))
+		return false;
+	uclass_foreach_dev(dev, uc) {
+		struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+		if (device_active(dev) && priv->quiet_boot)
+			return true;
+	}
+
+	return false;
+}
+
+void vidconsole_quiet_boot_clear(void)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+
+	if (uclass_get(UCLASS_VIDEO_CONSOLE, &uc))
+		return;
+	uclass_foreach_dev(dev, uc) {
+		struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+		if (device_active(dev) && priv->quiet_boot)
+			priv->clear_pending = true;
+	}
+}
+
+void vidconsole_quiet_boot_end(bool clear)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+
+	if (uclass_get(UCLASS_VIDEO_CONSOLE, &uc))
+		return;
+	uclass_foreach_dev(dev, uc) {
+		struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+		if (!device_active(dev) || !priv->quiet_boot)
+			continue;
+		priv->quiet_boot = false;
+		priv->quiet = false;
+		if (clear || priv->clear_pending) {
+			vidconsole_clear_and_reset(dev);
+			video_sync(dev->parent, true);
+		}
+		priv->clear_pending = false;
+	}
+}
+#endif /* VIDEO_QUIET_BOOT */
+
 /* Register the device with stdio */
 static int vidconsole_post_probe(struct udevice *dev)
 {
@@ -763,6 +829,13 @@ static int vidconsole_post_probe(struct udevice *dev)
 	} else {
 		strcpy(sdev->name, "vidconsole");
 	}
+
+#if CONFIG_IS_ENABLED(VIDEO_QUIET_BOOT)
+	if (!quiet_boot_verbose()) {
+		priv->quiet = true;
+		priv->quiet_boot = true;
+	}
+#endif
 
 	sdev->flags = DEV_FLAGS_OUTPUT;
 	sdev->putc = vidconsole_putc;

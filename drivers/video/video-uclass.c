@@ -797,7 +797,8 @@ static int video_post_probe(struct udevice *dev)
 	}
 
 	if (CONFIG_IS_ENABLED(VIDEO_LOGO) &&
-	    !CONFIG_IS_ENABLED(SPLASH_SCREEN) && !plat->hide_logo) {
+	    !CONFIG_IS_ENABLED(SPLASH_SCREEN) && !plat->hide_logo &&
+	    !vidconsole_quiet_boot()) {
 		ret = show_splash(dev);
 		if (ret) {
 			log_debug("Cannot show splash screen\n");

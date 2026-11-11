@@ -9,9 +9,11 @@
 
 #define LOG_CATEGORY LOGC_EFI
 
+#include <abuf.h>
 #include <cpu_func.h>
 #include <ctxr_exec_window.h>
 #include <efi_loader.h>
+#include <gzip.h>
 #include <lmb.h>
 #include <log.h>
 #include <malloc.h>
@@ -21,8 +23,10 @@
 #include <crypto/mscode.h>
 #include <crypto/pkcs7_parser.h>
 #include <asm/sections.h>
+#include <asm/unaligned.h>
 #include <linux/err.h>
 #include <linux/sizes.h>
+#include <linux/zstd.h>
 
 const efi_guid_t efi_global_variable_guid = EFI_GLOBAL_VARIABLE_GUID;
 const efi_guid_t efi_guid_device_path = EFI_DEVICE_PATH_PROTOCOL_GUID;
@@ -918,6 +922,119 @@ static bool efi_linux_is_zboot(const struct linux_efi_header *hdr)
 	       le32_to_cpu(hdr->zboot_type) == LINUX_ZBOOT_TYPE;
 }
 
+/*
+ * The rest of a zboot header, after code0 and zboot_type: where the compressed
+ * kernel is in the file and how it was compressed. The size of the kernel it
+ * holds is a 32-bit little-endian value at the end of the compressed data. In
+ * gzip that is part of the format and counted in payload_size. For the other
+ * methods it is appended after payload_size bytes.
+ */
+struct linux_zboot_header {
+	__le32 code0;
+	__le32 zboot_type;
+	__le32 payload_offset;
+	__le32 payload_size;
+	__le32 reserved[2];
+	char comp_type[32];
+};
+
+/**
+ * efi_unpack_zboot_for_ctxr() - decompress a zboot kernel the window must hold
+ *
+ * A zboot image decompresses its kernel itself, into memory it picks from the
+ * memory map, which is outside the CTXR window, and then starts it in place.
+ * When a window is in use, decompress the kernel here instead, so that the
+ * arm64 Image it holds is loaded like any other Image: in the window, run in
+ * place by the EFI stub. The zboot image has already been authenticated by the
+ * caller, and the kernel is its payload.
+ *
+ * Only gzip and zstd, the methods of an arm64 zboot image that U-Boot has
+ * decompressors for, are handled. For any other method, or an image
+ * that doesn't decompress to an arm64 Image, *@image is left NULL and the
+ * zboot image is loaded as it is.
+ *
+ * @efi:		the PE file
+ * @efi_size:		size of @efi in bytes
+ * @image:		set to the decompressed kernel, to be freed with
+ *			efi_free_pages(), or NULL
+ * @image_size:		set to the size of *@image in bytes
+ */
+static void efi_unpack_zboot_for_ctxr(void *efi, size_t efi_size, void **image,
+				      size_t *image_size)
+{
+	const struct linux_zboot_header *zh = efi;
+	struct ctxr_exec_window win;
+	u32 off, len, size;
+	u64 buf;
+	bool zstd;
+	int ret;
+
+	*image = NULL;
+	*image_size = 0;
+
+	if (efi_size < sizeof(struct linux_efi_header) ||
+	    !efi_linux_is_zboot(efi) || !ctxr_exec_window_get(&win))
+		return;
+
+	/* Older kernels name it "zstd22" */
+	zstd = !strncmp(zh->comp_type, "zstd", sizeof(zh->comp_type)) ||
+	       !strncmp(zh->comp_type, "zstd22", sizeof(zh->comp_type));
+	if (!(zstd && IS_ENABLED(CONFIG_ZSTD)) &&
+	    !(!strncmp(zh->comp_type, "gzip", sizeof(zh->comp_type)) &&
+	      IS_ENABLED(CONFIG_GZIP))) {
+		log_warning("zboot: can't decompress '%.*s' here\n",
+			    (int)sizeof(zh->comp_type), zh->comp_type);
+		return;
+	}
+
+	off = le32_to_cpu(zh->payload_offset);
+	len = le32_to_cpu(zh->payload_size);
+	if (off > efi_size || len > efi_size - off || len < 4 ||
+	    (zstd && efi_size - off - len < 4)) {
+		log_err("zboot: payload [%#x, +%#x) is not in the file\n", off,
+			len);
+		return;
+	}
+	size = get_unaligned_le32(efi + off + len - (zstd ? 0 : 4));
+	if (size < sizeof(struct linux_efi_header)) {
+		log_err("zboot: bad kernel size %#x\n", size);
+		return;
+	}
+
+	if (efi_allocate_pages(EFI_ALLOCATE_ANY_PAGES, EFI_BOOT_SERVICES_DATA,
+			       efi_size_in_pages(size), &buf) != EFI_SUCCESS) {
+		log_err("zboot: no memory for the %#x byte kernel\n", size);
+		return;
+	}
+
+	if (IS_ENABLED(CONFIG_ZSTD) && zstd) {
+		struct abuf in, out;
+
+		abuf_init_set(&in, efi + off, len);
+		abuf_init_set(&out, (void *)(uintptr_t)buf, size);
+		ret = zstd_decompress(&in, &out);
+		ret = ret == size ? 0 : -EINVAL;
+	} else if (IS_ENABLED(CONFIG_GZIP)) {
+		unsigned long src_len = len;
+
+		ret = gunzip((void *)(uintptr_t)buf, size, efi + off, &src_len);
+	} else {
+		ret = -ENOSYS;
+	}
+
+	if (ret || le32_to_cpu(((struct linux_efi_header *)(uintptr_t)buf)->magic) !=
+		   LINUX_ARM64_IMAGE_MAGIC) {
+		log_err("zboot: the payload is not an arm64 Image\n");
+		efi_free_pages(buf, efi_size_in_pages(size));
+		return;
+	}
+
+	log_info("zboot: %#x byte kernel decompressed for the CTXR window\n",
+		 size);
+	*image = (void *)(uintptr_t)buf;
+	*image_size = size;
+}
+
 /* Confined cores cannot run runtime code outside the window */
 static void efi_warn_runtime_outside(const struct ctxr_exec_window *win)
 {
@@ -1080,9 +1197,12 @@ efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
  * to run it in place: that alignment and the protocol take the stub down its
  * path that neither moves the image nor randomises its physical address.
  *
- * A zboot image cannot be placed like this. Its decompressor picks the kernel's
+ * efi_load_pe() passes the kernel of a zboot image here once it has
+ * decompressed it, see efi_unpack_zboot_for_ctxr(). A zboot image it couldn't
+ * decompress can't be placed like this: its decompressor picks the kernel's
  * address from all of the memory map and does not look at the protocol. That,
- * or a window with no room, only gets a warning: the kernel still boots.
+ * or a window with no room, only gets a warning: the kernel boots on the boot
+ * CPU alone.
  *
  * @handle:		loaded image handle
  * @efi:		the PE file, already checked to hold an MS-DOS header
@@ -1109,7 +1229,7 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
 		return EFI_SUCCESS;
 
 	if (efi_linux_is_zboot(hdr)) {
-		ctxr_exec_warn_outside(&win, "a zboot kernel places itself, boot a plain Image");
+		ctxr_exec_warn_outside(&win, "a zboot kernel U-Boot can't decompress places itself, boot a plain Image");
 		return EFI_SUCCESS;
 	}
 	if (le32_to_cpu(hdr->magic) != LINUX_ARM64_IMAGE_MAGIC)
@@ -1143,6 +1263,8 @@ static efi_status_t efi_place_linux_in_ctxr_window(struct efi_loaded_image_obj *
  *
  * This function loads all sections from a PE binary into a newly reserved
  * piece of memory. On success the entry point is returned as handle->entry.
+ * When a CTXR window is in use, a zboot image's kernel is loaded in its place,
+ * see efi_unpack_zboot_for_ctxr().
  *
  * @handle:		loaded image handle
  * @efi:		pointer to the EFI binary
@@ -1167,6 +1289,10 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	unsigned long virt_size = 0;
 	u64 alloc_size;
 	int supported = 0;
+	void *file __maybe_unused = efi;
+	size_t file_size __maybe_unused = efi_size;
+	void *unpacked = NULL;
+	size_t unpacked_size;
 	efi_status_t ret;
 
 	ret = efi_check_pe(efi, efi_size, (void **)&nt);
@@ -1212,6 +1338,29 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	    efi_secure_boot_audit()) {
 		log_warning("Secure Boot audit: starting an image that is not authenticated\n");
 		handle->auth_status = EFI_IMAGE_AUTH_PASSED;
+	}
+
+	efi_unpack_zboot_for_ctxr(efi, efi_size, &unpacked, &unpacked_size);
+	if (unpacked) {
+		efi = unpacked;
+		efi_size = unpacked_size;
+		if (efi_check_pe(efi, efi_size, (void **)&nt) != EFI_SUCCESS ||
+		    nt->FileHeader.Machine != IMAGE_FILE_MACHINE_ARM64 ||
+		    nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+			log_err("zboot: the kernel is not an arm64 PE image\n");
+			ret = EFI_LOAD_ERROR;
+			goto err;
+		}
+		num_sections = nt->FileHeader.NumberOfSections;
+		sections = (void *)&nt->OptionalHeader +
+			   nt->FileHeader.SizeOfOptionalHeader;
+		if (efi_size < ((void *)sections +
+				sizeof(sections[0]) * num_sections - efi)) {
+			log_err("zboot: invalid number of sections: %d\n",
+				num_sections);
+			ret = EFI_LOAD_ERROR;
+			goto err;
+		}
 	}
 
 	/* Calculate upper virtual address boundary */
@@ -1273,7 +1422,7 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 
 #if IS_ENABLED(CONFIG_EFI_TCG2_PROTOCOL)
 	/* Measure an PE/COFF image */
-	ret = tcg2_measure_pe_image(efi, efi_size, handle, loaded_image_info);
+	ret = tcg2_measure_pe_image(file, file_size, handle, loaded_image_info);
 	if (ret == EFI_SECURITY_VIOLATION) {
 		/*
 		 * TCG2 Protocol is installed but no TPM device found,
@@ -1335,10 +1484,13 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	loaded_image_info->image_size = alloc_size;
 
 	if (handle->auth_status == EFI_IMAGE_AUTH_PASSED)
-		return EFI_SUCCESS;
+		ret = EFI_SUCCESS;
 	else
-		return EFI_SECURITY_VIOLATION;
+		ret = EFI_SECURITY_VIOLATION;
 
 err:
+	if (unpacked)
+		efi_free_pages((uintptr_t)unpacked,
+			       efi_size_in_pages(unpacked_size));
 	return ret;
 }

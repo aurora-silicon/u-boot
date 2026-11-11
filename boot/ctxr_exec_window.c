@@ -72,8 +72,8 @@ static bool ctxr_exec_overlaps(u64 start, u64 size, u64 addr, u64 len)
 /* The device tree's reservations are all there is before LMB starts */
 static bool ctxr_exec_reserved(const void *fdt, u64 start, u64 size)
 {
-	struct fdt_resource res;
-	int i, node, sub;
+	const fdt32_t *reg;
+	int i, node, sub, na, ns, reg_len;
 	u64 addr, len;
 
 	for (i = 0; i < fdt_num_mem_rsv(fdt); i++) {
@@ -86,11 +86,25 @@ static bool ctxr_exec_reserved(const void *fdt, u64 start, u64 size)
 	if (node < 0)
 		return false;
 
+	/*
+	 * This runs with the D-cache off, where fdt_get_resource() walking the
+	 * tree from its root for each node's parent and address translation
+	 * took 16 s on a J616s. The children's reg uses this node's cells, and
+	 * the binding gives it an empty ranges, so reg is the physical address.
+	 */
+	na = fdt_address_cells(fdt, node);
+	ns = fdt_size_cells(fdt, node);
+	if (na < 0 || ns < 0)
+		return false;
+
 	fdt_for_each_subnode(sub, fdt, node) {
-		if (!fdt_get_resource(fdt, sub, "reg", 0, &res) &&
-		    fdtdec_get_is_enabled(fdt, sub) &&
-		    ctxr_exec_overlaps(start, size, res.start,
-				       fdt_resource_size(&res)))
+		reg = fdt_getprop(fdt, sub, "reg", &reg_len);
+		if (!reg || reg_len < (na + ns) * (int)sizeof(*reg) ||
+		    !fdtdec_get_is_enabled(fdt, sub))
+			continue;
+		addr = fdtdec_get_number(reg, na);
+		len = fdtdec_get_number(reg + na, ns);
+		if (ctxr_exec_overlaps(start, size, addr, len))
 			return true;
 	}
 

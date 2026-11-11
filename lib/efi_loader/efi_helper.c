@@ -624,6 +624,10 @@ efi_status_t efi_install_fdt(void *fdt)
 		}
 	}
 
+	/* Images loaded before this copy existed go in its boot record */
+	if (IS_ENABLED(CONFIG_EFI_AURORA_MEASURE))
+		efi_aurora_flush(fdt);
+
 	/* Install device tree as UEFI table */
 	ret = efi_install_configuration_table(&efi_guid_fdt, fdt);
 	if (ret != EFI_SUCCESS) {

@@ -664,7 +664,7 @@ static bool efi_image_authenticate(void *efi, size_t efi_size)
 
 	log_debug("%s: Enter, %d\n", __func__, ret);
 
-	if (!efi_secure_boot_enabled())
+	if (!efi_secure_boot_enabled() && !efi_secure_boot_audit())
 		return true;
 
 	new_efi = efi_prepare_aligned_image(efi, &new_efi_size);
@@ -1329,6 +1329,15 @@ efi_status_t efi_load_pe(struct efi_loaded_image_obj *handle,
 	} else {
 		handle->auth_status = EFI_IMAGE_AUTH_FAILED;
 		log_err("Image not authenticated\n");
+	}
+	if (IS_ENABLED(CONFIG_EFI_AURORA_MEASURE))
+		efi_aurora_measure(efi, efi_size,
+				   handle->auth_status == EFI_IMAGE_AUTH_PASSED);
+	/* Audit: the failure is recorded above, and the image still runs. */
+	if (handle->auth_status == EFI_IMAGE_AUTH_FAILED &&
+	    efi_secure_boot_audit()) {
+		log_warning("Secure Boot audit: starting an image that is not authenticated\n");
+		handle->auth_status = EFI_IMAGE_AUTH_PASSED;
 	}
 
 	efi_unpack_zboot_for_ctxr(efi, efi_size, &unpacked, &unpacked_size);

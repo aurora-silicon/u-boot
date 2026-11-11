@@ -1580,7 +1580,12 @@ static void apple_efi_late_init(bool start_keyboard)
 	 * until the USB-C PHY support has been validated; "usb start" still
 	 * works by hand.
 	 */
-	if (!strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
+	/*
+	 * Under UEFI Secure Boot the configured bootcmd stays: aurora_boot
+	 * falls back to booti, which no signature check covers.
+	 */
+	if (!IS_ENABLED(CONFIG_EFI_SECURE_BOOT) &&
+	    !strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
 		env_set("bootcmd", "run aurora_boot");
 	if (!strcmp(env_get("boot_targets") ?: "", "nvme usb"))
 		env_set("boot_targets", "nvme");

@@ -617,6 +617,9 @@ efi_status_t efi_env_set_load_options(efi_handle_t handle, const char *env_var,
 				      u16 **load_options);
 /* Get EFI configuration table */
 void *efi_get_configuration_table(const efi_guid_t *guid);
+/* Record a loaded EFI image in /chosen/aurora,boot-security of the OS FDT */
+void efi_aurora_measure(const void *efi, size_t efi_size, bool authenticated);
+void efi_aurora_flush(void *fdt);
 /* Install device tree */
 efi_status_t efi_install_fdt(void *fdt);
 /* Install initrd */
@@ -1136,6 +1139,7 @@ struct efi_signature_store *efi_build_signature_store(void *sig_list,
 struct efi_signature_store *efi_sigstore_parse_sigdb(u16 *name);
 
 bool efi_secure_boot_enabled(void);
+bool efi_secure_boot_audit(void);
 
 bool efi_capsule_auth_enabled(void);
 

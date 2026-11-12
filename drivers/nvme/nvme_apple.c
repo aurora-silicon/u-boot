@@ -27,6 +27,9 @@
 #define REG_CPU_CTRL		0x0044
 #define  REG_CPU_CTRL_RUN	BIT(4)
 #define REG_CPU_STATUS		0x0048
+#define  REG_CPU_STATUS_STOPPED	BIT(1)
+/* Measured on the J700: set after a reset of ANS, until the run bit (0x6a, against 0x62). */
+#define  REG_CPU_STATUS_RESET	BIT(3)
 #define REG_MBOX_A2I_CTRL	0x0110
 #define REG_MBOX_I2A_CTRL	0x0114
 #define  REG_MBOX_RECV_ENABLE	BIT(0)
@@ -703,12 +706,54 @@ static int apple_nvme_wake(struct udevice *dev)
 	return 0;
 }
 
+/* Write the SART entries passed in apple,sart-entries: (index << 8 | flags), address, size. */
+static int apple_nvme_sart_restore(struct udevice *dev, const fdt64_t *cells, int len)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	int i;
+
+	for (i = 0; i + 3 <= len / sizeof(*cells); i += 3) {
+		u64 key = fdt64_to_cpu(cells[i]);
+
+		if (!sart_set_entry(priv->sart, key >> 8, key & 0xff,
+				    (void *)fdt64_to_cpu(cells[i + 1]),
+				    fdt64_to_cpu(cells[i + 2]))) {
+			dev_err(dev, "can't write SART entry %llu back\n", key >> 8);
+			return -EIO;
+		}
+	}
+	return i / 3;
+}
+
+/*
+ * Stop the CPU and reset ANS, which takes its SART entries with it: a CPU stopped without a
+ * reset since its last run doesn't start again from the run bit.
+ */
+static void apple_nvme_ans_reset(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 stat;
+
+	clrbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	readl_poll_sleep_timeout(priv->asc + REG_CPU_STATUS, stat,
+				 stat & REG_CPU_STATUS_STOPPED, 100, 100000);
+	reset_assert_bulk(&priv->resets);
+	udelay(10);
+	reset_deassert_bulk(&priv->resets);
+	readl_poll_sleep_timeout(priv->asc + REG_CPU_STATUS, stat,
+				 stat & REG_CPU_STATUS_RESET, 100, 10000);
+	printf("%s: ANS reset: status %#x\n", dev->name, stat);
+}
+
 /*
  * Post-M4, powered off by the boot loader stage that used it: its PCIe block
  * is back up, ANS's CPU is stopped and the SART has lost its entries.  The
  * stage passed them in apple,sart-entries: per entry (index << 8 | flags),
  * address and size, 64 bits each.  Write them back and start the firmware as
  * after a power loss.  It keeps the buffers it was given.
+ *
+ * ANS is reset first when its CPU isn't in its reset state, and once more,
+ * with the entries written again, when the firmware doesn't answer the run bit.
  */
 static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 				     int len)
@@ -716,7 +761,8 @@ static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 phandle, stat;
 	void *mbox;
-	int i, ret;
+	int n, ret, attempt;
+	bool can_reset;
 
 	if (readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN) {
 		dev_err(dev, "ANS is running, but the boot loader passed it on powered off\n");
@@ -731,39 +777,52 @@ static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 	priv->sart = sart_init(ofnode_get_by_phandle(phandle));
 	if (!priv->sart)
 		return -EINVAL;
-	for (i = 0; i + 3 <= len / sizeof(*cells); i += 3) {
-		u64 key = fdt64_to_cpu(cells[i]);
-
-		if (!sart_set_entry(priv->sart, key >> 8, key & 0xff,
-				    (void *)fdt64_to_cpu(cells[i + 1]),
-				    fdt64_to_cpu(cells[i + 2]))) {
-			dev_err(dev, "can't write SART entry %llu back\n", key >> 8);
-			return -EIO;
-		}
-	}
-
-	priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup, NULL);
-	if (!priv->rtk)
-		return -ENOMEM;
-	/* As macOS does before the run bit after a sleep: the mailbox's receive side on. */
 	mbox = dev_read_addr_ptr(priv->chan.dev);
 	if (!mbox)
 		return -EINVAL;
-	debug("%s: before the run bit: CPU %#x status %#x, mailbox A2I %#x I2A %#x\n", dev->name,
-	      readl(priv->asc + REG_CPU_CTRL), readl(priv->asc + REG_CPU_STATUS),
-	      readl(mbox + REG_MBOX_A2I_CTRL), readl(mbox + REG_MBOX_I2A_CTRL));
-	setbits_le32(mbox + REG_MBOX_I2A_CTRL, REG_MBOX_RECV_ENABLE);
-	setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
-	ret = apple_rtkit_boot_warm(priv->rtk, BIT(0));
-	if (!ret)
-		ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
-					       stat == ANS_BOOT_STATUS_OK, 100, 1000000);
-	if (ret) {
-		printf("%s: ANS didn't start from off (%d); it stays down until a reboot\n",
-		       dev->name, ret);
-		return ret;
+	can_reset = !reset_get_bulk(dev, &priv->resets);
+
+	stat = readl(priv->asc + REG_CPU_STATUS);
+	if (!(stat & REG_CPU_STATUS_RESET)) {
+		printf("%s: ANS isn't in its reset state (status %#x)%s\n", dev->name, stat,
+		       can_reset ? ": resetting it" : ", and has no reset");
+		if (can_reset)
+			apple_nvme_ans_reset(dev);
 	}
-	debug("%s: ANS started from off, %d SART entries written back\n", dev->name, i / 3);
+
+	for (attempt = 0;; attempt++) {
+		n = apple_nvme_sart_restore(dev, cells, len);
+		if (n < 0)
+			return n;
+		priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup, NULL);
+		if (!priv->rtk)
+			return -ENOMEM;
+		/* As macOS does before the run bit after a sleep: the mailbox's receive side on. */
+		printf("%s: ANS from off: status %#x before the run bit\n", dev->name,
+		       readl(priv->asc + REG_CPU_STATUS));
+		debug("%s: before the run bit: CPU %#x, mailbox A2I %#x I2A %#x\n", dev->name,
+		      readl(priv->asc + REG_CPU_CTRL), readl(mbox + REG_MBOX_A2I_CTRL),
+		      readl(mbox + REG_MBOX_I2A_CTRL));
+		setbits_le32(mbox + REG_MBOX_I2A_CTRL, REG_MBOX_RECV_ENABLE);
+		setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+		ret = apple_rtkit_boot_warm(priv->rtk, BIT(0));
+		if (!ret)
+			ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+						       stat == ANS_BOOT_STATUS_OK, 100, 1000000);
+		if (!ret)
+			break;
+		if (attempt || !can_reset) {
+			printf("%s: ANS didn't start from off (%d); it stays down until a reboot\n",
+			       dev->name, ret);
+			return ret;
+		}
+		printf("%s: ANS didn't start from off (%d, status %#x): resetting it and starting it again\n",
+		       dev->name, ret, readl(priv->asc + REG_CPU_STATUS));
+		apple_rtkit_free(priv->rtk);
+		priv->rtk = NULL;
+		apple_nvme_ans_reset(dev);
+	}
+	debug("%s: ANS started from off, %d SART entries written back\n", dev->name, n);
 	priv->woken = true;
 	ans_started_from_off = true;
 	/* Answer its log traffic while commands are outstanding. */

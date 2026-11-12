@@ -961,6 +961,17 @@ static const struct udevice_id apple_nvme_ids[] = {
 	  .data = (ulong)&apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2",
 	  .data = (ulong)&apple_nvme_t8132_hw },
+	/*
+	 * T8140 (A18 Pro) and T8142 (M5) use the post-M4 layout: Linux's
+	 * entries for both set the same layout flags as its T8132 one.  The
+	 * J813 device tree lists only "apple,t8142-nvme-ans2",
+	 * "apple,t8140-nvme-ans2", so without these U-Boot binds no NVMe
+	 * controller there.
+	 */
+	{ .compatible = "apple,t8142-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t8132_hw },
+	{ .compatible = "apple,t8140-nvme-ans2",
+	  .data = (ulong)&apple_nvme_t8132_hw },
 	{ .compatible = "apple,nvme-ans2",
 	  .data = (ulong)&apple_nvme_t8103_hw },
 	{ /* sentinel */ }

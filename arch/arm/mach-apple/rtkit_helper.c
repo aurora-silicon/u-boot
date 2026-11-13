@@ -12,7 +12,9 @@
 #include <malloc.h>
 #include <mapmem.h>
 #include <reset.h>
+#include <linux/bitfield.h>
 #include <linux/libfdt.h>
+#include <u-boot/crc.h>
 
 #include <asm/io.h>
 #include <asm/arch/dart.h>
@@ -25,6 +27,17 @@
 #define  REG_CPU_CTRL_RUN	BIT(4)
 
 #define APPLE_RTKIT_EP_OSLOG 8
+
+/* PMGR power state words */
+#define PS_RESET		BIT(31)
+#define PS_AUTO_ENABLE		BIT(28)
+#define PS_BUSY			BIT(11)
+#define PS_DEV_DISABLE		BIT(10)
+#define PS_FLAGS		GENMASK(9, 8)
+#define PS_ACTUAL		GENMASK(7, 4)
+#define PS_TARGET		GENMASK(3, 0)
+#define PS_ACTIVE		0xf
+#define PS_MAX_WORDS		8
 
 /* Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs. */
 #define RTKIT_HELPER_HANDOFF	"mtp-live-v1"
@@ -56,6 +69,13 @@ struct rtkit_helper_priv {
 	bool handoff_published;
 	const void *published_fdt;
 	bool input_ready;
+	/*
+	 * Parked at OS entry (/chosen/aurora,mtp-handoff = "off"): the firmware SRAM as it
+	 * was before the first run, in memory U-Boot never gives back.
+	 */
+	phys_addr_t image;
+	phys_size_t image_size;
+	u32 image_crc;
 };
 
 /* J613 retains the first MTP epoch, with OSLog in SRAM. */
@@ -89,7 +109,78 @@ static bool rtkit_helper_j713_handoff(struct udevice *dev)
  */
 static bool rtkit_helper_sleeps(struct udevice *dev)
 {
-	return device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
+	const char *v = ofnode_read_string(ofnode_path("/chosen"), "aurora,mtp-handoff");
+
+	return device_is_compatible(dev, "apple,t8140-rtk-helper-asc4") && v &&
+	       !strcmp(v, "off");
+}
+
+/*
+ * Before the first run: keep the firmware SRAM's image, which only iBoot can load, so the OS
+ * can start the firmware again as one nobody ran.
+ */
+static void rtkit_helper_save_image(struct udevice *dev)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+	fdt_size_t size;
+	fdt_addr_t fw = dev_read_addr_size_name(dev, "firmware", &size);
+	phys_addr_t addr;
+
+	if (fw == FDT_ADDR_T_NONE || !size ||
+	    lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_16K, &addr, size, LMB_NOOVERWRITE)) {
+		dev_err(dev, "can't keep the firmware image; the OS gets the MTP running\n");
+		return;
+	}
+	memcpy_fromio(map_sysmem(addr, size), map_sysmem(fw, size), size);
+	flush_dcache_range(addr, addr + size);
+	priv->image = addr;
+	priv->image_size = size;
+	priv->image_crc = crc32(0, map_sysmem(addr, size), size);
+}
+
+/* One PS word fully on with automatic power management off; RESET/DEV_DISABLE kept. */
+static int rtkit_helper_ps_pin(void *word)
+{
+	u32 val = readl(word);
+
+	val &= ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET);
+	writel(val | PS_ACTIVE, word);
+	return readl_poll_timeout(word, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE &&
+				  !(val & PS_BUSY), 5000);
+}
+
+/*
+ * After the stop: the MTP's whole power chain on with no automatic power management (its
+ * SRAM has two parents, the SCM fabric and the CPU), then its CPU disabled and held in reset
+ * for the OS, which writes the saved image back before it lets the CPU go.
+ */
+static int rtkit_helper_park(struct udevice *dev)
+{
+	ofnode pmgr = ofnode_get_by_phandle(dev_read_u32_default(dev, "apple,aon-pmgr", 0));
+	u32 words[PS_MAX_WORDS], cpu, val;
+	fdt_addr_t base = ofnode_get_addr(pmgr);
+	int n, i, ret;
+
+	n = dev_read_size(dev, "apple,aon-power-words") / sizeof(u32);
+	if (base == FDT_ADDR_T_NONE || n < 1 || n > PS_MAX_WORDS ||
+	    dev_read_u32_array(dev, "apple,aon-power-words", words, n) ||
+	    dev_read_u32(dev, "apple,aon-cpu-word", &cpu))
+		return -EINVAL;
+	for (i = 0; i < n; i++) {
+		ret = rtkit_helper_ps_pin(map_sysmem(base + words[i], 4));
+		if (ret) {
+			dev_err(dev, "power word %#x didn't come on: %#x\n", words[i],
+				readl(map_sysmem(base + words[i], 4)));
+			return ret;
+		}
+	}
+	setbits_le32(map_sysmem(base + cpu, 4), PS_DEV_DISABLE);
+	ret = readl_poll_timeout(map_sysmem(base + cpu, 4), val, !(val & PS_BUSY), 1000);
+	if (ret)
+		return ret;
+	setbits_le32(map_sysmem(base + cpu, 4), PS_RESET);
+	debug("%s: parked, CPU word %#x\n", dev->name, readl(map_sysmem(base + cpu, 4)));
+	return 0;
 }
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
@@ -259,6 +350,8 @@ static int rtkit_helper_probe(struct udevice *dev)
 	}
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
+	if (rtkit_helper_sleeps(dev) && !(ctrl & REG_CPU_CTRL_RUN))
+		rtkit_helper_save_image(dev);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
 
 	priv->rtk = apple_rtkit_init(&priv->chan, dev, shmem_setup, shmem_destroy);
@@ -298,8 +391,8 @@ err_stop:
 static void rtkit_helper_stop(struct udevice *dev)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
-	int state = rtkit_helper_sleeps(dev) ? APPLE_RTKIT_PWR_STATE_SLEEP :
-					    APPLE_RTKIT_PWR_STATE_QUIESCED;
+	int state = priv->image ? APPLE_RTKIT_PWR_STATE_SLEEP :
+				  APPLE_RTKIT_PWR_STATE_QUIESCED;
 	u32 ctrl;
 	int ret;
 
@@ -312,6 +405,12 @@ static void rtkit_helper_stop(struct udevice *dev)
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl & ~REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
 	readl(priv->asc + REG_CPU_CTRL);
+	/* Once: a repeated stop (failed FDT preparation) finds it parked already. */
+	if (priv->image && priv->rtk) {
+		ret = rtkit_helper_park(dev);
+		if (ret)
+			dev_err(dev, "couldn't park the MTP (%d)\n", ret);
+	}
 	priv->handoff_published = false;
 	priv->published_fdt = NULL;
 	priv->input_ready = false;
@@ -629,6 +728,36 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	return 0;
 }
 
+/* The saved firmware image as no-map reserved memory, and where it is on the helper's node. */
+static int rtkit_helper_fdt_publish_image(struct udevice *dev, void *blob)
+{
+	struct rtkit_helper_priv *priv = dev_get_priv(dev);
+	int node, resv, sub, ret;
+	fdt64_t reg[2];
+	char name[40];
+
+	if (!priv->image)
+		return -ENOENT;
+	node = rtkit_helper_fdt_node(blob, dev);
+	resv = fdt_path_offset(blob, "/reserved-memory");
+	if (node < 0 || resv < 0)
+		return node < 0 ? node : resv;
+	snprintf(name, sizeof(name), "mtp-image@%llx", (unsigned long long)priv->image);
+	sub = fdt_subnode_offset(blob, resv, name);
+	if (sub == -FDT_ERR_NOTFOUND)
+		sub = fdt_add_subnode(blob, resv, name);
+	if (sub < 0)
+		return sub;
+	reg[0] = cpu_to_fdt64(priv->image);
+	reg[1] = cpu_to_fdt64(priv->image_size);
+	ret = fdt_setprop(blob, sub, "reg", reg, sizeof(reg));
+	ret = ret ?: fdt_setprop_empty(blob, sub, "no-map");
+	node = rtkit_helper_fdt_node(blob, dev);
+	ret = ret ?: node < 0 ? node : fdt_setprop(blob, node, "apple,sram-image", reg, sizeof(reg));
+	ret = ret ?: fdt_setprop_u32(blob, node, "apple,sram-image-crc32", priv->image_crc);
+	return ret;
+}
+
 int apple_rtkit_helper_fdt_fixup(void *blob)
 {
 	struct udevice *dev;
@@ -643,9 +772,18 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
 		     !rtkit_helper_j613_handoff(dev)))
 			continue;
-		/* Stopped at OS entry, so the OS has nothing to adopt. */
-		if (rtkit_helper_sleeps(dev))
-			continue;
+		/*
+		 * Parked at OS entry: the OS gets the saved image, and nothing to adopt.
+		 * Without the image it gets the running session, as before.
+		 */
+		if (dev_get_priv(dev) && ((struct rtkit_helper_priv *)dev_get_priv(dev))->image) {
+			ret = rtkit_helper_fdt_publish_image(dev, blob);
+			if (!ret)
+				continue;
+			dev_err(dev, "couldn't pass the firmware image on (%d); handing it over running\n",
+				ret);
+			((struct rtkit_helper_priv *)dev_get_priv(dev))->image = 0;
+		}
 
 		priv = dev_get_priv(dev);
 		bool was_published = priv->handoff_published;

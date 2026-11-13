@@ -312,6 +312,13 @@ static struct {
 static int ans_handoff_nbufs;
 /* This stage started ANS from off: Linux gets it running, not off. */
 static bool ans_started_from_off;
+/*
+ * /chosen/aurora,nvme-handoff = "off": a post-M4 ANS goes to the OS powered off, its SART
+ * entries in apple,sart-entries, and the OS starts it itself (see apple_nvme_pass_off()).
+ */
+#define ANS_MAX_SART_ENTRIES	16
+static struct apple_sart *ans_off_sart;
+static char ans_off_path[128];
 
 static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
 {
@@ -372,7 +379,30 @@ int apple_nvme_fdt_fixup(void *blob)
 	char name[40];
 	fdt64_t reg[2];
 
-	for (sub = fdt_next_node(blob, -1, NULL); ans_started_from_off && sub >= 0;
+	if (ans_off_sart) {
+		/*
+		 * Read now, while ANS runs with them; apple_nvme_pass_off() stops it
+		 * when the devices are removed for the OS.
+		 */
+		u64 cells[3 * ANS_MAX_SART_ENTRIES];
+		fdt64_t prop[3 * ANS_MAX_SART_ENTRIES];
+		int n = sart_get_entries(ans_off_sart, cells, ANS_MAX_SART_ENTRIES);
+
+		sub = fdt_path_offset(blob, ans_off_path);
+		for (i = 0; i < 3 * n; i++)
+			prop[i] = cpu_to_fdt64(cells[i]);
+		ret = sub < 0 ? sub : !n ? -ENOENT :
+		      fdt_setprop(blob, sub, "apple,sart-entries", prop, 3 * n * sizeof(*prop));
+		if (ret) {
+			/* Then it goes on running, as without aurora,nvme-handoff. */
+			printf("ANS: couldn't pass its SART entries on (%d); it goes to the OS running\n",
+			       ret);
+			ans_off_sart = NULL;
+		} else {
+			printf("ANS goes to the OS powered off, %d SART entries passed on\n", n);
+		}
+	}
+	for (sub = fdt_next_node(blob, -1, NULL); ans_started_from_off && !ans_off_sart && sub >= 0;
 	     sub = fdt_next_node(blob, sub, NULL)) {
 		if (fdt_getprop(blob, sub, "apple,sart-entries", NULL)) {
 			fdt_delprop(blob, sub, "apple,sart-entries");
@@ -1001,6 +1031,36 @@ static int apple_nvme_boot(struct udevice *dev)
  */
 static bool apple_nvme_adopt_failed;
 
+static bool apple_nvme_handoff_off(struct udevice *dev)
+{
+	const char *v = ofnode_read_string(ofnode_path("/chosen"), "aurora,nvme-handoff");
+
+	return v && !strcmp(v, "off");
+}
+
+/* For apple_nvme_fdt_fixup(): the SART that ANS runs with now, and the nvme node's path. */
+static int apple_nvme_arm_pass_off(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 phandle;
+	int ret;
+
+	if (!priv->sart) {
+		ret = dev_read_u32(dev, "apple,sart", &phandle);
+		if (ret < 0)
+			return ret;
+		priv->sart = sart_init(ofnode_get_by_phandle(phandle));
+		if (!priv->sart)
+			return -EINVAL;
+	}
+	ret = ofnode_get_path(dev_ofnode(dev), ans_off_path, sizeof(ans_off_path));
+	if (ret)
+		return ret;
+	ans_off_sart = priv->sart;
+
+	return 0;
+}
+
 static int apple_nvme_probe(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
@@ -1058,14 +1118,67 @@ static int apple_nvme_probe(struct udevice *dev)
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
 		apple_nvme_adopt_failed = true;
+	if (!ret && priv->hw->post_m4 && apple_nvme_handoff_off(dev) &&
+	    apple_nvme_arm_pass_off(dev))
+		printf("%s: ANS goes to the OS running\n", dev->name);
 
 	return ret;
+}
+
+/*
+ * Post-M4, /chosen/aurora,nvme-handoff = "off": hand ANS to the OS stopped, as aura hands it to
+ * U-Boot, instead of with its session live.  Stop the controller, put the firmware to sleep,
+ * then reset ANS, which takes the SART entries with it; apple_nvme_fdt_fixup() passed those on
+ * in apple,sart-entries.  The OS writes them back and starts the firmware warm.
+ */
+static int apple_nvme_pass_off(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	int ret;
+
+	if (nvme_retire_io_queues(dev))
+		printf("%s: could not delete the I/O queues\n", dev->name);
+	ret = apple_nvme_disable_post_m4(priv);
+	if (ret)
+		return ret;
+
+	/* An adopted session has no RTKit instance of ours until now. */
+	if (!priv->rtk) {
+		if (!priv->adopted_mbox && mbox_get_by_index(dev, 0, &priv->chan))
+			return -ENODEV;
+		priv->rtk = apple_rtkit_init(&priv->chan, priv, NULL, NULL);
+		if (!priv->rtk)
+			return -ENOMEM;
+	}
+	ret = apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_SLEEP);
+	if (ret)
+		printf("%s: ANS didn't acknowledge sleep (%d); resetting it anyway\n",
+		       dev->name, ret);
+	priv->adopted_mbox = false;
+
+	if (!priv->resets.count && reset_get_bulk(dev, &priv->resets))
+		return -ENODEV;
+	apple_nvme_ans_reset(dev);
+	if (!(readl(priv->asc + REG_CPU_STATUS) & REG_CPU_STATUS_RESET))
+		return -EIO;
+	debug("%s: ANS handed to the OS powered off\n", dev->name);
+
+	return 0;
 }
 
 static int apple_nvme_remove(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
+
+	if (priv->hw->post_m4 && ans_off_sart) {
+		int ret = apple_nvme_pass_off(dev);
+
+		if (ret)
+			printf("%s: couldn't hand ANS to the OS powered off (%d)\n",
+			       dev->name, ret);
+		return 0;
+	}
 
 	if (priv->hw->post_m4) {
 		/*

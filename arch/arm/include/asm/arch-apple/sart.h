@@ -19,5 +19,6 @@ void sart_free(struct apple_sart *sart);
 bool sart_add_allowed_region(struct apple_sart *sart, void *paddr, size_t sz);
 bool sart_remove_allowed_region(struct apple_sart *sart, void *paddr, size_t sz);
 bool sart_set_entry(struct apple_sart *sart, int index, u8 flags, void *paddr, size_t sz);
+int sart_get_entries(struct apple_sart *sart, u64 *cells, int max);
 
 #endif

@@ -345,6 +345,27 @@ static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf
 	return 0;
 }
 
+/* A session that won't be handed on (a start being retried): its buffers go back to LMB. */
+static void nvme_handoff_shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf)
+{
+	struct apple_nvme_priv *priv = (struct apple_nvme_priv *)cookie;
+	int i;
+
+	if (!buf || !buf->buffer)
+		return;
+
+	sart_remove_allowed_region(priv->sart, buf->buffer, buf->size);
+	for (i = 0; i < ans_handoff_nbufs; i++) {
+		if (ans_handoff_bufs[i].addr != buf->dva)
+			continue;
+		lmb_free(ans_handoff_bufs[i].addr, ans_handoff_bufs[i].size, LMB_NOOVERWRITE);
+		ans_handoff_bufs[i] = ans_handoff_bufs[--ans_handoff_nbufs];
+		break;
+	}
+	buf->buffer = NULL;
+	buf->dva = 0;
+}
+
 int apple_nvme_fdt_fixup(void *blob)
 {
 	int resv, sub, i, ret;
@@ -827,7 +848,8 @@ static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 		n = apple_nvme_sart_restore(dev, cells, len);
 		if (n < 0)
 			return n;
-		priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup, NULL);
+		priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup,
+					     nvme_handoff_shmem_destroy);
 		if (!priv->rtk)
 			return -ENOMEM;
 		/* As macOS does before the run bit after a sleep: the mailbox's receive side on. */

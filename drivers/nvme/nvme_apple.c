@@ -93,12 +93,12 @@ struct ans_nvmmu_tcb {
 
 /*
  * On post-M4 controllers (A18 Pro/T8140 and M4/T8132 onwards) the
- * NVMMU has its own register window, the I/O queue addresses are also
- * programmed through dedicated registers, and the ANS coprocessor cannot
- * be reset or restarted once running: clearing CPU_CTRL.RUN is one-way
- * and asserting its PMGR reset raises an SError.  The boot loader that
- * started the firmware (m1n1) hands it over with its RTKit session live,
- * and every later stage adopts that session instead of booting it.
+ * NVMMU has its own register window and the I/O queue addresses are also
+ * programmed through dedicated registers.  The firmware stays resident in
+ * DRAM: a stage done with ANS idles it and powers it off, and the next one
+ * writes the SART entries back and starts it warm (apple,sart-entries, see
+ * apple_nvme_start_from_off()).  A running session handed over by an older
+ * boot loader is still adopted.
  */
 struct apple_nvme_hw {
 	bool post_m4;
@@ -813,7 +813,7 @@ static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 				     int len)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
-	u32 phandle, stat;
+	u32 phandle, stat, boot_status;
 	void *mbox;
 	int n, ret, attempt;
 	bool can_reset;
@@ -836,9 +836,16 @@ static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
 		return -EINVAL;
 	can_reset = !reset_get_bulk(dev, &priv->resets);
 
+	/*
+	 * A power cycle leaves the CPU in its reset state and the firmware's boot
+	 * status cleared.  If either survived, the CPU was only stopped since it
+	 * last ran, and it doesn't start again from the run bit.
+	 */
 	stat = readl(priv->asc + REG_CPU_STATUS);
-	if (!(stat & REG_CPU_STATUS_RESET)) {
-		printf("%s: ANS isn't in its reset state (status %#x)%s\n", dev->name, stat,
+	boot_status = readl(priv->base + ANS_BOOT_STATUS);
+	if (!(stat & REG_CPU_STATUS_RESET) || boot_status == ANS_BOOT_STATUS_OK) {
+		printf("%s: ANS isn't in its reset state (status %#x, boot status %#x)%s\n",
+		       dev->name, stat, boot_status,
 		       can_reset ? ": resetting it" : ", and has no reset");
 		if (can_reset)
 			apple_nvme_ans_reset(dev);

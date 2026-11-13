@@ -772,20 +772,20 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
 		     !rtkit_helper_j613_handoff(dev)))
 			continue;
+		priv = dev_get_priv(dev);
 		/*
 		 * Parked at OS entry: the OS gets the saved image, and nothing to adopt.
 		 * Without the image it gets the running session, as before.
 		 */
-		if (dev_get_priv(dev) && ((struct rtkit_helper_priv *)dev_get_priv(dev))->image) {
+		if (priv->image) {
 			ret = rtkit_helper_fdt_publish_image(dev, blob);
 			if (!ret)
 				continue;
 			dev_err(dev, "couldn't pass the firmware image on (%d); handing it over running\n",
 				ret);
-			((struct rtkit_helper_priv *)dev_get_priv(dev))->image = 0;
+			priv->image = 0;
 		}
 
-		priv = dev_get_priv(dev);
 		bool was_published = priv->handoff_published;
 		size_t capacity = fdt_totalsize(blob);
 		void *scratch = malloc(capacity);

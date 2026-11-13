@@ -276,3 +276,38 @@ bool sart_remove_allowed_region(struct apple_sart *sart, void *paddr, size_t sz)
 	printf("sart: could not find entry to be removed\n");
 	return false;
 }
+
+/* An entry as an earlier owner had it, written back after the SART lost its power. */
+bool sart_set_entry(struct apple_sart *sart, int index, u8 flags, void *paddr, size_t sz)
+{
+	if (index < 0 || index >= APPLE_SART_MAX_ENTRIES ||
+	    !sart->set_entry(sart, index, flags, paddr, sz))
+		return false;
+	sart->protected_entries |= 1 << index;
+	return true;
+}
+
+/*
+ * The entries in use, for a stage that powers the coprocessor off and passes them on: per
+ * entry (index << 8 | flags), address and size.  Returns how many were written to cells.
+ */
+int sart_get_entries(struct apple_sart *sart, u64 *cells, int max)
+{
+	int n = 0;
+
+	for (unsigned int i = 0; i < APPLE_SART_MAX_ENTRIES && n < max; ++i) {
+		void *paddr;
+		u8 flags;
+		size_t sz;
+
+		sart->get_entry(sart, i, &flags, &paddr, &sz);
+		if (!flags)
+			continue;
+		cells[3 * n] = (u64)i << 8 | flags;
+		cells[3 * n + 1] = (u64)paddr;
+		cells[3 * n + 2] = sz;
+		n++;
+	}
+
+	return n;
+}

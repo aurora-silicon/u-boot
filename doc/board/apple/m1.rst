@@ -119,6 +119,13 @@ optional input may still be disabled. Input qualification must separately check
 the running ASC, and physical keyboard/trackpad response. A marker alone does
 not establish that the coprocessor is live.
 
+T8140 (J700) does not hand its MTP over running. U-Boot starts it for its own
+keyboard. Before OS entry it stops the MTP with an RTKit sleep, clears its run
+bit and releases its DART bypass. It reserves none of its buffers and publishes
+nothing for the OS. A firmware stopped this way starts again only from its
+reset vector, so the OS resets the MTP's CPU, sets the run bit and wakes RTKit.
+U-Boot still replays the saved INIT packets into the FIFO.
+
 CTXR executable window
 ----------------------
 

@@ -20,6 +20,7 @@
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
+#include <asm/sections.h>
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
 #include <asm/arch/j713_fdt.h>
@@ -1021,7 +1022,8 @@ static struct mm_region t8152_mem_map[] = {
 	}
 };
 
-struct mm_region *mem_map;
+/* In .data: arch_cpu_init() sets it before relocation, when .bss is not usable */
+struct mm_region *mem_map __section(".data");
 
 int board_init(void)
 {
@@ -1107,6 +1109,8 @@ static bool apple_dram_is_path(const void *fdt, int node)
 	       (!name[6] || name[6] == '@');
 }
 
+static void apple_early_map_dram(void);
+
 int dram_init(void)
 {
 	const void *fdt = gd->fdt_blob;
@@ -1151,6 +1155,7 @@ int dram_init(void)
 	}
 	gd->ram_base = (unsigned long)start;
 	gd->ram_size = size;
+	apple_early_map_dram();
 
 	return 0;
 }
@@ -1184,6 +1189,45 @@ int board_fdt_blob_setup(void **fdtp)
 	return 0;
 }
 
+/* The memory map of the SoC, or NULL */
+static struct mm_region *apple_soc_mem_map(void)
+{
+	if (of_machine_is_compatible("apple,t8103") ||
+	    of_machine_is_compatible("apple,t8112"))
+		return t8103_mem_map;
+	else if (of_machine_is_compatible("apple,t6000") ||
+		 of_machine_is_compatible("apple,t6001"))
+		return t6000_mem_map;
+	else if (of_machine_is_compatible("apple,t6002"))
+		return t6002_mem_map;
+	else if (of_machine_is_compatible("apple,t6020") ||
+		 of_machine_is_compatible("apple,t6021"))
+		return t6020_mem_map;
+	else if (of_machine_is_compatible("apple,t6022"))
+		return t6022_mem_map;
+	else if (of_machine_is_compatible("apple,t8122"))
+		return t8122_mem_map;
+	else if (of_machine_is_compatible("apple,t6030") ||
+		 of_machine_is_compatible("apple,t6031") ||
+		 of_machine_is_compatible("apple,t6034"))
+		return t6030_mem_map;
+	else if (of_machine_is_compatible("apple,t8132"))
+		return t8132_mem_map;
+	else if (of_machine_is_compatible("apple,t8140"))
+		return t8140_mem_map;
+	else if (of_machine_is_compatible("apple,t6040") ||
+		 of_machine_is_compatible("apple,t6041") ||
+		 of_machine_is_compatible("apple,t6050"))
+		return t6040_mem_map;
+	else if (of_machine_is_compatible("apple,t8142"))
+		return t8142_mem_map;
+	else if (of_machine_is_compatible("apple,t8152") &&
+		 of_machine_is_compatible("apple,j873g"))
+		return t8152_mem_map;
+
+	return NULL;
+}
+
 void build_mem_map(void)
 {
 	ofnode node;
@@ -1191,39 +1235,8 @@ void build_mem_map(void)
 	fdt_size_t size;
 	int i, bank, fb_slot;
 
-	if (of_machine_is_compatible("apple,t8103") ||
-	    of_machine_is_compatible("apple,t8112"))
-		mem_map = t8103_mem_map;
-	else if (of_machine_is_compatible("apple,t6000") ||
-		 of_machine_is_compatible("apple,t6001"))
-		mem_map = t6000_mem_map;
-	else if (of_machine_is_compatible("apple,t6002"))
-		mem_map = t6002_mem_map;
-	else if (of_machine_is_compatible("apple,t6020") ||
-		 of_machine_is_compatible("apple,t6021"))
-		mem_map = t6020_mem_map;
-	else if (of_machine_is_compatible("apple,t6022"))
-		mem_map = t6022_mem_map;
-	else if (of_machine_is_compatible("apple,t8122"))
-		mem_map = t8122_mem_map;
-	else if (of_machine_is_compatible("apple,t6030") ||
-		 of_machine_is_compatible("apple,t6031") ||
-		 of_machine_is_compatible("apple,t6034"))
-		mem_map = t6030_mem_map;
-	else if (of_machine_is_compatible("apple,t8132"))
-		mem_map = t8132_mem_map;
-	else if (of_machine_is_compatible("apple,t8140"))
-		mem_map = t8140_mem_map;
-	else if (of_machine_is_compatible("apple,t6040") ||
-		 of_machine_is_compatible("apple,t6041") ||
-		 of_machine_is_compatible("apple,t6050"))
-		mem_map = t6040_mem_map;
-	else if (of_machine_is_compatible("apple,t8142"))
-		mem_map = t8142_mem_map;
-	else if (of_machine_is_compatible("apple,t8152") &&
-		 of_machine_is_compatible("apple,j873g"))
-		mem_map = t8152_mem_map;
-	else
+	mem_map = apple_soc_mem_map();
+	if (!mem_map)
 		panic("Unsupported SoC\n");
 
 	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
@@ -1282,8 +1295,153 @@ void build_mem_map(void)
 	mem_map[fb_slot].size = size;
 }
 
+/*
+ * The boot loader hands over with the MMU off, and U-Boot used to turn it on
+ * in initr_caches(), after relocation. Until then every data access goes to
+ * DRAM uncached, and board_init_f() is mostly device tree walks (the driver
+ * model scan, dram_init(), the console lookup): several million accesses,
+ * 2.4 to 2.9 s on a T6000, 1 to 2 s on a T8140 or T6040, 0.4 s on a T8112.
+ *
+ * So turn the MMU and the data cache on in arch_cpu_init(), before those, as
+ * i.MX8M does. Finding the DRAM ranges takes a walk of the whole tree, so
+ * the first tables map only the SoC's I/O and what U-Boot already uses: its
+ * image with the early stack, gd and malloc() area above it, and the device
+ * tree. dram_init() then maps the first DRAM range, which the relocation
+ * destination is in, and enable_caches() the full map after relocation.
+ *
+ * The tables are in .data because .bss is not usable before relocation, and
+ * as large as get_page_table_size() gives the final ones.
+ */
+static u8 apple_early_tlb[SZ_256K] __section(".data") __aligned(SZ_4K);
+static struct mm_region apple_early_map[32] __section(".data");
+
+static bool apple_is_ram(const struct mm_region *r)
+{
+	u64 type = (r->attrs >> 2) & 7;
+
+	return type == MT_NORMAL || type == MT_NORMAL_NC;
+}
+
+/*
+ * The I/O regions of the SoC map, followed by @n normal memory ranges.
+ * Returns false if they do not fit.
+ */
+static bool apple_early_mem_map(struct mm_region *soc, const ulong (*ram)[2],
+				int n)
+{
+	int i, j = 0;
+
+	for (i = 0; soc[i].size || soc[i].attrs; i++) {
+		if (!soc[i].size || apple_is_ram(&soc[i]))
+			continue;
+		if (j == ARRAY_SIZE(apple_early_map) - 1)
+			return false;
+		apple_early_map[j++] = soc[i];
+	}
+
+	for (i = 0; i < n; i++) {
+		if (j == ARRAY_SIZE(apple_early_map) - 1)
+			return false;
+		apple_early_map[j].virt = ALIGN_DOWN(ram[i][0], SZ_4K);
+		apple_early_map[j].phys = apple_early_map[j].virt;
+		apple_early_map[j].size = ALIGN(ram[i][0] + ram[i][1], SZ_4K) -
+					  apple_early_map[j].virt;
+		apple_early_map[j].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+					   PTE_BLOCK_INNER_SHARE;
+		j++;
+	}
+	memset(&apple_early_map[j], 0, sizeof(apple_early_map[j]));
+
+	return true;
+}
+
+/* Rebuild the early tables from apple_early_map with the caches off */
+static void apple_early_remap(void)
+{
+	if (dcache_status())
+		dcache_disable();
+	mem_map = apple_early_map;
+	gd->arch.tlb_addr = (ulong)apple_early_tlb;
+	gd->arch.tlb_size = sizeof(apple_early_tlb);
+	gd->arch.tlb_fillptr = 0;
+	dcache_enable();
+}
+
+/* The end of what U-Boot uses above its image: gd and the malloc() area */
+static ulong apple_early_top(void)
+{
+	ulong top = (ulong)gd + sizeof(*gd);
+
+#if CONFIG_IS_ENABLED(SYS_MALLOC_F)
+	top = max(top, gd->malloc_base + gd->malloc_limit);
+#endif
+
+	return top;
+}
+
+int arch_cpu_init(void)
+{
+	ulong image = (ulong)__image_copy_start;
+	ulong top = apple_early_top();
+	ulong ram[2][2];
+	struct mm_region *soc;
+
+	if (CONFIG_IS_ENABLED(SYS_DCACHE_OFF) || dcache_status())
+		return 0;
+
+	soc = apple_soc_mem_map();
+	if (!soc)
+		return 0;
+
+	/* The early stack is between the image and gd */
+	if (top <= image)
+		return 0;
+	ram[0][0] = image;
+	ram[0][1] = top - image;
+	ram[1][0] = (ulong)gd->fdt_blob;
+	ram[1][1] = fdt_totalsize(gd->fdt_blob);
+	if (!apple_early_mem_map(soc, ram, 2))
+		return 0;
+
+	apple_early_remap();
+
+	return 0;
+}
+
+/*
+ * Called at the end of dram_init(): map the first DRAM range, which
+ * board_init_f() reserves and relocates into, or turn the caches off again
+ * if U-Boot or its device tree is not in it.
+ */
+static void apple_early_map_dram(void)
+{
+	ulong image = (ulong)__image_copy_start;
+	ulong top = apple_early_top();
+	ulong fdt = (ulong)gd->fdt_blob;
+	ulong ram[1][2] = { { gd->ram_base, gd->ram_size } };
+	phys_addr_t end = gd->ram_base + gd->ram_size;
+
+	if (mem_map != apple_early_map || !dcache_status())
+		return;
+
+	if (image < gd->ram_base || top > end || fdt < gd->ram_base ||
+	    fdt + fdt_totalsize(gd->fdt_blob) > end ||
+	    !apple_early_mem_map(apple_soc_mem_map(), ram, 1)) {
+		dcache_disable();
+		return;
+	}
+
+	apple_early_remap();
+}
+
 void enable_caches(void)
 {
+	/* Leave the early tables, in the copy that relocation left behind */
+	if (dcache_status()) {
+		dcache_disable();
+		gd->arch.tlb_fillptr = 0;
+	}
+
 	build_mem_map();
 
 	icache_enable();

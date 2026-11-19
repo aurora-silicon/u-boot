@@ -1405,10 +1405,9 @@ static char *asahi_esp_devpart(void)
 			break;
 
 		dev = dev_get_parent(nvme_blk->bdev);
-		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t8132-nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t6041-nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t6050-nvme-ans2"))
+		/* Every internal Apple controller, whatever its compatible. */
+		if (!IS_ENABLED(CONFIG_NVME_APPLE) ||
+		    dev->driver != DM_DRIVER_GET(apple_nvme))
 			continue;
 
 		memset(&scan, 0, sizeof(scan));

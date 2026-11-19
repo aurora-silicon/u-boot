@@ -83,7 +83,10 @@ def fixture_tree(runtime, graphics=True, peripherals=False, aop=False, sep=False
                      f'memory-region = <{330 + shift} {331 + shift} {332 + shift}>;'
                      'memory-region-names = "text", "data", "heap";'
                      f'iommus = <{71 + shift} 0>, <{72 + shift} 0>, <{73 + shift} 0>;'
-                     + ('apple,platform-id = <0x17>;' if runtime else '') + status + '};')
+                     + ('apple,platform-id = <0x17>;'
+                        'apple,dapf-ranges = /bits/ 64 <0x380704000 0x380704063>,'
+                        '/bits/ 64 <0x382824000 0x382824004>;' if runtime else '')
+                     + status + '};')
         for n in range(3):
             isp_nodes += (f'iommu@48e8{0xc + 2 * n:x}0000 {{ phandle = <{71 + n + shift}>;'
                           f'#iommu-cells = <1>; {status} }};')
@@ -429,6 +432,13 @@ int main(int argc, char **argv)
    int n = fdt_node_offset_by_compatible(source, -1, "apple,t8132-isp");
    assert(!fdt_setprop_u64(source, n, "apple,platform-id", 0x17));
   }
+  if (fault == 52 || fault == 53) {
+   int n = fdt_node_offset_by_compatible(source, -1, "apple,t8132-isp");
+   if (fault == 52) /* an older aura gives no address filter windows */
+    assert(!fdt_delprop(source, n, "apple,dapf-ranges"));
+   else /* half a window */
+    assert(!fdt_setprop_u64(source, n, "apple,dapf-ranges", 0x380704000ULL));
+  }
   if (fault >= 60 && fault <= 62) {
    int node = fdt_path_offset(fault == 62 ? target : source, "/soc/i2c@3ad01c000/codec@38");
    assert(node >= 0);
@@ -454,7 +464,7 @@ int main(int argc, char **argv)
  memcpy(saved, target, capacity); memcpy(saved_source, source, fdt_totalsize(source));
  int ret = apple_j713_import_fdt(target, source);
  assert(!memcmp(source, saved_source, fdt_totalsize(source)));
-  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43 && fault != 44 && fault != 45 && fault != 46 && fault != 47 && fault != 48 && fault != 49 && fault != 50 && fault != 51 && fault != 60) {
+  if (fault && fault != 10 && fault != 13 && fault != 15 && fault != 16 && fault != 17 && fault != 19 && fault != 21 && fault != 22 && fault != 26 && fault != 28 && fault != 29 && fault != 34 && fault != 35 && fault != 36 && fault != 38 && fault != 39 && fault != 40 && fault != 43 && fault != 44 && fault != 45 && fault != 46 && fault != 47 && fault != 48 && fault != 49 && fault != 50 && fault != 51 && fault != 52 && fault != 53 && fault != 60) {
   assert(ret < 0); assert(!memcmp(saved, target, capacity));
   puts("refused transactionally"); return 0;
  }
@@ -498,11 +508,20 @@ int main(int argc, char **argv)
    const u64 phys[] = {0x10000d30000ULL, 0x10001f40000ULL}, sizes[] = {0xca4000, 0x748000};
    const char *status = fdt_getprop(target, isp, "status", NULL);
    const fdt32_t *id = fdt_getprop(target, isp, "apple,platform-id", &len);
+   int dlen;
    u32 phandle = fdt_get_phandle(target, isp);
-   bool handed = fault != 48 && fault != 49 && fault != 50 && fault != 51;
+   bool handed = fault != 48 && fault != 49 && fault != 50 && fault != 51 && fault != 53;
+   const fdt64_t *dapf = fdt_getprop(target, isp, "apple,dapf-ranges", &dlen);
    if (fault == 49) assert(status && !strcmp(status, "okay") && !id);
    else if (!handed) assert(status && !strcmp(status, "disabled") && !id);
    else assert(status && !strcmp(status, "okay") && id && len == 4 && fdt32_to_cpu(*id) == 0x17);
+   /* The windows go over with the handoff, where aura gave them. */
+   if (handed && fault != 52)
+    assert(dapf && dlen == 32 && fdt64_to_cpu(dapf[0]) == 0x380704000ULL &&
+           fdt64_to_cpu(dapf[1]) == 0x380704063ULL && fdt64_to_cpu(dapf[2]) == 0x382824000ULL &&
+           fdt64_to_cpu(dapf[3]) == 0x382824004ULL);
+   else
+    assert(!dapf);
    for (unsigned i = 0; i < 3; i++) {
     const fdt32_t *iommus = fdt_getprop(target, isp, "iommus", &len);
     int dart = fdt_node_offset_by_phandle(target, fdt32_to_cpu(iommus[2 * i]));
@@ -809,7 +828,8 @@ def test_j713_isp_handoff(tmp_path):
     # Handed over, refused by aura (empty or zero placeholders, which must not
     # refuse the import), an OS tree that reserves its own firmware, and a malformed
     # platform ID (the camera stays off).
-    for fault in [0, 48, 49, 50]:
+    # An older aura without address filter windows, and malformed windows.
+    for fault in [0, 48, 49, 50, 52, 53]:
         subprocess.run([str(binary), str(source), str(target), str(fault)], check=True)
     # An OS tree without the ISP imports a control tree with one, and an OS
     # tree with the ISP imports a control tree without one.

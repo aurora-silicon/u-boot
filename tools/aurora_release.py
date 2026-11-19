@@ -14,7 +14,7 @@ import zipfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--config", choices=("apple_m1", "apple_j873"), required=True)
+    parser.add_argument("--config", choices=("apple_m1",), required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("dist"))
     parser.add_argument("--compiler", default="gcc")
@@ -52,8 +52,6 @@ def main():
             "Use u-boot-nodtb.bin (or its gzip) with Aura and board-matching DTBs.\n"
             "u-boot.bin includes the build's default t8103-j274 control DTB; do not\n"
             "treat it or u-boot.dtb as a Neo, M5, or M6 device tree.\n"
-            "apple_j873 is the separate M6 RAM-boot configuration. Automatic boot\n"
-            "and persistent EFI variable storage are disabled in that configuration.\n"
             "These exact release artifacts have not been boot-tested on hardware.\n"
         ))
     with zipfile.ZipFile(args.output / f"{name}-debug.zip", "w", zipfile.ZIP_DEFLATED) as archive:

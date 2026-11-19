@@ -91,16 +91,17 @@ that inventory before receiving RTKit traffic. The legacy inherited marker
 remains for stable kernels that preserve the session without servicing it.
 If optional input initialization or handoff fails, stop the helper
 before freeing its buffers, disable its outgoing DT nodes and continue booting.
-This retained input contract applies to every T8132 and T6041 MTP. The built-in keyboard is
+This retained input contract applies only to J713. Its built-in keyboard is
 registered as ``mtpkbd`` alongside the other console inputs, including EFI
-ConIn. Keyboard setup uses the announcement parser even though these MTPs have an STM
+ConIn. Keyboard setup uses the announcement parser even though J713 has an STM
 interface: STM identity discovery remains Linux's responsibility. Before OS
 entry, U-Boot drains reports and replays the saved INIT packets and the original
 keyboard READY in their wire order, using word-wide FIFO writes while leaving
 the helper, buffers and DART bypass live.
 Replay waits for FIFO space, bounds draining, and refuses observed concurrent
 writes; this shared FIFO has no established packet-atomic producer lock. The
-trackpad is configured by Linux after that replay.
+trackpad is configured by Linux after that replay. J813 remains excluded from
+this keyboard transport.
 
 A failed J713 startup is not retried by keyboard probing. The helper stops
 accepting buffer requests after publishing its OS inventory. A stopped helper
@@ -117,24 +118,6 @@ optional input may still be disabled. Input qualification must separately check
 ``apple,rtkit-handoff = "mtp-live-v1"``, its buffer inventory and reservations,
 the running ASC, and physical keyboard/trackpad response. A marker alone does
 not establish that the coprocessor is live.
-
-MTP keyboard handoff
---------------------
-
-What U-Boot does with the MTP behind the built-in keyboard is decided by the
-MTP node, the same way on every SoC (``apple_rtkit_helper_handoff()``):
-
-- M2-generation MTPs (``apple,t8112-mtp``, ``apple,t6020-mtp``) and helpers that
-  are not an MTP restart cleanly: U-Boot stops them at OS entry and the OS
-  starts them again.
-- ``apple,t8142-mtp`` and ``apple,t6050-mtp``: iBoot already runs this MTP, so
-  U-Boot never touches it and the OS keeps iBoot's session.
-- Every other MTP cannot be restarted once it has run. U-Boot starts it for
-  its own keyboard only if the MTP's DART is in bypass, and hands the session
-  to the OS running (``apple,rtkit-handoff = "mtp-live-v1"``, no-map
-  reservations, ``apple,rtkit-buffers``). The T8132 and T6041 MTPs use the
-  retained form described above. If the handoff cannot be published, U-Boot
-  stops the MTP and disables it and its keyboard in the OS tree.
 
 CTXR executable window
 ----------------------

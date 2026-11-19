@@ -91,17 +91,16 @@ that inventory before receiving RTKit traffic. The legacy inherited marker
 remains for stable kernels that preserve the session without servicing it.
 If optional input initialization or handoff fails, stop the helper
 before freeing its buffers, disable its outgoing DT nodes and continue booting.
-This retained input contract applies only to J713. Its built-in keyboard is
+This retained input contract is the T8132 and T6041 form of the live handoff (J713, J614s). The built-in keyboard is
 registered as ``mtpkbd`` alongside the other console inputs, including EFI
-ConIn. Keyboard setup uses the announcement parser even though J713 has an STM
+ConIn. Keyboard setup uses the announcement parser even though these MTPs have an STM
 interface: STM identity discovery remains Linux's responsibility. Before OS
 entry, U-Boot drains reports and replays the saved INIT packets and the original
 keyboard READY in their wire order, using word-wide FIFO writes while leaving
 the helper, buffers and DART bypass live.
 Replay waits for FIFO space, bounds draining, and refuses observed concurrent
 writes; this shared FIFO has no established packet-atomic producer lock. The
-trackpad is configured by Linux after that replay. J813 remains excluded from
-this keyboard transport.
+trackpad is configured by Linux after that replay.
 
 A failed J713 startup is not retried by keyboard probing. The helper stops
 accepting buffer requests after publishing its OS inventory. A stopped helper
@@ -118,6 +117,27 @@ optional input may still be disabled. Input qualification must separately check
 ``apple,rtkit-handoff = "mtp-live-v1"``, its buffer inventory and reservations,
 the running ASC, and physical keyboard/trackpad response. A marker alone does
 not establish that the coprocessor is live.
+
+MTP keyboard handoff
+--------------------
+
+What U-Boot does with the MTP behind the built-in keyboard is chosen in one
+place, ``apple_rtkit_helper_handoff()``, from the MTP node:
+
+- Restart: M2-generation MTPs (``apple,t8112-mtp``, ``apple,t6020-mtp``) and
+  helpers that are not an MTP restart cleanly. U-Boot stops them at OS entry
+  and the OS starts them again.
+- OS: iBoot already runs the ``apple,t8142-mtp`` and ``apple,t6050-mtp``, so
+  U-Boot never touches them and the OS keeps iBoot's session.
+- Park: every other MTP cannot be restarted once it has run. With
+  ``/chosen/aurora,mtp-handoff = "off"`` U-Boot parks it at OS entry, with the
+  image it had before its first run, and the OS starts it fresh. This is the
+  intended path for every such MTP; the park sequence itself is added
+  separately.
+- Live: otherwise, on the boards where it is qualified (J700, J613, J713,
+  J614s), U-Boot hands the session to the OS running
+  (``apple,rtkit-handoff = "mtp-live-v1"``). The J604 and the other T6041
+  boards leave the MTP cold for Linux; other boards keep the restart path.
 
 CTXR executable window
 ----------------------

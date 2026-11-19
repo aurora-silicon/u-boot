@@ -26,10 +26,7 @@
 
 #define APPLE_RTKIT_EP_OSLOG 8
 
-/*
- * Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs:
- * T8140 MTP firmware cannot be restarted after QUIESCED or SLEEP.
- */
+/* Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs. */
 #define RTKIT_HELPER_HANDOFF	"mtp-live-v1"
 #define RTKIT_HELPER_MAX_BUFS	8
 
@@ -61,28 +58,132 @@ struct rtkit_helper_priv {
 	bool input_ready;
 };
 
-/* J613 retains the first MTP epoch, with OSLog in SRAM. */
-static bool rtkit_helper_j613_handoff(struct udevice *dev)
+/*
+ * What U-Boot does with a helper is chosen here, and only here, from the
+ * helper's devicetree node (apple_rtkit_helper_handoff()).
+ *
+ * MTP firmware newer than the M2's cannot be started again once it has run:
+ * taken to QUIESCED or SLEEP and started by the next owner, it faults or never
+ * answers (T8122 J613, T8132 J604, T8140 J700, T8142 J813).  The fixed facts:
+ *
+ * - RESTART: the M2-generation MTP (T8112, T6020 to T6022) restarts cleanly,
+ *   and so does a helper that is not an MTP.  U-Boot stops it at OS entry and
+ *   the OS starts it again (the MacBook Air M2, J413, boots this way).
+ * - OS: iBoot already runs the T8142 and T6050 MTPs before the OS, so a
+ *   session U-Boot opened would already be a restart.  U-Boot never touches
+ *   them.
+ * - PARK: for every other MTP, U-Boot starts it for its own keyboard and parks
+ *   it at OS entry (stopped, power chain pinned, CPU held in reset, with the
+ *   firmware image it had before its first run), and the OS starts it fresh.
+ *   It is requested per boot with /chosen/aurora,mtp-handoff = "off" and needs
+ *   an MTP node that describes its always-on power chain.
+ * - LIVE: the fallback when the MTP is not parked: the session is handed to
+ *   the OS running ("mtp-live-v1").
+ */
+
+/* The park sequence plugs in here (u-boot#49); until then nothing is parked. */
+static bool rtkit_helper_can_park(ofnode node)
 {
-	return of_machine_is_compatible("apple,j613") &&
+	return false;
+}
+
+static bool rtkit_helper_park_requested(void)
+{
+	const char *mode = ofnode_read_string(ofnode_path("/chosen"),
+					      "aurora,mtp-handoff");
+
+	return mode && !strcmp(mode, "off");
+}
+
+/*
+ * Without a park, a non-restartable MTP keeps the path its board has been
+ * run with.  The live handoff is qualified only on the boards listed; the
+ * J604 and the other T6041 boards leave the MTP cold for Linux, and every
+ * other board keeps the restart path it had.  Moving those boards needs a
+ * hardware row each, so it is a separate change.
+ */
+static const struct {
+	const char *mtp;	/* compatible of the MTP node */
+	const char *board;	/* machine compatible, or NULL for every board */
+	enum apple_rtkit_helper_handoff handoff;
+} rtkit_helper_unparked[] = {
+	{ "apple,t8140-mtp", NULL, APPLE_RTKIT_HELPER_LIVE },
+	{ "apple,t8122-rtk-helper-asc4", "apple,j613", APPLE_RTKIT_HELPER_LIVE },
+	{ "apple,t8132-mtp", "apple,j713", APPLE_RTKIT_HELPER_LIVE },
+	{ "apple,t8132-mtp", "apple,j604", APPLE_RTKIT_HELPER_OS },
+	{ "apple,t6041-mtp", "apple,j614s", APPLE_RTKIT_HELPER_LIVE },
+	{ "apple,t6041-mtp", NULL, APPLE_RTKIT_HELPER_OS },
+};
+
+enum apple_rtkit_helper_handoff apple_rtkit_helper_handoff(ofnode node)
+{
+	unsigned int i;
+
+	if (!ofnode_device_is_compatible(node, "apple,mtp") ||
+	    ofnode_device_is_compatible(node, "apple,t8112-mtp") ||
+	    ofnode_device_is_compatible(node, "apple,t6020-mtp"))
+		return APPLE_RTKIT_HELPER_RESTART;
+	if (ofnode_device_is_compatible(node, "apple,t8142-mtp") ||
+	    ofnode_device_is_compatible(node, "apple,t6050-mtp"))
+		return APPLE_RTKIT_HELPER_OS;
+	if (rtkit_helper_park_requested() && rtkit_helper_can_park(node))
+		return APPLE_RTKIT_HELPER_PARK;
+
+	for (i = 0; i < ARRAY_SIZE(rtkit_helper_unparked); i++)
+		if (ofnode_device_is_compatible(node, rtkit_helper_unparked[i].mtp) &&
+		    (!rtkit_helper_unparked[i].board ||
+		     of_machine_is_compatible(rtkit_helper_unparked[i].board)))
+			return rtkit_helper_unparked[i].handoff;
+	return APPLE_RTKIT_HELPER_RESTART;
+}
+
+/*
+ * A live session is published in one of three forms, chosen by the MTP:
+ * - retained (T8132, T6041): only the system endpoints Linux services after
+ *   OS entry are started, the startup exchanges are drained before Linux
+ *   inherits the mailbox, and the legacy inherited-HID marker is added for
+ *   stable kernels.  Linux keys its adoption of these MTPs on the same
+ *   compatibles.
+ * - with an inventory (T8122): the buffer inventory is published and the
+ *   keyboard must be ready first.
+ * - plain (T8140).
+ */
+bool apple_rtkit_helper_retained(ofnode node)
+{
+	return apple_rtkit_helper_handoff(node) == APPLE_RTKIT_HELPER_LIVE &&
+	       (ofnode_device_is_compatible(node, "apple,t8132-mtp") ||
+		ofnode_device_is_compatible(node, "apple,t6041-mtp"));
+}
+
+static bool rtkit_helper_live(struct udevice *dev)
+{
+	return apple_rtkit_helper_handoff(dev_ofnode(dev)) ==
+	       APPLE_RTKIT_HELPER_LIVE;
+}
+
+static bool rtkit_helper_retained(struct udevice *dev)
+{
+	return apple_rtkit_helper_retained(dev_ofnode(dev));
+}
+
+static bool rtkit_helper_inventory(struct udevice *dev)
+{
+	return rtkit_helper_live(dev) &&
 	       device_is_compatible(dev, "apple,t8122-rtk-helper-asc4");
 }
 
-static bool rtkit_helper_uses_dram(struct udevice *dev)
+/*
+ * A live session keeps its OSLog in the helper's SRAM, which the OS maps as
+ * part of the helper, unless the helper has no SRAM region (T6041).  The
+ * T8140 handoff has only been run with OSLog in DRAM, so T8140 keeps that.
+ */
+static bool rtkit_helper_dram_oslog(struct udevice *dev)
 {
-	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	       (device_is_compatible(dev, "apple,t8140-rtk-helper-asc4") ||
-		(of_machine_is_compatible("apple,j614s") &&
-		 device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")));
-}
+	fdt_size_t size;
 
-/* J713 and J614s Linux consume the initialized session without owning its RTKit epoch. */
-static bool rtkit_helper_j713_handoff(struct udevice *dev)
-{
-	return (of_machine_is_compatible("apple,j713") &&
-		device_is_compatible(dev, "apple,t8132-rtk-helper-asc4")) ||
-	       (of_machine_is_compatible("apple,j614s") &&
-		device_is_compatible(dev, "apple,t6041-rtk-helper-asc4"));
+	return rtkit_helper_live(dev) &&
+	       (dev_read_addr_size_name(dev, "sram", &size) == FDT_ADDR_T_NONE ||
+		device_is_compatible(dev, "apple,t8140-mtp"));
 }
 
 static void rtkit_helper_read_dma_window(struct udevice *dev)
@@ -139,7 +240,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 	if (!buf->is_mapped) {
 		/* Older MTP firmware retains OSLog in SRAM across OS handoff. */
 		if (buf->endpoint == APPLE_RTKIT_EP_OSLOG &&
-		    !rtkit_helper_uses_dram(dev)) {
+		    !rtkit_helper_dram_oslog(dev)) {
 			if (priv->sram_stolen)
 				return -EBUSY;
 
@@ -156,7 +257,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 			return 0;
 		}
 
-		/* DRAM OSLog is only for the unsafe, opt-in T8140 MTP path. */
+		/* Everything else lives in DRAM inside the helper's DMA window. */
 		buf->buffer = rtkit_helper_alloc(priv, buf->size);
 		if (!buf->buffer)
 			return -ENOMEM;
@@ -205,18 +306,10 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 		free(buf->buffer);
 }
 
-/*
- * Keep T8140 MTP and its DART untouched in the default build.  Never touch
- * T6040 MTP except for the J614s retained handoff.
- */
+/* U-Boot never touches a helper, or its DART, that belongs to the OS. */
 bool apple_rtkit_helper_allowed(ofnode node)
 {
-	if (ofnode_device_is_compatible(node, "apple,t6041-rtk-helper-asc4"))
-		return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-		       of_machine_is_compatible("apple,j614s");
-
-	return !ofnode_device_is_compatible(node, "apple,t8140-rtk-helper-asc4") ||
-	       IS_ENABLED(CONFIG_APPLE_MTP_KEYB);
+	return apple_rtkit_helper_handoff(node) != APPLE_RTKIT_HELPER_OS;
 }
 
 static int rtkit_helper_bind(struct udevice *dev)
@@ -238,15 +331,14 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (ret < 0)
 		return ret;
 
-	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev) ||
-	    rtkit_helper_j613_handoff(dev))
+	if (rtkit_helper_live(dev))
 		rtkit_helper_read_dma_window(dev);
 
-	if (of_machine_is_compatible("apple,j614s") &&
-	    device_is_compatible(dev, "apple,t6041-rtk-helper-asc4")) {
+	/* A T6041 live handoff checks the DART bypass before starting. */
+	if (rtkit_helper_live(dev) && device_is_compatible(dev, "apple,t6041-mtp")) {
 		ret = priv->dart ? apple_dart_retain_bypass(priv->dart) : -ENODEV;
 		if (ret) {
-			printf("J614s: MTP DART bypass unavailable (%d)\n", ret);
+			printf("MTP: DART bypass unavailable (%d)\n", ret);
 			return ret;
 		}
 	}
@@ -261,7 +353,7 @@ static int rtkit_helper_probe(struct udevice *dev)
 	}
 
 	/* Stable kernels do not service logging after the OS boundary. */
-	ret = rtkit_helper_j713_handoff(dev) ?
+	ret = rtkit_helper_retained(dev) ?
 		apple_rtkit_boot_with_sys_ep_mask(priv->rtk,
 					       ~(u32)(BIT(2) | BIT(3) | BIT(10))) :
 		apple_rtkit_boot(priv->rtk);
@@ -320,10 +412,10 @@ static int rtkit_helper_remove(struct udevice *dev)
 	if (priv->handoff_published) {
 		int ret = apple_dart_retain_bypass(priv->dart);
 
-		/* A published J713 inventory already promises a running session.
+		/* A published inventory already promises a running session.
 		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
-		if (ret && (rtkit_helper_j713_handoff(dev) ||
-			    rtkit_helper_j613_handoff(dev)))
+		if (ret && (rtkit_helper_retained(dev) ||
+			    rtkit_helper_inventory(dev)))
 			panic("MTP: refusing OS entry after DART retention error %d", ret);
 		if (ret)
 			goto stop;
@@ -390,8 +482,8 @@ static int rtkit_helper_fdt_node(void *blob, struct udevice *dev)
 }
 
 
-/* J713 preserves its HID startup state and exports every live RTKit buffer. */
-static int rtkit_helper_fdt_publish_j713(struct udevice *dev, void *blob)
+/* The retained form keeps the HID startup state and exports every live RTKit buffer. */
+static int rtkit_helper_fdt_publish_retained(struct udevice *dev, void *blob)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 	int node, resv, sub, ret;
@@ -483,7 +575,7 @@ static int rtkit_helper_fdt_publish_j713(struct udevice *dev, void *blob)
 }
 
 /* Failed optional input must not leave a completed-handoff claim behind. */
-static void rtkit_helper_fdt_disable_j713(struct udevice *dev, void *blob)
+static void rtkit_helper_fdt_disable(struct udevice *dev, void *blob)
 {
 	int node = rtkit_helper_fdt_node(blob, dev);
 	int input;
@@ -520,7 +612,7 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	struct apple_rtkit_buffer buffers[4];
 	int count;
 
-	if ((rtkit_helper_j613_handoff(dev) && !priv->input_ready) ||
+	if ((rtkit_helper_inventory(dev) && !priv->input_ready) ||
 	    !priv->rtk || !priv->dart || !priv->nbufs ||
 	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
 		return -ENODEV;
@@ -585,7 +677,7 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 			       priv->dart_sid))
 		return -ENOSPC;
 
-	if (rtkit_helper_j613_handoff(dev)) {
+	if (rtkit_helper_inventory(dev)) {
 		count = apple_rtkit_get_buffers(priv->rtk, buffers, ARRAY_SIZE(buffers));
 		if (count != ARRAY_SIZE(buffers))
 			return count < 0 ? count : -EINVAL;
@@ -620,15 +712,14 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 {
 	struct udevice *dev;
 	struct uclass *uc;
+	bool strict;
 	int ret;
 
 	uclass_id_foreach_dev(UCLASS_MISC, dev, uc) {
 		struct rtkit_helper_priv *priv;
 
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
-		    !device_active(dev) ||
-		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
-		     !rtkit_helper_j613_handoff(dev)))
+		    !device_active(dev) || !rtkit_helper_live(dev))
 			continue;
 
 		priv = dev_get_priv(dev);
@@ -637,7 +728,7 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 		void *scratch = malloc(capacity);
 
 		ret = scratch ? fdt_open_into(blob, scratch, capacity) : -ENOMEM;
-		if (!ret && rtkit_helper_j713_handoff(dev)) {
+		if (!ret && rtkit_helper_retained(dev)) {
 			int node = rtkit_helper_fdt_node(scratch, dev);
 
 			if (node >= 0) {
@@ -646,8 +737,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 			}
 		}
 		if (!ret)
-			ret = rtkit_helper_j713_handoff(dev) ?
-				rtkit_helper_fdt_publish_j713(dev, scratch) :
+			ret = rtkit_helper_retained(dev) ?
+				rtkit_helper_fdt_publish_retained(dev, scratch) :
 				rtkit_helper_fdt_publish(dev, scratch);
 		if (!ret) {
 			memcpy(blob, scratch, capacity);
@@ -655,22 +746,25 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 				priv->published_fdt = blob;
 		}
 		free(scratch);
-		if (ret && rtkit_helper_j613_handoff(dev))
-			panic("J613 MTP handoff publication failed: %d", ret);
+		/*
+		 * Retained and inventory sessions fail closed: a refused handoff
+		 * stops the MTP and takes it and its keyboard out of the OS tree.
+		 */
+		strict = rtkit_helper_retained(dev) || rtkit_helper_inventory(dev);
 		if (ret && was_published) {
 			/* The prior EFI table may still be selected after a later
 			 * candidate fixup fails. Its buffers/DART/session stay live. */
 			dev_warn(dev, "candidate handoff refused (%d); keeping prior RTKit session\n", ret);
-			if (rtkit_helper_j713_handoff(dev) && blob != priv->published_fdt) {
-				rtkit_helper_fdt_disable_j713(dev, blob);
+			if (strict && blob != priv->published_fdt) {
+				rtkit_helper_fdt_disable(dev, blob);
 				/* Refuse this candidate so EFI keeps the prior table. */
 				return ret;
 			}
 		} else if (ret) {
 			dev_warn(dev, "no live OS handoff (%d); stopping RTKit at boot\n", ret);
-			if (rtkit_helper_j713_handoff(dev)) {
+			if (strict) {
 				rtkit_helper_stop(dev);
-				rtkit_helper_fdt_disable_j713(dev, blob);
+				rtkit_helper_fdt_disable(dev, blob);
 			} else {
 				apple_dart_release_bypass(priv->dart);
 			}

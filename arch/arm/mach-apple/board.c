@@ -1610,28 +1610,36 @@ static void apple_efi_late_init(bool start_keyboard)
 	apple_loader_initrd(chosen);
 }
 
-/* Prepare the live helper before the keyboard console consumes discovery. */
-static int j713_prepare_input(void)
+/* The MTP behind the built-in DockChannel keyboard, if there is one. */
+static ofnode apple_mtp_helper(ofnode *inputp)
 {
-	ofnode node, input;
+	ofnode input;
+	u32 phandle;
+
+	input = ofnode_by_compatible(ofnode_null(), "apple,dockchannel-hid");
+	if (!ofnode_valid(input) ||
+	    ofnode_read_u32(input, "apple,helper-cpu", &phandle))
+		return ofnode_null();
+	*inputp = input;
+	return ofnode_get_by_phandle(phandle);
+}
+
+/*
+ * Start a helper handed over in the retained form before the keyboard console
+ * consumes discovery.
+ */
+static int apple_mtp_prepare_retained_input(ofnode node, ofnode input)
+{
 	struct udevice *helper;
 	fdt_addr_t data;
 	ulong start;
 	int ret, index;
 
-	node = ofnode_by_compatible(ofnode_null(),
-		of_machine_is_compatible("apple,j614s") ?
-		"apple,t6041-rtk-helper-asc4" : "apple,t8132-rtk-helper-asc4");
-	if (!ofnode_valid(node))
-		return -ENODEV;
 	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
 	if (ret) {
 		printf("MTP: failed to initialize input helper (%d)\n", ret);
 		return ret;
 	}
-	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
-	if (!ofnode_valid(input))
-		return -ENODEV;
 	index = ofnode_stringlist_search(input, "reg-names", "data");
 	if (index < 0)
 		return index;
@@ -1646,12 +1654,12 @@ static int j713_prepare_input(void)
 	while (readl((void *)(data + 0x2c)) < 8 && get_timer(start) < 2000) {
 		ret = apple_rtkit_helper_poll(helper, 0);
 		if (ret && ret != -ETIMEDOUT) {
-			printf("J713: input startup mailbox error %d\n", ret);
+			printf("MTP: input startup mailbox error %d\n", ret);
 			return ret;
 		}
 		udelay(50);
 	}
-	debug("J713: input discovery FIFO has %u bytes at handoff\n",
+	debug("MTP: input discovery FIFO has %u bytes at handoff\n",
 	      readl((void *)(data + 0x2c)));
 	if (readl((void *)(data + 0x2c)) < 8)
 		return -ETIMEDOUT;
@@ -1689,25 +1697,23 @@ int board_late_init(void)
 	bool start_keyboard = true;
 	u32 status = 0;
 	phys_addr_t addr;
+	ofnode mtp, input;
 
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
 
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	    (of_machine_is_compatible("apple,j713") ||
-	     of_machine_is_compatible("apple,j614s"))) {
-		int ret = j713_prepare_input();
+	/* The MTP decides whether U-Boot may use the built-in keyboard. */
+	mtp = apple_mtp_helper(&input);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) && ofnode_valid(mtp)) {
+		start_keyboard = apple_rtkit_helper_allowed(mtp);
+		if (start_keyboard && apple_rtkit_helper_retained(mtp)) {
+			int ret = apple_mtp_prepare_retained_input(mtp, input);
 
-		start_keyboard = !ret;
-		if (ret)
-			printf("MTP: input unavailable (%d); continuing boot\n", ret);
+			start_keyboard = !ret;
+			if (ret)
+				printf("MTP: input unavailable (%d); continuing boot\n", ret);
+		}
 	}
-	/* T6040 and T6041 stay with Linux except for the J614s retained handoff. */
-	if ((of_machine_is_compatible("apple,t6040") &&
-	     !of_machine_is_compatible("apple,j614s")) ||
-	    of_machine_is_compatible("apple,t6041") ||
-	    of_machine_is_compatible("apple,t6050"))
-		start_keyboard = false;
 	if (of_machine_is_compatible("apple,j613") ||
 	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||
@@ -1760,16 +1766,9 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	/* Coprocessors handed over running must be described in every case. */
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
 		ret = apple_rtkit_helper_fdt_fixup(blob);
-		/*
-		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
-		 * fixup only costs the OS the running session: keep booting.
-		 */
-		if (ret && (of_machine_is_compatible("apple,j713") ||
-			    of_machine_is_compatible("apple,j614s")))
-			return ret;
+		/* A refused live handoff must not reach the OS. */
 		if (ret)
-			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",
-			       ret);
+			return ret;
 	}
 	if (IS_ENABLED(CONFIG_APPLE_J713_FDT) && imported) {
 		ret = apple_j713_complete_fdt(blob);

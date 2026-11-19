@@ -76,10 +76,14 @@ config APPLE_MTP_KEYB
 	  laptops based on Apple M2 and newer SoCs. These keyboards use an
 	  Apple-specific HID-over-DockChannel protocol.
 
-	  T8140 (A18 Pro) MTP firmware cannot be restarted, so U-Boot hands
-	  the running session to the OS (apple,rtkit-handoff). Linux needs
-	  rtkit-helper support for adopting it; older kernels lose the
-	  internal keyboard and trackpad after U-Boot has used them.
+	  MTP firmware newer than the M2's cannot be restarted. U-Boot parks
+	  such an MTP at OS entry when /chosen/aurora,mtp-handoff is "off",
+	  otherwise it hands the running session to the OS
+	  (apple,rtkit-handoff) on the boards where that is qualified, and it
+	  never touches an MTP that iBoot already ran (T8142, T6050). Linux
+	  needs rtkit-helper support for adopting a live session; older
+	  kernels lose the internal keyboard and trackpad after U-Boot has
+	  used them.
 
 config CROS_EC_KEYB
 	bool "Enable Chrome OS EC keyboard support"

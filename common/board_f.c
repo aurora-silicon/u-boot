@@ -580,7 +580,8 @@ static int reserve_fdt(void)
 static int reserve_bootstage(void)
 {
 #ifdef CONFIG_BOOTSTAGE
-	int size = bootstage_get_size(true);
+	/* instrumentation: room for the names of the marks added after this */
+	int size = bootstage_get_size(true) + CONFIG_BOOTSTAGE_RECORD_COUNT * 40;
 
 	gd->start_addr_sp = reserve_stack_aligned(size);
 	gd->boardf->new_bootstage = map_sysmem(gd->start_addr_sp, size);

@@ -10,7 +10,7 @@
  * Copyright The Aurora Silicon Contributors
  *
  * The "apple,dockchannel-uart" binding and DockChannel FIFO layout follow Yureka
- * Lilian's Linux driver and the Asahi MTP keyboard driver (apple_mtp_kbd.c).
+ * Lilian's Linux driver and the Apple MTP keyboard driver (apple_mtp_kbd.c).
  */
 
 #include <dm.h>
@@ -89,7 +89,7 @@ static int apple_dc_serial_of_to_plat(struct udevice *dev)
 
 	/*
 	 * Linux-style DTs describe the channel's data window explicitly.  The
-	 * compact m1n1 smoke DT instead supplies the shared config window and an
+	 * compact aura smoke DT instead supplies the shared config window and an
 	 * apple,channel selector.  Normalize both forms to the data window so the
 	 * handoff can stay on the firmware-selected DockChannel.
 	 */

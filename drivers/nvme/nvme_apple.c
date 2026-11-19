@@ -88,7 +88,7 @@ struct ans_nvmmu_tcb {
  * programmed through dedicated registers, and the ANS coprocessor cannot
  * be reset or restarted once running: clearing CPU_CTRL.RUN is one-way
  * and asserting its PMGR reset raises an SError.  The boot loader that
- * started the firmware (m1n1) hands it over with its RTKit session live,
+ * started the firmware (aura) hands it over with its RTKit session live,
  * and every later stage adopts that session instead of booting it.
  */
 struct apple_nvme_hw {

@@ -956,13 +956,17 @@ static int j713_speaker_amps(void *dst, const void *src)
 }
 
 /* aura reserves this boot's ISP firmware in the control tree's
- * isp-firmware-text and isp-firmware-data, sets the platform ID and enables
- * the ISP and its DARTs, or leaves them disabled. The reservations were
- * carried over to the OS tree's placeholders of the same names, which its ISP
- * already refers to. Carry the platform ID over and enable the ISP and its
- * DARTs there too. An OS tree whose ISP is enabled reserves its own firmware
- * and is left as it is.
+ * isp-firmware-text and isp-firmware-data, sets the platform ID, copies the
+ * ISP DART's address filter windows into apple,dapf-ranges and enables the
+ * ISP and its DARTs, or leaves them disabled. The reservations were carried
+ * over to the OS tree's placeholders of the same names, which its ISP already
+ * refers to. Carry the platform ID and the windows over and enable the ISP
+ * and its DARTs there too. An OS tree whose ISP is enabled reserves its own
+ * firmware and is left as it is. An older aura gives no windows, and none
+ * are carried over.
  */
+#define J713_ISP_DAPF_SLICES 16
+
 static int j713_isp(void *dst, const void *src)
 {
 	static const char compatible[] = "apple,t8132-isp";
@@ -970,8 +974,9 @@ static int j713_isp(void *dst, const void *src)
 		"/reserved-memory/isp-firmware-text", "/reserved-memory/isp-firmware-data",
 	};
 	const fdt32_t *id, *iommus, *map;
+	const void *dapf;
 	unsigned int i, count;
-	int dn, sn, len, ret;
+	int dn, sn, len, dapf_len, ret;
 	u32 phandle;
 
 	dn = fdt_node_offset_by_compatible(dst, -1, compatible);
@@ -988,6 +993,10 @@ static int j713_isp(void *dst, const void *src)
 	if (!j713_enabled(src, sn) || !id || len != 4 || !fdt32_to_cpu(*id) || !phandle ||
 	    j713_map_node(dst, src, sn) != dn)
 		return 0;
+	/* Start and end pairs of 64-bit addresses, one per filter slice. */
+	dapf = fdt_getprop(src, sn, "apple,dapf-ranges", &dapf_len);
+	if (dapf && (!dapf_len || dapf_len % 16 || dapf_len > J713_ISP_DAPF_SLICES * 16))
+		return 0;
 	for (i = 0; i < ARRAY_SIZE(regions); i++) {
 		int n = fdt_path_offset(dst, regions[i]);
 		const fdt64_t *reg = n < 0 ? NULL : fdt_getprop(dst, n, "reg", &len);
@@ -1003,6 +1012,11 @@ static int j713_isp(void *dst, const void *src)
 		return -EINVAL;
 	count = len / 8;
 	ret = fdt_setprop_u32(dst, dn, "apple,platform-id", fdt32_to_cpu(*id));
+	if (!ret && dapf) {
+		dn = fdt_node_offset_by_phandle(dst, phandle);
+		ret = dn < 0 ? -EINVAL :
+			       fdt_setprop(dst, dn, "apple,dapf-ranges", dapf, dapf_len);
+	}
 	for (i = 0; !ret && i < count; i++) {
 		int dart;
 

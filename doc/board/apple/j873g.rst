@@ -5,7 +5,7 @@ Apple M6 Mac mini (J873g)
 
 The initial T8152 port boots from RAM using the firmware-selected DockChannel
 UART. Build with ``make apple_j873_defconfig`` followed by ``make`` using an
-AArch64 GNU toolchain. Supply an external FDT from m1n1; the built-in M1 DT does
+AArch64 GNU toolchain. Supply an external FDT from aura; the built-in M1 DT does
 not describe this board. The root must include ``apple,j873g`` and ``apple,t8152``.
 Use ``u-boot-nodtb.bin`` for RAM handoff.
 
@@ -27,12 +27,12 @@ not a claim of T8152 support.
 USB-C display handoff
 --------------------
 
-m1n1 must establish the USB-C DisplayPort link before entering U-Boot. The
+aura must establish the USB-C DisplayPort link before entering U-Boot. The
 J873 configuration enables the simple framebuffer, video console and
 ``NO_FB_CLEAR``; U-Boot inherits the active scanout rather than initializing
 the M6 display PHY. Keep the DCP session and its live allocations reserved.
 
-Describe ``/chosen/framebuffer`` using m1n1's updated ``cur_boot_args`` after
+Describe ``/chosen/framebuffer`` using aura's updated ``cur_boot_args`` after
 the modeset. The original firmware boot arguments may still describe its
 dummy framebuffer. Supply the current base, width, height, stride and size,
 and use ``x8r8g8b8`` for the M6 32-bit BGRA surface. Preserve serial output
@@ -51,7 +51,7 @@ missing RAM or framebuffer mappings, relocation into a live loader allocation,
 lost console characters and broken return from an EFI payload. A compile alone
 does not rule these out.
 
-From a fresh single-CPU m1n1 session on chip ``0x8152``, board ``0x24``, target
+From a fresh single-CPU aura session on chip ``0x8152``, board ``0x24``, target
 ``J873g`` / model ``Mac18,5``, hash the candidate, upload to reserved RAM, and
 verify complete readback. Enter with caches/MMU off and the FDT in x0. Capture
 the banner and prompt, then run ``version``, ``bdinfo``, ``printenv`` and

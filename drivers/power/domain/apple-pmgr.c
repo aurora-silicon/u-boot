@@ -27,7 +27,17 @@
 #define APPLE_PMGR_PS_ACTIVE	0xf
 #define APPLE_PMGR_PS_PWRGATE	0x0
 
-#define APPLE_PMGR_PS_SET_TIMEOUT_US	10000
+/*
+ * Bound on one requested PS_TARGET -> PS_ACTUAL transition.  Linux allows
+ * 100 us for every domain (APPLE_PMGR_PS_SET_TIMEOUT in
+ * drivers/pmdomain/apple/pmgr-pwrstate.c).  U-Boot's
+ * regmap_read_poll_timeout() takes milliseconds and counts them with
+ * get_timer(), so 1 ms is the shortest bound it can express; it covers the
+ * Linux bound.  Inherited active domains return early in
+ * apple_pmgr_ps_set() and are never timed here, so a power-up that takes
+ * longer is a fault to report, not one to wait out.
+ */
+#define APPLE_PMGR_PS_SET_TIMEOUT_MS	1
 
 struct apple_pmgr_priv {
 	struct regmap *regmap;
@@ -113,7 +123,7 @@ static int apple_pmgr_ps_set(struct power_domain *power_domain, u32 pstate)
 
 	ret = regmap_read_poll_timeout(priv->regmap, priv->offset, reg,
 				       (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate),
-				       1, APPLE_PMGR_PS_SET_TIMEOUT_US);
+				       1, APPLE_PMGR_PS_SET_TIMEOUT_MS);
 	if (ret)
 		dev_err(power_domain->dev,
 			"power state %u timed out (register %#x)\n", pstate, reg);

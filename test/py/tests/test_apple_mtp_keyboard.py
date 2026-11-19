@@ -104,7 +104,7 @@ static int apple_mtp_kbd_check(struct input_config *input) {
 }
 '''
     for name in ('dockchannel_write', 'dchid_sum', 'dchid_comm_set_report',
-                 'dchid_handle_event', 'apple_mtp_kbd_handoff_error', 'apple_mtp_kbd_check_announce', 'apple_mtp_kbd_replay_count', 'apple_mtp_kbd_replay_j713', 'apple_mtp_kbd_handoff'):
+                 'dchid_handle_event', 'apple_mtp_kbd_handoff_error', 'apple_mtp_kbd_check_announce', 'apple_mtp_kbd_replay_count', 'apple_mtp_kbd_replay_retained', 'apple_mtp_kbd_handoff'):
         unit += function(text, name)
     # The real poll loop, renamed so the drain stub above stays in place.
     live = function(text, 'apple_mtp_kbd_check')
@@ -142,7 +142,7 @@ static void announce(struct input_config *input,const char *name,u8 iface,bool m
 }
 int main(void) {
     struct apple_mtp_kbd_priv priv={.local=local,.config=config,.rmt=remote,.irq_base=irq,
-        .fifo_size=sizeof(expected),.kbd_iface=-1,.announce=true,.j713=true,.rx_irq_mask=2};
+        .fifo_size=sizeof(expected),.kbd_iface=-1,.announce=true,.retained=true,.rx_irq_mask=2};
     struct keyboard_priv uc={0};struct udevice helper={.retained=true},dev={.priv=&priv,.uc=&uc};
     priv.helper=&helper;priv.init_data=malloc(priv.fifo_size);priv.pkt=malloc(DCHID_MAX_PKT);
     assert(priv.init_data&&priv.pkt);uc.input.dev=&dev;
@@ -178,8 +178,8 @@ int main(void) {
     assert(!apple_mtp_kbd_check_announce(&uc.input,&ack)&&!priv.handoff_error);
     size_t saved=priv.init_size;
     /* Other announcing profiles keep their original INIT-only replay. */
-    priv.j713=false;deliver(&uc.input,0,ready,2,false,false);
-    assert(priv.init_size==saved);priv.j713=true;
+    priv.retained=false;deliver(&uc.input,0,ready,2,false,false);
+    assert(priv.init_size==saved);priv.retained=true;
     struct apple_mtp_kbd_priv broken=priv;dev.priv=&broken;expected_error=-EBADMSG;
     announce(&uc.input,"keyboard",7,false,true);
     assert(broken.handoff_error==-EBADMSG&&apple_mtp_kbd_handoff(&dev)==-EBADMSG);
@@ -196,9 +196,9 @@ int main(void) {
     assert(apple_mtp_kbd_handoff(&dev)==-ETIME&&stalled_reads);
     pending_bytes=0;dev.priv=&priv;
     remote_space=priv.init_size-4;
-    assert(apple_mtp_kbd_replay_j713(&priv)==-ETIME&&!replay_size);
+    assert(apple_mtp_kbd_replay_retained(&priv)==-ETIME&&!replay_size);
     remote_space=2048;producer_at=4;
-    assert(apple_mtp_kbd_replay_j713(&priv)==-EAGAIN&&replay_size==4);
+    assert(apple_mtp_kbd_replay_retained(&priv)==-EAGAIN&&replay_size==4);
     producer_at=producer_extra=0;replay_size=0;
     remove_error=-EIO;assert(apple_mtp_kbd_handoff(&dev)==-EIO);
     assert(priv.helper==&helper&&!replay_size);
@@ -207,7 +207,7 @@ int main(void) {
     assert(replay_size==expected_size&&!memcmp(replay,expected,expected_size));
     /* First-publication failure disabled input: skip stale partial bytes. */
     struct udevice cold_helper={0};
-    broken=(struct apple_mtp_kbd_priv){.j713=true,.helper=&cold_helper,.handoff_error=-EBADMSG,
+    broken=(struct apple_mtp_kbd_priv){.retained=true,.helper=&cold_helper,.handoff_error=-EBADMSG,
         .irq_base=irq,.local=local,.pkt=malloc(16),.init_data=malloc(16)};
     dev.priv=&broken;pending_bytes=4;unsigned before=stalled_reads;
     assert(!apple_mtp_kbd_handoff(&dev)&&stalled_reads==before);
@@ -222,7 +222,7 @@ int main(void) {
     subprocess.run([str(binary)], check=True)
 
 
-def test_j713_keyboard_never_reboots_unprepared_helper(tmp_path):
+def test_retained_keyboard_never_reboots_unprepared_helper(tmp_path):
     root = Path(__file__).resolve().parents[3]
     text = (root / 'drivers/input/apple_mtp_kbd.c').read_text()
     unit = r'''
@@ -234,20 +234,16 @@ def test_j713_keyboard_never_reboots_unprepared_helper(tmp_path):
 typedef uint32_t u32;typedef int ofnode;
 #define UCLASS_MISC 1
 struct udevice { int unused; };
-struct apple_mtp_kbd_priv { struct udevice *helper; };
+struct apple_mtp_kbd_priv { struct udevice *helper; bool retained; };
 static struct apple_mtp_kbd_priv priv;
 static struct udevice helper;
-static bool j713=true,j614,prepared;
+static bool prepared;
 static int finds,gets,find_error,property_error;
 static void *dev_get_priv(struct udevice *d){(void)d;return &priv;}
 static int dev_read_u32(struct udevice *d,const char *name,u32 *v){
  (void)d;assert(!strcmp(name,"apple,helper-cpu"));*v=123;return property_error;
 }
 static ofnode ofnode_get_by_phandle(u32 phandle){assert(phandle==123);return 123;}
-static bool of_machine_is_compatible(const char *name){
- if(!strcmp(name,"apple,j713"))return j713;
- assert(!strcmp(name,"apple,j614s"));return j614;
-}
 static int uclass_find_device_by_ofnode(int cls,ofnode node,struct udevice **d){
  assert(cls==1&&node==123);finds++;*d=&helper;return find_error;
 }
@@ -258,14 +254,14 @@ static bool apple_rtkit_helper_input_prepared(struct udevice *d){assert(d==&help
 ''' + function(text, 'get_rtkit_helper') + r'''
 int main(void){
  struct udevice keyboard={0};
+ priv.retained=true;
  assert(get_rtkit_helper(&keyboard)==-ENODEV&&finds==1&&!gets);
  prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==2&&!gets);
  find_error=-ENODEV;assert(get_rtkit_helper(&keyboard)==-ENODEV&&!gets);
  property_error=-EINVAL;assert(get_rtkit_helper(&keyboard)==-EINVAL&&finds==3&&!gets);
- property_error=0;find_error=0;j713=false;j614=true;prepared=false;
- assert(get_rtkit_helper(&keyboard)==-ENODEV&&finds==4&&!gets);
- prepared=true;assert(!get_rtkit_helper(&keyboard)&&finds==5&&!gets);
- j614=false;assert(!get_rtkit_helper(&keyboard)&&gets==1);
+ /* Other live and restartable helpers are started by the keyboard probe. */
+ property_error=0;find_error=0;priv.retained=false;prepared=false;
+ assert(!get_rtkit_helper(&keyboard)&&finds==3&&gets==1);
  return 0;
 }
 '''
@@ -277,8 +273,8 @@ int main(void){
     subprocess.run([str(binary)], check=True)
 
 
-def test_j713_remove_errors_cannot_be_ignored(tmp_path):
-    """EFI/booti ignore DM removal errors: the J713 callback must not return."""
+def test_retained_remove_errors_cannot_be_ignored(tmp_path):
+    """EFI/booti ignore DM removal errors: a retained session's callback must not return."""
     root = Path(__file__).resolve().parents[3]
     text = (root / 'drivers/input/apple_mtp_kbd.c').read_text()
     unit = r'''
@@ -286,7 +282,7 @@ def test_j713_remove_errors_cannot_be_ignored(tmp_path):
 #include <stdbool.h>
 #include <errno.h>
 #include <setjmp.h>
-struct apple_mtp_kbd_priv { bool j713; };
+struct apple_mtp_kbd_priv { bool retained; };
 struct udevice { struct apple_mtp_kbd_priv *priv; };
 static int handoff_result,panics;
 static jmp_buf boundary;
@@ -297,12 +293,12 @@ static void __attribute__((noreturn)) panic(const char *fmt,...) {
 }
 ''' + function(text, 'apple_mtp_kbd_remove') + r'''
 int main(void) {
-    struct apple_mtp_kbd_priv priv={.j713=true};struct udevice dev={.priv=&priv};
+    struct apple_mtp_kbd_priv priv={.retained=true};struct udevice dev={.priv=&priv};
     assert(!apple_mtp_kbd_remove(&dev)&&!panics);
     handoff_result=-EIO;
     if (!setjmp(boundary)) { apple_mtp_kbd_remove(&dev);assert(false); }
     assert(panics==1);
-    priv.j713=false;assert(apple_mtp_kbd_remove(&dev)==-EIO&&panics==1);
+    priv.retained=false;assert(apple_mtp_kbd_remove(&dev)==-EIO&&panics==1);
     return 0;
 }
 '''

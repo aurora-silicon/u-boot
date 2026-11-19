@@ -998,7 +998,7 @@ static struct mm_region t8142_mem_map[] = {
 	}
 };
 
-/* T8152: only DockChannel is qualified for initial RAM boot. */
+/* T8152: only the DockChannel aperture is mapped for the initial RAM boot. */
 static struct mm_region t8152_mem_map[] = {
 	{
 		.virt = 0x308000000,
@@ -1220,8 +1220,7 @@ void build_mem_map(void)
 		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
-	else if (of_machine_is_compatible("apple,t8152") &&
-		 of_machine_is_compatible("apple,j873g"))
+	else if (of_machine_is_compatible("apple,t8152"))
 		mem_map = t8152_mem_map;
 	else
 		panic("Unsupported SoC\n");

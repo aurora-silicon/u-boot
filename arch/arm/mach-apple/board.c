@@ -13,6 +13,7 @@
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <init.h>
 #include <time.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
@@ -1717,6 +1718,18 @@ int board_late_init(void)
 		apple_efi_late_init(start_keyboard);
 	else
 		apple_typec_late_init();
+
+	/*
+	 * The only PCIe devices U-Boot drives here are the USB host
+	 * controllers of machines without a built-in keyboard (USB-A ports
+	 * behind a PCIe xHCI). Bringing a port up costs 100 ms after PERST#
+	 * plus the link wait, and the OS resets every port again, so bring
+	 * PCIe up only when USB is started at boot: preboot is "usb start"
+	 * where the machine needs it (see apple_typec_late_init()), or where
+	 * a saved environment asks for it. "pci enum" works by hand.
+	 */
+	if (IS_ENABLED(CONFIG_PCI) && strstr(env_get("preboot") ?: "", "usb start"))
+		pci_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M

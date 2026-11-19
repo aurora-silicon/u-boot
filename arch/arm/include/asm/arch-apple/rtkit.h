@@ -39,12 +39,22 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout);
 int apple_rtkit_shutdown(struct apple_rtkit *rtk, int pwrstate);
 
 int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
-/* Only publish a J713 session after its first HID discovery header is pending. */
+/* Only publish a live session once the keyboard's startup is complete. */
 void apple_rtkit_helper_input_ready(struct udevice *dev);
 bool apple_rtkit_helper_input_prepared(struct udevice *dev);
 bool apple_rtkit_helper_input_retained(struct udevice *dev);
 void apple_rtkit_helper_input_failed(struct udevice *dev);
 
+/* What U-Boot does with a helper; see rtkit_helper.c. */
+enum apple_rtkit_helper_handoff {
+	APPLE_RTKIT_HELPER_RESTART,	/* stopped at OS entry, the OS restarts it */
+	APPLE_RTKIT_HELPER_LIVE,	/* handed to the OS running (mtp-live-v1) */
+	APPLE_RTKIT_HELPER_OS,		/* never touched: the OS owns it */
+};
+
+enum apple_rtkit_helper_handoff apple_rtkit_helper_handoff(ofnode node);
+/* A live handoff in the retained form (see rtkit_helper.c). */
+bool apple_rtkit_helper_retained(ofnode node);
 bool apple_rtkit_helper_allowed(ofnode node);
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */
 int apple_rtkit_helper_fdt_fixup(void *blob);

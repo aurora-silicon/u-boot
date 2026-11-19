@@ -7,6 +7,7 @@
 #define __INITCALL_H
 
 #include <asm/types.h>
+#include <bootstage.h>
 #include <event.h>
 #include <hang.h>
 
@@ -19,6 +20,7 @@ _Static_assert(EVT_COUNT < 256, "Can only support 256 event types with 8 bits");
 			       #_call); \
 			hang(); \
 		} \
+		bootstage_mark_name(BOOTSTAGE_ID_ALLOC, #_call); \
 	} while (0)
 
 #define INITCALL_EVT(_evt) \

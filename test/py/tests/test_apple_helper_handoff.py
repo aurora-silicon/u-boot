@@ -69,9 +69,7 @@ static int stops;
 static bool device_active(struct udevice *dev) { return true; }
 static bool rtkit_helper_live(struct udevice *dev) { return true; }
 static bool rtkit_helper_retained(struct udevice *dev) { return true; }
-static bool rtkit_helper_inventory(struct udevice *dev) { return false; }
 static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob) { assert(false); return -1; }
-static void apple_dart_release_bypass(void *dart) { assert(false); }
 static void rtkit_helper_stop(struct udevice *dev)
 { stops++; priv.rtk = NULL; priv.input_ready = priv.handoff_published = false; }
 
@@ -389,12 +387,10 @@ def test_published_remove_never_stops_firmware_on_dart_failure(tmp_path):
 #define debug(...) ((void)0)
 struct rtkit_helper_priv { bool handoff_published;void *rtk,*dart; };
 struct udevice { const char *name;struct rtkit_helper_priv *priv; };
-static int retention_error,stops,frees,panics;static bool j713=true,j613;
+static int retention_error,stops,frees,panics;
 static jmp_buf boundary;
 static void *dev_get_priv(struct udevice *d) { return d->priv; }
 static int apple_dart_retain_bypass(void *d) { assert(d);return retention_error; }
-static bool rtkit_helper_retained(struct udevice *d) { assert(d);return j713; }
-static bool rtkit_helper_inventory(struct udevice *d) { assert(d);return j613; }
 static void apple_rtkit_free(void *r) { assert(r);frees++; }
 static void rtkit_helper_stop(struct udevice *d) { d->priv->rtk=NULL;stops++; }
 static void __attribute__((noreturn)) panic(const char *fmt,...) {
@@ -409,11 +405,10 @@ int main(void) {
  retention_error=0;assert(!rtkit_helper_remove(&d));assert(frees==1&&!stops&&!p.rtk);
  p.rtk=(void *)1;p.handoff_published=false;
  assert(!rtkit_helper_remove(&d)&&stops==1&&!p.rtk);
- p.rtk=(void *)1;p.handoff_published=true;j713=false;retention_error=-EINVAL;
- assert(!rtkit_helper_remove(&d)&&stops==2&&!p.rtk&&panics==1);
- p.rtk=(void *)1;p.handoff_published=true;j613=true;
+ /* Every published session, whatever its form, refuses OS entry. */
+ p.rtk=(void *)1;p.handoff_published=true;retention_error=-EINVAL;
  if(!setjmp(boundary)){rtkit_helper_remove(&d);assert(false);}
- assert(panics==2&&stops==2&&p.rtk&&p.handoff_published);
+ assert(panics==2&&stops==1&&p.rtk&&p.handoff_published);
  return 0;
 }
 '''
@@ -438,16 +433,14 @@ def test_helper_handoff_follows_the_mtp(tmp_path):
 #include <stdbool.h>
 #include <string.h>
 typedef const char *const *ofnode;
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 enum apple_rtkit_helper_handoff {
  APPLE_RTKIT_HELPER_RESTART, APPLE_RTKIT_HELPER_OS, APPLE_RTKIT_HELPER_PARK, APPLE_RTKIT_HELPER_LIVE,
 };
-static const char *board, *mode;
+static const char *board, *mode; /* board: must not matter */
 static bool ofnode_device_is_compatible(ofnode node, const char *compat) {
  for (; *node; node++) if (!strcmp(*node, compat)) return true;
  return false;
 }
-static bool of_machine_is_compatible(const char *compat) { return board && !strcmp(board, compat); }
 static ofnode ofnode_path(const char *path) { assert(!strcmp(path, "/chosen")); return 0; }
 static const char *ofnode_read_string(ofnode node, const char *name)
 { assert(!strcmp(name, "aurora,mtp-handoff")); return mode; }
@@ -464,14 +457,14 @@ int main(void) {
   { MTP("t6050"), "apple,j714c", O, false },
   { MTP("t8140"), "apple,j700", L, false },
   { MTP("t8122"), "apple,j613", L, false },
-  { MTP("t8122"), "apple,j504", R, false },
-  { (const char *const[]){"apple,t6031-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp", "apple,rtk-helper-asc4", 0}, "apple,j514c", R, false },
+  { MTP("t8122"), "apple,j504", L, false },
+  { (const char *const[]){"apple,t6031-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp", "apple,rtk-helper-asc4", 0}, "apple,j514c", L, false },
   { MTP("t8132"), "apple,j713", L, true },
-  { MTP("t8132"), "apple,j604", O, false },
-  { MTP("t8132"), "apple,j715", R, false },
+  { MTP("t8132"), "apple,j604", L, true },
+  { MTP("t8132"), "apple,j715", L, true },
   { MTP("t6041"), "apple,j614s", L, true },
-  { MTP("t6041"), "apple,j616s", O, false },
-  { MTP("t6041"), "apple,j616c", O, false },
+  { MTP("t6041"), "apple,j616s", L, true },
+  { MTP("t6041"), "apple,j616c", L, true },
  };
  for (int m = 0; m < 3; m++) {
   mode = m == 0 ? NULL : m == 1 ? "off" : "live";
@@ -493,10 +486,9 @@ int main(void) {
     subprocess.run([str(binary)], check=True)
 
 
-def test_live_publish_plain_and_inventory_forms(tmp_path):
-    """The generic live publication: reservations mapped 1:1 for the DART and
-    its bypass stream; the inventory form also waits for the keyboard's READY
-    and exports the buffer inventory."""
+def test_live_publish_needs_ready_input_and_exports_inventory(tmp_path):
+    """The generic live publication: no publication before the keyboard's
+    READY, reservations mapped 1:1 for the DART, and the buffer inventory."""
     repo = Path(__file__).resolve().parents[3]
     text = (repo / 'arch/arm/mach-apple/rtkit_helper.c').read_text()
     start = text.index('/*\n * Describe the running session')
@@ -527,8 +519,6 @@ struct rtkit_helper_priv {
 };
 static struct rtkit_helper_priv priv;
 static int bypass_error;
-static int inventory_form;
-static bool rtkit_helper_inventory(struct udevice *dev) { return inventory_form; }
 static struct rtkit_helper_priv *dev_get_priv(struct udevice *dev) { return &priv; }
 static u32 readl(void *addr) { return REG_CPU_CTRL_RUN; }
 static int apple_dart_retain_bypass(struct udevice *dart) { return bypass_error; }
@@ -565,17 +555,15 @@ int main(void)
 {
  static char blob[8192];
  struct udevice dart = {"/soc/dart"}, dev = {"/soc/mtp"};
- for (inventory_form = 0; inventory_form <= 1; inventory_form++) {
-  const int nbufs = 2;
+ for (int pass = 0; pass < 2; pass++) {
+  const int nbufs = pass ? 2 : 0; /* SRAM-only sessions need no DRAM reservation */
   tree(blob);
   priv = (struct rtkit_helper_priv){.rtk = (void *)1, .dart = &dart, .dart_sid = 1, .nbufs = nbufs};
   priv.bufs[0] = (struct rtkit_helper_buf){0x10100000000ULL, 0x4000};
   priv.bufs[1] = (struct rtkit_helper_buf){0x10100010000ULL, 0x8000};
-  if (inventory_form) {
-   /* No publication before the keyboard's READY: the OS would miss discovery. */
-   assert(rtkit_helper_fdt_publish(&dev, blob) == -ENODEV && !priv.handoff_published);
-   priv.input_ready = true;
-  }
+  /* No publication before the keyboard's READY: the OS would miss discovery. */
+  assert(rtkit_helper_fdt_publish(&dev, blob) == -ENODEV && !priv.handoff_published);
+  priv.input_ready = true;
   bypass_error = -EINVAL;
   assert(rtkit_helper_fdt_publish(&dev, blob) == -EINVAL && !priv.handoff_published);
   bypass_error = 0;
@@ -584,15 +572,11 @@ int main(void)
   const char *h = fdt_getprop(blob, mtp, "apple,rtkit-handoff", NULL);
   assert(h && !strcmp(h, "mtp-live-v1"));
   const fdt32_t *inv = fdt_getprop(blob, mtp, "apple,rtkit-buffers", &len);
-  if (inventory_form) {
-   assert(inv && len == 20 * 4);
-   assert(fdt32_to_cpu(inv[0]) == 2 && fdt32_to_cpu(inv[5]) == 4 && fdt32_to_cpu(inv[10]) == 8);
-   assert(fdt32_to_cpu(inv[8]) == 0x6000 && fdt32_to_cpu(inv[14]) == 1);
-  } else {
-   assert(!inv);
-  }
+  assert(inv && len == 20 * 4);
+  assert(fdt32_to_cpu(inv[0]) == 2 && fdt32_to_cpu(inv[5]) == 4 && fdt32_to_cpu(inv[10]) == 8);
+  assert(fdt32_to_cpu(inv[8]) == 0x6000 && fdt32_to_cpu(inv[14]) == 1);
   const fdt32_t *regions = fdt_getprop(blob, mtp, "memory-region", &len);
-  assert(regions && len == nbufs * 4);
+  assert(nbufs ? regions && len == nbufs * 4 : !regions);
   for (int i = 0; i < nbufs; i++) {
    int r = fdt_node_offset_by_phandle(blob, fdt32_to_cpu(regions[i]));
    const fdt32_t *ia = fdt_getprop(blob, r, "iommu-addresses", &len);

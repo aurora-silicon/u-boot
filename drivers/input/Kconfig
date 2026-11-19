@@ -79,8 +79,7 @@ config APPLE_MTP_KEYB
 	  MTP firmware newer than the M2's cannot be restarted. U-Boot parks
 	  such an MTP at OS entry when /chosen/aurora,mtp-handoff is "off",
 	  otherwise it hands the running session to the OS
-	  (apple,rtkit-handoff) on the boards where that is qualified, and it
-	  never touches an MTP that iBoot already ran (T8142, T6050). Linux
+	  (apple,rtkit-handoff), and it never touches an MTP that iBoot already ran (T8142, T6050). Linux
 	  needs rtkit-helper support for adopting a live session; older
 	  kernels lose the internal keyboard and trackpad after U-Boot has
 	  used them.

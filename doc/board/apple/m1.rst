@@ -91,7 +91,7 @@ that inventory before receiving RTKit traffic. The legacy inherited marker
 remains for stable kernels that preserve the session without servicing it.
 If optional input initialization or handoff fails, stop the helper
 before freeing its buffers, disable its outgoing DT nodes and continue booting.
-This retained input contract is the T8132 and T6041 form of the live handoff (J713, J614s). The built-in keyboard is
+This retained input contract is the live handoff form of every T8132 and T6041 MTP. The built-in keyboard is
 registered as ``mtpkbd`` alongside the other console inputs, including EFI
 ConIn. Keyboard setup uses the announcement parser even though these MTPs have an STM
 interface: STM identity discovery remains Linux's responsibility. Before OS
@@ -134,10 +134,11 @@ place, ``apple_rtkit_helper_handoff()``, from the MTP node:
   image it had before its first run, and the OS starts it fresh. This is the
   intended path for every such MTP; the park sequence itself is added
   separately.
-- Live: otherwise, on the boards where it is qualified (J700, J613, J713,
-  J614s), U-Boot hands the session to the OS running
-  (``apple,rtkit-handoff = "mtp-live-v1"``). The J604 and the other T6041
-  boards leave the MTP cold for Linux; other boards keep the restart path.
+- Live: otherwise U-Boot starts the MTP only if its DART is in bypass and
+  hands the session to the OS running (``apple,rtkit-handoff =
+  "mtp-live-v1"``, no-map reservations, ``apple,rtkit-buffers``) once the
+  keyboard is ready. If that cannot be published, U-Boot stops the MTP and
+  disables it and its keyboard in the OS tree.
 
 CTXR executable window
 ----------------------

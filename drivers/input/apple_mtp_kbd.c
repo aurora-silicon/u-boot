@@ -521,8 +521,8 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
 			 of_machine_is_compatible("apple,j713") ||
 			 of_machine_is_compatible("apple,j614s") ||
-			 apple_t8112_mtp_live_epoch() ||
-			 of_machine_is_compatible("apple,j613");
+			 (priv->helper &&
+			  apple_rtkit_helper_keeps_running(dev_ofnode(priv->helper)));
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {

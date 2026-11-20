@@ -46,6 +46,12 @@ bool apple_rtkit_helper_input_retained(struct udevice *dev);
 void apple_rtkit_helper_input_failed(struct udevice *dev);
 
 bool apple_rtkit_helper_allowed(ofnode node);
-bool apple_t8112_mtp_live_epoch(void);
+#if IS_ENABLED(CONFIG_APPLE_MTP_KEYB)
+bool apple_rtkit_helper_keeps_running(ofnode node);
+bool apple_rtkit_helper_any_keeps_running(void);
+#else
+static inline bool apple_rtkit_helper_keeps_running(ofnode node) { return false; }
+static inline bool apple_rtkit_helper_any_keeps_running(void) { return false; }
+#endif
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */
 int apple_rtkit_helper_fdt_fixup(void *blob);

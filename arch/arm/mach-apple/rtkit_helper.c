@@ -62,26 +62,30 @@ struct rtkit_helper_priv {
 };
 
 /*
- * The T8112 MTP firmware of macOS 27 and later cannot be restarted once it has
- * been quiesced, unlike the 13.x firmware on the same SoC (MacBook Air M2 on the
- * 27.2 stub): its first epoch must be handed to the OS running. Selected by the
- * MTP compatible and the OS firmware the loader reports, not by board.
+ * apple,rtkit-keep-running: the board device tree says this helper's firmware
+ * cannot be restarted once quiesced (J613; J413 on macOS 27 firmware), so its
+ * first epoch goes to the OS running, with OSLog in SRAM and an inventory of
+ * the live buffers. Whether the handoff can happen is then up to the DART
+ * (bypass) and the session itself (rtkit_helper_fdt_publish()).
  */
-bool apple_t8112_mtp_live_epoch(void)
+bool apple_rtkit_helper_keeps_running(ofnode node)
 {
-	const char *ver = ofnode_read_chosen_string("asahi,os-fw-version");
-
-	return ofnode_valid(ofnode_by_compatible(ofnode_null(), "apple,t8112-mtp")) &&
-	       ver && simple_strtoul(ver, NULL, 10) >= 27;
+	return ofnode_read_bool(node, "apple,rtkit-keep-running");
 }
 
-/* The SRAM OSLog handoff retains the first MTP epoch, with OSLog in SRAM. */
+bool apple_rtkit_helper_any_keeps_running(void)
+{
+	ofnode node;
+
+	ofnode_for_each_compatible_node(node, "apple,mtp")
+		if (ofnode_is_enabled(node) && apple_rtkit_helper_keeps_running(node))
+			return true;
+	return false;
+}
+
 static bool rtkit_helper_inventory_handoff(struct udevice *dev)
 {
-	return (of_machine_is_compatible("apple,j613") &&
-		device_is_compatible(dev, "apple,t8122-rtk-helper-asc4")) ||
-	       (apple_t8112_mtp_live_epoch() &&
-		device_is_compatible(dev, "apple,t8112-rtk-helper-asc4"));
+	return apple_rtkit_helper_keeps_running(dev_ofnode(dev));
 }
 
 static bool rtkit_helper_uses_dram(struct udevice *dev)
@@ -665,18 +669,6 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 			ret = rtkit_helper_j713_handoff(dev) ?
 				rtkit_helper_fdt_publish_j713(dev, scratch) :
 				rtkit_helper_fdt_publish(dev, scratch);
-		/*
-		 * The 27.x T8112 trackpad firmware answers only the two-stage power
-		 * command (Linux's apple,power-method = <2>, as on J613/25G83 and
-		 * T8132); the original one leaves it timing out.
-		 */
-		if (!ret && apple_t8112_mtp_live_epoch()) {
-			int hid = fdt_node_offset_by_compatible(scratch, -1, "apple,dockchannel-hid");
-			int mt = hid < 0 ? hid : fdt_subnode_offset(scratch, hid, "multi-touch");
-
-			if (mt >= 0 && !fdt_getprop(scratch, mt, "apple,power-method", NULL))
-				ret = fdt_setprop_u32(scratch, mt, "apple,power-method", 2);
-		}
 		if (!ret) {
 			memcpy(blob, scratch, capacity);
 			if (!was_published)

@@ -1708,7 +1708,8 @@ int board_late_init(void)
 	    of_machine_is_compatible("apple,t6041") ||
 	    of_machine_is_compatible("apple,t6050"))
 		start_keyboard = false;
-	if (apple_t8112_mtp_live_epoch() ||
+	/* A helper the OS adopts running is started for U-Boot's keyboard too. */
+	if (apple_rtkit_helper_any_keeps_running() ||
 	    of_machine_is_compatible("apple,j613") ||
 	    of_machine_is_compatible("apple,t8140") ||
 	    of_machine_is_compatible("apple,t8132") ||

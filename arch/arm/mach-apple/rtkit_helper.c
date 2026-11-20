@@ -61,11 +61,27 @@ struct rtkit_helper_priv {
 	bool input_ready;
 };
 
-/* J613 retains the first MTP epoch, with OSLog in SRAM. */
-static bool rtkit_helper_j613_handoff(struct udevice *dev)
+/*
+ * The T8112 MTP firmware of macOS 27 and later cannot be restarted once it has
+ * been quiesced, unlike the 13.x firmware on the same SoC (MacBook Air M2 on the
+ * 27.2 stub): its first epoch must be handed to the OS running. Selected by the
+ * MTP compatible and the OS firmware the loader reports, not by board.
+ */
+bool apple_t8112_mtp_live_epoch(void)
 {
-	return of_machine_is_compatible("apple,j613") &&
-	       device_is_compatible(dev, "apple,t8122-rtk-helper-asc4");
+	const char *ver = ofnode_read_chosen_string("asahi,os-fw-version");
+
+	return ofnode_valid(ofnode_by_compatible(ofnode_null(), "apple,t8112-mtp")) &&
+	       ver && simple_strtoul(ver, NULL, 10) >= 27;
+}
+
+/* The SRAM OSLog handoff retains the first MTP epoch, with OSLog in SRAM. */
+static bool rtkit_helper_inventory_handoff(struct udevice *dev)
+{
+	return (of_machine_is_compatible("apple,j613") &&
+		device_is_compatible(dev, "apple,t8122-rtk-helper-asc4")) ||
+	       (apple_t8112_mtp_live_epoch() &&
+		device_is_compatible(dev, "apple,t8112-rtk-helper-asc4"));
 }
 
 static bool rtkit_helper_uses_dram(struct udevice *dev)
@@ -239,7 +255,7 @@ static int rtkit_helper_probe(struct udevice *dev)
 		return ret;
 
 	if (rtkit_helper_uses_dram(dev) || rtkit_helper_j713_handoff(dev) ||
-	    rtkit_helper_j613_handoff(dev))
+	    rtkit_helper_inventory_handoff(dev))
 		rtkit_helper_read_dma_window(dev);
 
 	if (of_machine_is_compatible("apple,j614s") &&
@@ -323,7 +339,7 @@ static int rtkit_helper_remove(struct udevice *dev)
 		/* A published J713 inventory already promises a running session.
 		 * Removal errors alone cannot stop EFI/booti from entering Linux. */
 		if (ret && (rtkit_helper_j713_handoff(dev) ||
-			    rtkit_helper_j613_handoff(dev)))
+			    rtkit_helper_inventory_handoff(dev)))
 			panic("MTP: refusing OS entry after DART retention error %d", ret);
 		if (ret)
 			goto stop;
@@ -520,7 +536,7 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	struct apple_rtkit_buffer buffers[4];
 	int count;
 
-	if ((rtkit_helper_j613_handoff(dev) && !priv->input_ready) ||
+	if ((rtkit_helper_inventory_handoff(dev) && !priv->input_ready) ||
 	    !priv->rtk || !priv->dart || !priv->nbufs ||
 	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
 		return -ENODEV;
@@ -585,7 +601,7 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 			       priv->dart_sid))
 		return -ENOSPC;
 
-	if (rtkit_helper_j613_handoff(dev)) {
+	if (rtkit_helper_inventory_handoff(dev)) {
 		count = apple_rtkit_get_buffers(priv->rtk, buffers, ARRAY_SIZE(buffers));
 		if (count != ARRAY_SIZE(buffers))
 			return count < 0 ? count : -EINVAL;
@@ -628,7 +644,7 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 		if (dev->driver != DM_DRIVER_GET(rtkit_helper) ||
 		    !device_active(dev) ||
 		    (!rtkit_helper_uses_dram(dev) && !rtkit_helper_j713_handoff(dev) &&
-		     !rtkit_helper_j613_handoff(dev)))
+		     !rtkit_helper_inventory_handoff(dev)))
 			continue;
 
 		priv = dev_get_priv(dev);
@@ -655,8 +671,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 				priv->published_fdt = blob;
 		}
 		free(scratch);
-		if (ret && rtkit_helper_j613_handoff(dev))
-			panic("J613 MTP handoff publication failed: %d", ret);
+		if (ret && rtkit_helper_inventory_handoff(dev))
+			panic("MTP handoff publication failed: %d", ret);
 		if (ret && was_published) {
 			/* The prior EFI table may still be selected after a later
 			 * candidate fixup fails. Its buffers/DART/session stay live. */

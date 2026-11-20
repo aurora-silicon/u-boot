@@ -665,6 +665,18 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 			ret = rtkit_helper_j713_handoff(dev) ?
 				rtkit_helper_fdt_publish_j713(dev, scratch) :
 				rtkit_helper_fdt_publish(dev, scratch);
+		/*
+		 * The 27.x T8112 trackpad firmware answers only the two-stage power
+		 * command (Linux's apple,power-method = <2>, as on J613/25G83 and
+		 * T8132); the original one leaves it timing out.
+		 */
+		if (!ret && apple_t8112_mtp_live_epoch()) {
+			int hid = fdt_node_offset_by_compatible(scratch, -1, "apple,dockchannel-hid");
+			int mt = hid < 0 ? hid : fdt_subnode_offset(scratch, hid, "multi-touch");
+
+			if (mt >= 0 && !fdt_getprop(scratch, mt, "apple,power-method", NULL))
+				ret = fdt_setprop_u32(scratch, mt, "apple,power-method", 2);
+		}
 		if (!ret) {
 			memcpy(blob, scratch, capacity);
 			if (!was_published)

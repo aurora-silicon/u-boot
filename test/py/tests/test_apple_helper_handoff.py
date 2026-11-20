@@ -68,7 +68,7 @@ static int stops;
 #define debug(...) ((void)0)
 static bool device_active(struct udevice *dev) { return true; }
 static bool rtkit_helper_j713_handoff(struct udevice *dev) { return true; }
-static bool rtkit_helper_j613_handoff(struct udevice *dev) { return false; }
+static bool rtkit_helper_inventory_handoff(struct udevice *dev) { return false; }
 static void __attribute__((noreturn)) panic(const char *fmt, ...)
 { assert(!fmt); abort(); }
 static bool rtkit_helper_uses_dram(struct udevice *dev) { return false; }
@@ -402,7 +402,7 @@ static jmp_buf boundary;
 static void *dev_get_priv(struct udevice *d) { return d->priv; }
 static int apple_dart_retain_bypass(void *d) { assert(d);return retention_error; }
 static bool rtkit_helper_j713_handoff(struct udevice *d) { assert(d);return j713; }
-static bool rtkit_helper_j613_handoff(struct udevice *d) { assert(d);return j613; }
+static bool rtkit_helper_inventory_handoff(struct udevice *d) { assert(d);return j613; }
 static void apple_rtkit_free(void *r) { assert(r);frees++; }
 static void rtkit_helper_stop(struct udevice *d) { d->priv->rtk=NULL;stops++; }
 static void __attribute__((noreturn)) panic(const char *fmt,...) {

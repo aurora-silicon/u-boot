@@ -19,9 +19,6 @@
 #include <asm/io.h>
 #include <linux/iopoll.h>
 
-#define APPLE_DC_CHANNEL_STRIDE	0x10000
-
-#define APPLE_DC_DATA_OFFSET	0x4000
 #define APPLE_DC_DATA_TX8	0x04
 #define APPLE_DC_DATA_TX_FREE	0x14
 #define APPLE_DC_DATA_RX8	0x1c
@@ -85,31 +82,17 @@ static int apple_dc_serial_of_to_plat(struct udevice *dev)
 {
 	struct apple_dc_serial_plat *plat = dev_get_plat(dev);
 	fdt_addr_t addr;
-	u32 channel;
 
 	/*
-	 * Linux-style DTs describe the channel's data window explicitly; their
-	 * apple,channel only selects the channel's bits in the shared interrupt
-	 * registers, which U-Boot does not use.  The compact m1n1 smoke DT
-	 * instead supplies the shared config window and an apple,channel
-	 * selector.  Normalize both forms to the data window so the handoff can
-	 * stay on the firmware-selected DockChannel.
+	 * The DT names the data window of the channel the firmware selected.
+	 * Its apple,channel only selects that channel's bits in the shared
+	 * interrupt registers, which U-Boot does not use.
 	 */
 	addr = dev_read_addr_name(dev, "data");
-	if (addr != FDT_ADDR_T_NONE) {
-		channel = 0;
-	} else {
-		addr = dev_read_addr(dev);
-		if (addr == FDT_ADDR_T_NONE)
-			return -EINVAL;
-		channel = dev_read_u32_default(dev, "apple,channel", 1);
-		addr += APPLE_DC_DATA_OFFSET;
-	}
-	if (channel > 15)
+	if (addr == FDT_ADDR_T_NONE)
 		return -EINVAL;
 
-	plat->base = (void __iomem *)(uintptr_t)
-		(addr + channel * APPLE_DC_CHANNEL_STRIDE);
+	plat->base = (void __iomem *)(uintptr_t)addr;
 	return 0;
 }
 

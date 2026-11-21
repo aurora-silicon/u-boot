@@ -46,8 +46,8 @@
 #define AUS_COMMON_SHIM_BLK_BIAS_REG	0x0a00
 #define  AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV BIT(1)
 #define ATCPHY_EVT_USB2_CTL		0x0
-#define  ATCPHY_EVT_USB2_CTL_EVT_EN	0x1
-#define  ATCPHY_EVT_USB2_CTL_LOAD_CNT	0x8
+#define  ATCPHY_EVT_USB2_CTL_EVT_EN	BIT(0)
+#define  ATCPHY_EVT_USB2_CTL_LOAD_CNT	BIT(3)
 #define ATCPHY_POWER_CTRL		0x20000
 #define ATCPHY_POWER_STAT		0x20004
 #define  ATCPHY_POWER_SLEEP_SMALL	BIT(0)
@@ -97,6 +97,17 @@
 #define USB2PHY_MISCTUNE		0x1c
 #define  USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
 #define  USB2PHY_MISCTUNE_REFCLK_GATE_OFF BIT(30)
+
+/*
+ * Wait between releasing the USB2 PHY resets and setting USBCTL_RUN on the
+ * A18 Pro, for the eUSB2 repeater between the PHY and the board's fixed hub.
+ * No ready or lock bit is known for the repeater, so this is a fixed wait:
+ * 5 ms is the interval the J700 bring-up used, unchanged in the Aurora Linux
+ * driver (aurora-silicon/linux deb9dad18a0d), and it has not been narrowed
+ * down.  Tracked in aurora-silicon/u-boot#61: find the repeater's ready
+ * indication or measure the minimum before shortening it.
+ */
+#define ATCPHY_T8140_EUSB2_SETTLE_MS	5
 
 struct apple_atcphy_priv {
 	bool usb2_only;		/* A18 Pro: USB2 through a fixed hub */
@@ -212,8 +223,7 @@ static int atcphy_usb2_power_on(struct udevice *dev)
 	clear32(priv->usb2phy + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_APBCLK_GATE_OFF);
 	clear32(priv->usb2phy + USB2PHY_MISCTUNE, USB2PHY_MISCTUNE_REFCLK_GATE_OFF);
 
-	/* Let the eUSB2 repeater settle between reset release and link start. */
-	mdelay(5);
+	mdelay(ATCPHY_T8140_EUSB2_SETTLE_MS);
 
 	writel(USB2PHY_USBCTL_RUN, priv->usb2phy + USB2PHY_USBCTL);
 

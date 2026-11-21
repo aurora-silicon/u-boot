@@ -140,7 +140,7 @@ static int env_fat_load(void)
 #endif
 #if defined(CONFIG_NVME)
 	if (!strcmp(ifname, "nvme")) {
-		if (IS_ENABLED(CONFIG_PCI))
+		if (IS_ENABLED(CONFIG_NVME_PCI))
 			pci_init();
 
 		nvme_scan_namespace();

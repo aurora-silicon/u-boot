@@ -14,6 +14,7 @@
 #include <nvme.h>
 #include <part.h>
 #include <time.h>
+#include <linux/build_bug.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
 
@@ -29,7 +30,7 @@ DECLARE_GLOBAL_DATA_PTR;
 
 /* Apple M1/M2 */
 
-static struct mm_region t8103_mem_map[] = {
+static const struct mm_region t8103_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -78,27 +79,12 @@ static struct mm_region t8103_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
 			 PTE_BLOCK_INNER_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x800000000,
-		.phys = 0x800000000,
-		.size = 8UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M1 Pro/Max */
 
-static struct mm_region t6000_mem_map[] = {
+static const struct mm_region t6000_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x280000000,
@@ -171,27 +157,12 @@ static struct mm_region t6000_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M1 Ultra */
 
-static struct mm_region t6002_mem_map[] = {
+static const struct mm_region t6002_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x280000000,
@@ -336,27 +307,12 @@ static struct mm_region t6002_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M2 Pro/Max */
 
-static struct mm_region t6020_mem_map[] = {
+static const struct mm_region t6020_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x280000000,
@@ -453,27 +409,12 @@ static struct mm_region t6020_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M2 Ultra */
 
-static struct mm_region t6022_mem_map[] = {
+static const struct mm_region t6022_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x280000000,
@@ -666,27 +607,12 @@ static struct mm_region t6022_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M3 */
 
-static struct mm_region t8122_mem_map[] = {
+static const struct mm_region t8122_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -743,27 +669,12 @@ static struct mm_region t8122_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 8UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M3 Pro and Max */
 
-static struct mm_region t6030_mem_map[] = {
+static const struct mm_region t6030_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x280000000,
@@ -836,27 +747,12 @@ static struct mm_region t6030_mem_map[] = {
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* RAM */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-			 PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Framebuffer */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE |
-			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* List terminator */
-		0,
 	}
 };
 
 /* Apple M4 */
 
-static struct mm_region t8132_mem_map[CONFIG_NR_DRAM_BANKS + 10] = {
+static const struct mm_region t8132_io_map[] = {
 	{
 		/* SoC I/O, including PMGR, WD1, MTP, AIC and UART */
 		.virt = 0x380000000,
@@ -926,7 +822,7 @@ static struct mm_region t8132_mem_map[CONFIG_NR_DRAM_BANKS + 10] = {
 
 /* Apple A18 Pro (T8140) */
 
-static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
+static const struct mm_region t8140_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -943,11 +839,9 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
  * M5 Max (T6050), whose register blocks, APCIE ECAM and PCIe windows sit at
  * the same addresses (its GPU above 0x23_0000_0000 is left unmapped).  Every register
  * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
- * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
- * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
- * T8140.
+ * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.
  */
-static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 5] = {
+static const struct mm_region t6040_io_map[] = {
 	{
 		/* I/O */
 		.virt = 0x200000000,
@@ -975,53 +869,37 @@ static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 5] = {
 	}
 };
 
-/* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
- * RAM and framebuffer entries are populated from the m1n1-patched FDT.
- */
-static struct mm_region t8142_mem_map[] = {
+/* Apple M5 (J813), primary I/O range measured from the live Apple ADT. */
+static const struct mm_region t8142_io_map[] = {
 	{
 		.virt = 0x210000000,
 		.phys = 0x210000000,
 		.size = 0x3f0000000,
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = 16UL * SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE
-	}, {
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		0,
 	}
 };
 
 /* T8152: only DockChannel is qualified for initial RAM boot. */
-static struct mm_region t8152_mem_map[] = {
+static const struct mm_region t8152_io_map[] = {
 	{
 		.virt = 0x308000000,
 		.phys = 0x308000000,
 		.size = SZ_2M,
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		/* Replaced by the first FDT memory bank before enabling caches. */
-		.virt = 0x10000000000,
-		.phys = 0x10000000000,
-		.size = SZ_1G,
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE
-	}, {
-		/* Inherited framebuffer, populated from the FDT. */
-		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-			 PTE_BLOCK_INNER_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN
-	}, {
-		0,
 	}
 };
 
-struct mm_region *mem_map;
+/*
+ * The MMU map: the SoC's I/O regions from the table above, then every DRAM
+ * bank the boot loader describes, then the framebuffer, then a terminator.
+ */
+#define APPLE_MAX_IO_REGIONS	24
+static struct mm_region apple_mem_map[APPLE_MAX_IO_REGIONS +
+				       CONFIG_NR_DRAM_BANKS + 2];
+
+struct mm_region *mem_map = apple_mem_map;
 
 int board_init(void)
 {
@@ -1184,83 +1062,83 @@ int board_fdt_blob_setup(void **fdtp)
 	return 0;
 }
 
+#define APPLE_IO_MAP(map)						\
+	do {								\
+		BUILD_BUG_ON(ARRAY_SIZE(map) > APPLE_MAX_IO_REGIONS);	\
+		io = map;						\
+		nio = ARRAY_SIZE(map);					\
+	} while (0)
+
+static void apple_map_region(int slot, phys_addr_t base, phys_size_t size,
+			     u64 attrs)
+{
+	/* Align the mapping to page boundaries. */
+	size += base - ALIGN_DOWN(base, SZ_4K);
+	base = ALIGN_DOWN(base, SZ_4K);
+	mem_map[slot].virt = base;
+	mem_map[slot].phys = base;
+	mem_map[slot].size = ALIGN(size, SZ_4K);
+	mem_map[slot].attrs = attrs;
+}
+
 void build_mem_map(void)
 {
+	const struct mm_region *io;
 	ofnode node;
 	fdt_addr_t base;
 	fdt_size_t size;
-	int i, bank, fb_slot;
+	int nio, slot, bank;
 
 	if (of_machine_is_compatible("apple,t8103") ||
 	    of_machine_is_compatible("apple,t8112"))
-		mem_map = t8103_mem_map;
+		APPLE_IO_MAP(t8103_io_map);
 	else if (of_machine_is_compatible("apple,t6000") ||
 		 of_machine_is_compatible("apple,t6001"))
-		mem_map = t6000_mem_map;
+		APPLE_IO_MAP(t6000_io_map);
 	else if (of_machine_is_compatible("apple,t6002"))
-		mem_map = t6002_mem_map;
+		APPLE_IO_MAP(t6002_io_map);
 	else if (of_machine_is_compatible("apple,t6020") ||
 		 of_machine_is_compatible("apple,t6021"))
-		mem_map = t6020_mem_map;
+		APPLE_IO_MAP(t6020_io_map);
 	else if (of_machine_is_compatible("apple,t6022"))
-		mem_map = t6022_mem_map;
+		APPLE_IO_MAP(t6022_io_map);
 	else if (of_machine_is_compatible("apple,t8122"))
-		mem_map = t8122_mem_map;
+		APPLE_IO_MAP(t8122_io_map);
 	else if (of_machine_is_compatible("apple,t6030") ||
 		 of_machine_is_compatible("apple,t6031") ||
 		 of_machine_is_compatible("apple,t6034"))
-		mem_map = t6030_mem_map;
+		APPLE_IO_MAP(t6030_io_map);
 	else if (of_machine_is_compatible("apple,t8132"))
-		mem_map = t8132_mem_map;
+		APPLE_IO_MAP(t8132_io_map);
 	else if (of_machine_is_compatible("apple,t8140"))
-		mem_map = t8140_mem_map;
+		APPLE_IO_MAP(t8140_io_map);
 	else if (of_machine_is_compatible("apple,t6040") ||
 		 of_machine_is_compatible("apple,t6041") ||
 		 of_machine_is_compatible("apple,t6050"))
-		mem_map = t6040_mem_map;
+		APPLE_IO_MAP(t6040_io_map);
 	else if (of_machine_is_compatible("apple,t8142"))
-		mem_map = t8142_mem_map;
+		APPLE_IO_MAP(t8142_io_map);
 	else if (of_machine_is_compatible("apple,t8152") &&
 		 of_machine_is_compatible("apple,j873g"))
-		mem_map = t8152_mem_map;
+		APPLE_IO_MAP(t8152_io_map);
 	else
 		panic("Unsupported SoC\n");
 
-	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
-	    mem_map == t6040_mem_map) {
-		int ram_slot = mem_map == t8132_mem_map ? 8 :
-			       mem_map == t6040_mem_map ? 3 : 1;
+	memset(apple_mem_map, 0, sizeof(apple_mem_map));
+	memcpy(apple_mem_map, io, nio * sizeof(*io));
+	slot = nio;
 
-		/* LMB and EFI see every bank, so the MMU must map every bank. */
-		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
-			base = gd->bd->bi_dram[bank].start;
-			size = gd->bd->bi_dram[bank].size;
-			if (!size)
-				break;
-			size += base - ALIGN_DOWN(base, SZ_4K);
-			base = ALIGN_DOWN(base, SZ_4K);
-			mem_map[bank + ram_slot].virt = base;
-			mem_map[bank + ram_slot].phys = base;
-			mem_map[bank + ram_slot].size = ALIGN(size, SZ_4K);
-			mem_map[bank + ram_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
-						  PTE_BLOCK_INNER_SHARE;
-		}
-		fb_slot = bank + ram_slot;
-		mem_map[fb_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
-					 PTE_BLOCK_INNER_SHARE |
-					 PTE_BLOCK_PXN | PTE_BLOCK_UXN;
-	} else {
-		/* Find list terminator and update the original single RAM slot. */
-		for (i = 0; mem_map[i].size || mem_map[i].attrs; i++)
-			;
-		base = gd->bd->bi_dram[0].start;
-		size = gd->bd->bi_dram[0].size;
-		size += base - ALIGN_DOWN(base, SZ_4K);
-		base = ALIGN_DOWN(base, SZ_4K);
-		mem_map[i - 2].virt = base;
-		mem_map[i - 2].phys = base;
-		mem_map[i - 2].size = ALIGN(size, SZ_4K);
-		fb_slot = i - 1;
+	/*
+	 * LMB and EFI hand out memory from every bank in gd->bd->bi_dram, so
+	 * the MMU must map every bank, on every SoC.
+	 */
+	for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
+		if (!gd->bd->bi_dram[bank].size)
+			break;
+		apple_map_region(slot++, gd->bd->bi_dram[bank].start,
+				 gd->bd->bi_dram[bank].size,
+				 PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+				 PTE_BLOCK_INNER_SHARE);
 	}
 
 	node = ofnode_path("/chosen/framebuffer");
@@ -1271,15 +1149,10 @@ void build_mem_map(void)
 	if (base == FDT_ADDR_T_NONE)
 		return;
 
-	/* Align framebuffer mapping to page boundaries */
-	size += (base - ALIGN_DOWN(base, SZ_4K));
-	base = ALIGN_DOWN(base, SZ_4K);
-	size = ALIGN(size, SZ_4K);
-
-	/* Add framebuffer mapping */
-	mem_map[fb_slot].virt = base;
-	mem_map[fb_slot].phys = base;
-	mem_map[fb_slot].size = size;
+	apple_map_region(slot, base, size,
+			 PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN);
 }
 
 void enable_caches(void)

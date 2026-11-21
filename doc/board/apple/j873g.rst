@@ -4,8 +4,8 @@ Apple M6 Mac mini (J873g)
 =======================
 
 The initial T8152 port boots from RAM using the firmware-selected DockChannel
-UART. Build with ``make apple_j873_defconfig`` followed by ``make`` using an
-AArch64 GNU toolchain. Supply an external FDT from m1n1; the built-in M1 DT does
+UART. Build with ``make apple_m1_defconfig`` followed by ``make`` using an
+AArch64 GNU toolchain; the same configuration builds every Apple machine. Supply an external FDT from m1n1; the built-in M1 DT does
 not describe this board. The root must include ``apple,j873g`` and ``apple,t8152``.
 Use ``u-boot-nodtb.bin`` for RAM handoff.
 
@@ -17,8 +17,9 @@ register ranges and ``bootph-all``. The measured console windows are
 that node. Only the DockChannel I/O aperture is initially mapped.
 
 Storage, USB, networking, keyboard, SMP and EFI operating-system boot remain
-unqualified. Automatic boot and persistent EFI variable storage are disabled.
-Preserve the installed recovery loader.
+unqualified. U-Boot does not probe NVMe on T8152, so the boot scan finds no
+ESP and stops at the prompt, and there is no ESP for EFI variables. Preserve
+the installed recovery loader.
 
 The generic Apple board code still links the USB and NVMe drivers. Leave these
 devices absent or disabled in the handoff FDT; their presence in the binary is
@@ -28,7 +29,7 @@ USB-C display handoff
 --------------------
 
 m1n1 must establish the USB-C DisplayPort link before entering U-Boot. The
-J873 configuration enables the simple framebuffer, video console and
+configuration enables the simple framebuffer, video console and
 ``NO_FB_CLEAR``; U-Boot inherits the active scanout rather than initializing
 the M6 display PHY. Keep the DCP session and its live allocations reserved.
 

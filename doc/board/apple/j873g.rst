@@ -6,7 +6,8 @@ Apple M6 Mac mini (J873g)
 The initial T8152 port boots from RAM using the firmware-selected DockChannel
 UART. Build with ``make apple_j873_defconfig`` followed by ``make`` using an
 AArch64 GNU toolchain. Supply an external FDT from m1n1; the built-in M1 DT does
-not describe this board. The root must include ``apple,j873g`` and ``apple,t8152``.
+not describe this board. The root must include ``apple,t8152``; the same image
+boots any T8152 board whose FDT follows the rules below.
 Use ``u-boot-nodtb.bin`` for RAM handoff.
 
 The FDT must describe one contiguous usable RAM bank, reserve the resident loader

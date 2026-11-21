@@ -27,6 +27,13 @@
 /* ASC registers */
 #define REG_CPU_CTRL		0x0044
 #define  REG_CPU_CTRL_RUN	BIT(4)
+#define REG_CPU_STATUS		0x0048
+#define  REG_CPU_STATUS_STOPPED	BIT(1)
+/* Measured on the J700: set after a reset of ANS, until the run bit (0x6a, against 0x62). */
+#define  REG_CPU_STATUS_RESET	BIT(3)
+#define REG_MBOX_A2I_CTRL	0x0110
+#define REG_MBOX_I2A_CTRL	0x0114
+#define  REG_MBOX_RECV_ENABLE	BIT(0)
 
 /* Apple NVMe registers */
 #define ANS_IOSQ_BASE		0x01200	/* post-M4 */
@@ -86,12 +93,12 @@ struct ans_nvmmu_tcb {
 
 /*
  * On post-M4 controllers (A18 Pro/T8140 and M4/T8132 onwards) the
- * NVMMU has its own register window, the I/O queue addresses are also
- * programmed through dedicated registers, and the ANS coprocessor cannot
- * be reset or restarted once running: clearing CPU_CTRL.RUN is one-way
- * and asserting its PMGR reset raises an SError.  The boot loader that
- * started the firmware (m1n1) hands it over with its RTKit session live,
- * and every later stage adopts that session instead of booting it.
+ * NVMMU has its own register window and the I/O queue addresses are also
+ * programmed through dedicated registers.  The firmware stays resident in
+ * DRAM: a stage done with ANS idles it and powers it off, and the next one
+ * writes the SART entries back and starts it warm (apple,sart-entries, see
+ * apple_nvme_start_from_off()).  A running session handed over by an older
+ * boot loader is still adopted.
  */
 struct apple_nvme_hw {
 	bool post_m4;
@@ -101,12 +108,6 @@ struct apple_nvme_hw {
 	 * linear queues itself.
 	 */
 	bool lsq_in_nvmmu;
-	/*
-	 * The ANS may arrive straight from iBoot, before any OS-side RTKit
-	 * handshake: run that (one-time) handshake here, then hand the live
-	 * session on as on adoption.  See apple_nvme_needs_handshake().
-	 */
-	bool wake_disabled;
 	/*
 	 * T6050: straight from iBoot whenever CC.EN is clear, the coprocessor
 	 * possibly stopped; the controller becomes ready only with the CC
@@ -150,7 +151,6 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.post_m4 = true,
 	.lsq_in_nvmmu = true,
-	.wake_disabled = true,
 	.max_ns_id = 1,
 };
 
@@ -160,7 +160,6 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
  */
 static const struct apple_nvme_hw apple_nvme_t6050_hw = {
 	.post_m4 = true,
-	.wake_disabled = true,
 	.keep_cc_fields = true,
 	.max_ns_id = 1,
 };
@@ -311,6 +310,15 @@ static struct {
 	phys_size_t size;
 } ans_handoff_bufs[ANS_HANDOFF_MAX_BUFS];
 static int ans_handoff_nbufs;
+/* This stage started ANS from off: Linux gets it running, not off. */
+static bool ans_started_from_off;
+/*
+ * /chosen/aurora,nvme-handoff = "off": a post-M4 ANS goes to the OS powered off, its SART
+ * entries in apple,sart-entries, and the OS starts it itself (see apple_nvme_pass_off()).
+ */
+#define ANS_MAX_SART_ENTRIES	16
+static struct apple_sart *ans_off_sart;
+static char ans_off_path[128];
 
 static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
 {
@@ -344,12 +352,63 @@ static int nvme_handoff_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf
 	return 0;
 }
 
+/* A session that won't be handed on (a start being retried): its buffers go back to LMB. */
+static void nvme_handoff_shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf)
+{
+	struct apple_nvme_priv *priv = (struct apple_nvme_priv *)cookie;
+	int i;
+
+	if (!buf || !buf->buffer)
+		return;
+
+	sart_remove_allowed_region(priv->sart, buf->buffer, buf->size);
+	for (i = 0; i < ans_handoff_nbufs; i++) {
+		if (ans_handoff_bufs[i].addr != buf->dva)
+			continue;
+		lmb_free(ans_handoff_bufs[i].addr, ans_handoff_bufs[i].size, LMB_NOOVERWRITE);
+		ans_handoff_bufs[i] = ans_handoff_bufs[--ans_handoff_nbufs];
+		break;
+	}
+	buf->buffer = NULL;
+	buf->dva = 0;
+}
+
 int apple_nvme_fdt_fixup(void *blob)
 {
 	int resv, sub, i, ret;
 	char name[40];
 	fdt64_t reg[2];
 
+	if (ans_off_sart) {
+		/*
+		 * Read now, while ANS runs with them; apple_nvme_pass_off() stops it
+		 * when the devices are removed for the OS.
+		 */
+		u64 cells[3 * ANS_MAX_SART_ENTRIES];
+		fdt64_t prop[3 * ANS_MAX_SART_ENTRIES];
+		int n = sart_get_entries(ans_off_sart, cells, ANS_MAX_SART_ENTRIES);
+
+		sub = fdt_path_offset(blob, ans_off_path);
+		for (i = 0; i < 3 * n; i++)
+			prop[i] = cpu_to_fdt64(cells[i]);
+		ret = sub < 0 ? sub : !n ? -ENOENT :
+		      fdt_setprop(blob, sub, "apple,sart-entries", prop, 3 * n * sizeof(*prop));
+		if (ret) {
+			/* Then it goes on running, as without aurora,nvme-handoff. */
+			printf("ANS: couldn't pass its SART entries on (%d); it goes to the OS running\n",
+			       ret);
+			ans_off_sart = NULL;
+		} else {
+			printf("ANS goes to the OS powered off, %d SART entries passed on\n", n);
+		}
+	}
+	for (sub = fdt_next_node(blob, -1, NULL); ans_started_from_off && !ans_off_sart && sub >= 0;
+	     sub = fdt_next_node(blob, sub, NULL)) {
+		if (fdt_getprop(blob, sub, "apple,sart-entries", NULL)) {
+			fdt_delprop(blob, sub, "apple,sart-entries");
+			break;
+		}
+	}
 	if (!ans_handoff_nbufs)
 		return 0;
 
@@ -634,17 +693,15 @@ static int apple_nvme_adopt(struct udevice *dev)
 }
 
 /*
- * T6040: the firmware takes the OS-side RTKit handshake once per boot; every
- * later owner must adopt the live session.  An m1n1 stage that ran the
- * handshake leaves the controller disabled but programmed (NVMMU TCB bases,
- * I/O queue aperture); straight from iBoot (a chain whose m1n1 stages never
- * used NVMe) both read zero and the controller will not become ready until
- * someone runs the handshake.
+ * Post-M4: the firmware takes the OS-side RTKit handshake once per boot.  A
+ * boot loader stage that ran it leaves the controller programmed (NVMMU TCB
+ * bases, I/O queue aperture); straight from iBoot (a chain whose earlier
+ * stages never used NVMe) both read zero and the controller will not become
+ * ready until someone runs the handshake.
  */
 static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 {
-	if (!priv->hw->wake_disabled ||
-	    (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE))
+	if (readl(&priv->ndev.bar->cc) & NVME_CC_ENABLE)
 		return false;
 	/* T6050: an m1n1 stage 2 that received stage 1's live session says so in /chosen. */
 	if (priv->hw->keep_cc_fields)
@@ -656,8 +713,8 @@ static bool apple_nvme_needs_handshake(struct apple_nvme_priv *priv)
 }
 
 /*
- * Post-M4, T6040: the boot loader hands the ANS over running, with the
- * controller disabled and before the OS-side RTKit handshake (Linux in the
+ * Post-M4, straight from iBoot: the ANS arrives running, with the controller
+ * disabled and before the OS-side RTKit handshake (on T6040, Linux in the
  * same chain logs "RTKit: Initializing" and a cold "boot: mode normal").
  * The controller never becomes ready until that handshake has run, and the
  * firmware takes it once per run: after U-Boot it can neither be repeated
@@ -722,6 +779,144 @@ static int apple_nvme_wake(struct udevice *dev)
 		return -ETIMEDOUT;
 	}
 
+	/* Answer its log traffic while commands are outstanding. */
+	priv->adopted_mbox = true;
+
+	ret = apple_nvme_setup_post_m4(priv);
+	if (ret)
+		return ret;
+	priv->ndev.max_q_depth = ANS_MAX_QUEUE_DEPTH;
+
+	return 0;
+}
+
+/* Write the SART entries passed in apple,sart-entries: (index << 8 | flags), address, size. */
+static int apple_nvme_sart_restore(struct udevice *dev, const fdt64_t *cells, int len)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	int i;
+
+	for (i = 0; i + 3 <= len / sizeof(*cells); i += 3) {
+		u64 key = fdt64_to_cpu(cells[i]);
+
+		if (!sart_set_entry(priv->sart, key >> 8, key & 0xff,
+				    (void *)fdt64_to_cpu(cells[i + 1]),
+				    fdt64_to_cpu(cells[i + 2]))) {
+			dev_err(dev, "can't write SART entry %llu back\n", key >> 8);
+			return -EIO;
+		}
+	}
+	return i / 3;
+}
+
+/*
+ * Stop the CPU and reset ANS, which takes its SART entries with it: a CPU stopped without a
+ * reset since its last run doesn't start again from the run bit.
+ */
+static void apple_nvme_ans_reset(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 stat;
+
+	clrbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+	readl_poll_sleep_timeout(priv->asc + REG_CPU_STATUS, stat,
+				 stat & REG_CPU_STATUS_STOPPED, 100, 100000);
+	reset_assert_bulk(&priv->resets);
+	udelay(10);
+	reset_deassert_bulk(&priv->resets);
+	readl_poll_sleep_timeout(priv->asc + REG_CPU_STATUS, stat,
+				 stat & REG_CPU_STATUS_RESET, 100, 10000);
+	printf("%s: ANS reset: status %#x\n", dev->name, stat);
+}
+
+/*
+ * Post-M4, powered off by the boot loader stage that used it: its PCIe block
+ * is back up, ANS's CPU is stopped and the SART has lost its entries.  The
+ * stage passed them in apple,sart-entries: per entry (index << 8 | flags),
+ * address and size, 64 bits each.  Write them back and start the firmware as
+ * after a power loss.  It keeps the buffers it was given.
+ *
+ * ANS is reset first when its CPU isn't in its reset state, and once more,
+ * with the entries written again, when the firmware doesn't answer the run bit.
+ */
+static int apple_nvme_start_from_off(struct udevice *dev, const fdt64_t *cells,
+				     int len)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 phandle, stat, boot_status;
+	void *mbox;
+	int n, ret, attempt;
+	bool can_reset;
+
+	if (readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN) {
+		dev_err(dev, "ANS is running, but the boot loader passed it on powered off\n");
+		return -EIO;
+	}
+	ret = mbox_get_by_index(dev, 0, &priv->chan);
+	if (ret < 0)
+		return ret;
+	ret = dev_read_u32(dev, "apple,sart", &phandle);
+	if (ret < 0)
+		return ret;
+	priv->sart = sart_init(ofnode_get_by_phandle(phandle));
+	if (!priv->sart)
+		return -EINVAL;
+	mbox = dev_read_addr_ptr(priv->chan.dev);
+	if (!mbox)
+		return -EINVAL;
+	can_reset = !reset_get_bulk(dev, &priv->resets);
+
+	/*
+	 * A power cycle leaves the CPU in its reset state and the firmware's boot
+	 * status cleared.  If either survived, the CPU was only stopped since it
+	 * last ran, and it doesn't start again from the run bit.
+	 */
+	stat = readl(priv->asc + REG_CPU_STATUS);
+	boot_status = readl(priv->base + ANS_BOOT_STATUS);
+	if (!(stat & REG_CPU_STATUS_RESET) || boot_status == ANS_BOOT_STATUS_OK) {
+		printf("%s: ANS isn't in its reset state (status %#x, boot status %#x)%s\n",
+		       dev->name, stat, boot_status,
+		       can_reset ? ": resetting it" : ", and has no reset");
+		if (can_reset)
+			apple_nvme_ans_reset(dev);
+	}
+
+	for (attempt = 0;; attempt++) {
+		n = apple_nvme_sart_restore(dev, cells, len);
+		if (n < 0)
+			return n;
+		priv->rtk = apple_rtkit_init(&priv->chan, priv, nvme_handoff_shmem_setup,
+					     nvme_handoff_shmem_destroy);
+		if (!priv->rtk)
+			return -ENOMEM;
+		/* As macOS does before the run bit after a sleep: the mailbox's receive side on. */
+		printf("%s: ANS from off: status %#x before the run bit\n", dev->name,
+		       readl(priv->asc + REG_CPU_STATUS));
+		debug("%s: before the run bit: CPU %#x, mailbox A2I %#x I2A %#x\n", dev->name,
+		      readl(priv->asc + REG_CPU_CTRL), readl(mbox + REG_MBOX_A2I_CTRL),
+		      readl(mbox + REG_MBOX_I2A_CTRL));
+		setbits_le32(mbox + REG_MBOX_I2A_CTRL, REG_MBOX_RECV_ENABLE);
+		setbits_le32(priv->asc + REG_CPU_CTRL, REG_CPU_CTRL_RUN);
+		ret = apple_rtkit_boot_warm(priv->rtk, BIT(0));
+		if (!ret)
+			ret = readl_poll_sleep_timeout(priv->base + ANS_BOOT_STATUS, stat,
+						       stat == ANS_BOOT_STATUS_OK, 100, 1000000);
+		if (!ret)
+			break;
+		if (attempt || !can_reset) {
+			printf("%s: ANS didn't start from off (%d); it stays down until a reboot\n",
+			       dev->name, ret);
+			return ret;
+		}
+		printf("%s: ANS didn't start from off (%d, status %#x): resetting it and starting it again\n",
+		       dev->name, ret, readl(priv->asc + REG_CPU_STATUS));
+		apple_rtkit_free(priv->rtk);
+		priv->rtk = NULL;
+		apple_nvme_ans_reset(dev);
+	}
+	debug("%s: ANS started from off, %d SART entries written back\n", dev->name, n);
+	priv->woken = true;
+	ans_started_from_off = true;
 	/* Answer its log traffic while commands are outstanding. */
 	priv->adopted_mbox = true;
 
@@ -836,11 +1031,42 @@ static int apple_nvme_boot(struct udevice *dev)
  */
 static bool apple_nvme_adopt_failed;
 
+static bool apple_nvme_handoff_off(struct udevice *dev)
+{
+	const char *v = ofnode_read_string(ofnode_path("/chosen"), "aurora,nvme-handoff");
+
+	return v && !strcmp(v, "off");
+}
+
+/* For apple_nvme_fdt_fixup(): the SART that ANS runs with now, and the nvme node's path. */
+static int apple_nvme_arm_pass_off(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	u32 phandle;
+	int ret;
+
+	if (!priv->sart) {
+		ret = dev_read_u32(dev, "apple,sart", &phandle);
+		if (ret < 0)
+			return ret;
+		priv->sart = sart_init(ofnode_get_by_phandle(phandle));
+		if (!priv->sart)
+			return -EINVAL;
+	}
+	ret = ofnode_get_path(dev_ofnode(dev), ans_off_path, sizeof(ans_off_path));
+	if (ret)
+		return ret;
+	ans_off_sart = priv->sart;
+
+	return 0;
+}
+
 static int apple_nvme_probe(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	const fdt64_t *sart_cells;
 	fdt_addr_t addr;
-	int ret;
+	int ret, sart_len;
 
 	if (apple_nvme_adopt_failed)
 		return -ENODEV;
@@ -867,7 +1093,10 @@ static int apple_nvme_probe(struct udevice *dev)
 	priv->ndev.bar = priv->base;
 	priv->ndev.udev = dev;
 
-	if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
+	sart_cells = dev_read_prop(dev, "apple,sart-entries", &sart_len);
+	if (priv->hw->post_m4 && sart_cells)
+		ret = apple_nvme_start_from_off(dev, sart_cells, sart_len);
+	else if (priv->hw->post_m4 && apple_nvme_needs_handshake(priv))
 		ret = apple_nvme_wake(dev);
 	else if (priv->hw->post_m4)
 		ret = apple_nvme_adopt(dev);
@@ -889,14 +1118,67 @@ static int apple_nvme_probe(struct udevice *dev)
 	ret = nvme_init(dev);
 	if (ret && priv->hw->post_m4)
 		apple_nvme_adopt_failed = true;
+	if (!ret && priv->hw->post_m4 && apple_nvme_handoff_off(dev) &&
+	    apple_nvme_arm_pass_off(dev))
+		printf("%s: ANS goes to the OS running\n", dev->name);
 
 	return ret;
+}
+
+/*
+ * Post-M4, /chosen/aurora,nvme-handoff = "off": hand ANS to the OS stopped, as aura hands it to
+ * U-Boot, instead of with its session live.  Stop the controller, put the firmware to sleep,
+ * then reset ANS, which takes the SART entries with it; apple_nvme_fdt_fixup() passed those on
+ * in apple,sart-entries.  The OS writes them back and starts the firmware warm.
+ */
+static int apple_nvme_pass_off(struct udevice *dev)
+{
+	struct apple_nvme_priv *priv = dev_get_priv(dev);
+	int ret;
+
+	if (nvme_retire_io_queues(dev))
+		printf("%s: could not delete the I/O queues\n", dev->name);
+	ret = apple_nvme_disable_post_m4(priv);
+	if (ret)
+		return ret;
+
+	/* An adopted session has no RTKit instance of ours until now. */
+	if (!priv->rtk) {
+		if (!priv->adopted_mbox && mbox_get_by_index(dev, 0, &priv->chan))
+			return -ENODEV;
+		priv->rtk = apple_rtkit_init(&priv->chan, priv, NULL, NULL);
+		if (!priv->rtk)
+			return -ENOMEM;
+	}
+	ret = apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_SLEEP);
+	if (ret)
+		printf("%s: ANS didn't acknowledge sleep (%d); resetting it anyway\n",
+		       dev->name, ret);
+	priv->adopted_mbox = false;
+
+	if (!priv->resets.count && reset_get_bulk(dev, &priv->resets))
+		return -ENODEV;
+	apple_nvme_ans_reset(dev);
+	if (!(readl(priv->asc + REG_CPU_STATUS) & REG_CPU_STATUS_RESET))
+		return -EIO;
+	debug("%s: ANS handed to the OS powered off\n", dev->name);
+
+	return 0;
 }
 
 static int apple_nvme_remove(struct udevice *dev)
 {
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
+
+	if (priv->hw->post_m4 && ans_off_sart) {
+		int ret = apple_nvme_pass_off(dev);
+
+		if (ret)
+			printf("%s: couldn't hand ANS to the OS powered off (%d)\n",
+			       dev->name, ret);
+		return 0;
+	}
 
 	if (priv->hw->post_m4) {
 		/*

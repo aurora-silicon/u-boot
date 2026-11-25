@@ -137,6 +137,11 @@ void vidconsole_set_cursor_pos(struct udevice *dev, int x, int y)
 /**
  * set_cursor_position() - set cursor position
  *
+ * ANSI columns count from the start of the text line (xstart_frac), the same
+ * way get_cursor_position() reports them. Moving the cursor must not move the
+ * start of the line: a carriage return, a newline or a backspace at column 0
+ * would otherwise go back to the column last moved to.
+ *
  * @priv:	private data of the video console
  * @row:	new row
  * @col:	new column
@@ -144,6 +149,8 @@ void vidconsole_set_cursor_pos(struct udevice *dev, int x, int y)
 static void set_cursor_position(struct udevice *dev, int row, int col)
 {
 	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
+	int x, y;
 
 	/*
 	 * Ensure we stay in the bounds of the screen.
@@ -152,8 +159,21 @@ static void set_cursor_position(struct udevice *dev, int row, int col)
 		row = priv->rows - 1;
 	if (col >= priv->cols)
 		col = priv->cols - 1;
+	if (row < 0)
+		row = 0;
+	if (col < 0)
+		col = 0;
 
-	vidconsole_position_cursor(dev, col, row);
+	x = VID_TO_PIXEL(priv->xstart_frac) + col * priv->x_charsize;
+	x = min_t(int, x, vid_priv->xsize - 1);
+	y = min_t(int, row * priv->y_charsize, vid_priv->ysize - 1);
+
+	priv->xcur_frac = VID_TO_POS(x);
+	priv->ycur = y;
+
+	/* make sure not to kern against the previous character */
+	priv->last_ch = 0;
+	vidconsole_entry_start(dev);
 }
 
 /**

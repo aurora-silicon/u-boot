@@ -55,6 +55,42 @@ enum {
  * @utf8_buf:		Buffer to accumulate UTF-8 byte sequence
  * @quiet:		Suppress all output from stdio
  */
+/**
+ * struct vidconsole_cursor - state of the blinking text cursor
+ *
+ * The cursor is an underline across the bottom of the character cell at the
+ * text position. The pixels it covers are saved when it is drawn and put back
+ * when it is erased, so it never damages the text below it.
+ *
+ * @enabled: cursor requested (ESC [?25h, the default) or not (ESC [?25l)
+ * @parked: something other than the text console owns the screen (EFI GOP,
+ *	OS handover); the cursor stays off until the next text output
+ * @drawn: the cursor is on the screen at @x, @y now
+ * @busy: text output is in progress; the blink timer leaves the cursor alone
+ * @x: left edge of the drawn cursor in pixels
+ * @y: top edge of the drawn cursor in pixels
+ * @w: width of the drawn cursor in pixels
+ * @h: height of the drawn cursor in pixels
+ * @colour: colour the cursor was drawn in
+ * @last: time of the last blink change (get_timer() value)
+ * @save: saved frame-buffer pixels under the cursor
+ * @save_size: size of @save in bytes
+ */
+struct vidconsole_cursor {
+	bool enabled;
+	bool parked;
+	bool drawn;
+	bool busy;
+	int x;
+	int y;
+	int w;
+	int h;
+	u32 colour;
+	ulong last;
+	void *save;
+	size_t save_size;
+};
+
 struct vidconsole_priv {
 	struct stdio_dev sdev;
 	int xcur_frac;
@@ -81,6 +117,9 @@ struct vidconsole_priv {
 	bool quiet;
 	bool quiet_boot;
 	bool clear_pending;
+#if IS_ENABLED(CONFIG_VIDEO_CURSOR)
+	struct vidconsole_cursor cursor;
+#endif
 };
 
 /**
@@ -639,5 +678,18 @@ static inline void vidconsole_quiet_boot_end(bool clear)
 {
 }
 #endif /* VIDEO_QUIET_BOOT */
+
+/**
+ * vidconsole_park_cursors() - take the text cursor off every video console
+ *
+ * Call this before something other than the text console draws on the screen
+ * (EFI GOP) or before handing the frame buffer to an operating system. The
+ * cursor is erased and stays off until the next text output to that console.
+ */
+#if IS_ENABLED(CONFIG_VIDEO_CURSOR)
+void vidconsole_park_cursors(void);
+#else
+static inline void vidconsole_park_cursors(void) {}
+#endif
 
 #endif

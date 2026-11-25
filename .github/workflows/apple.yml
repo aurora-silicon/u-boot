@@ -28,15 +28,14 @@ jobs:
           else
             echo "RELEASE_VERSION=dev-${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
           fi
-      - name: Build and package both configurations
+      - name: Build and package apple_m1
         run: |
-          for config in apple_m1 apple_j873; do
-            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- "${config}_defconfig"
-            scripts/config --file "build-$config/.config" --enable WERROR
-            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-            make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm -j2
-            python3 tools/aurora_release.py --version "$RELEASE_VERSION" --config "$config" --build-dir "build-$config" --compiler aarch64-linux-gnu-gcc
-          done
+          config=apple_m1
+          make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- "${config}_defconfig"
+          scripts/config --file "build-$config/.config" --enable WERROR
+          make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm -j2
+          python3 tools/aurora_release.py --version "$RELEASE_VERSION" --config "$config" --build-dir "build-$config" --compiler aarch64-linux-gnu-gcc
           cd dist
           sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v7

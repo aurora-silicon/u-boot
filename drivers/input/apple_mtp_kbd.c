@@ -404,6 +404,17 @@ static int apple_mtp_kbd_check(struct input_config *input)
 	return 0;
 }
 
+/* Whether the keyboard's helper is a T8142 MTP. */
+static bool apple_mtp_kbd_t8142(struct udevice *dev)
+{
+	u32 phandle;
+
+	if (dev_read_u32(dev, "apple,helper-cpu", &phandle) < 0)
+		return false;
+	return ofnode_device_is_compatible(ofnode_get_by_phandle(phandle),
+					   "apple,t8142-mtp");
+}
+
 static int get_rtkit_helper(struct udevice *dev)
 {
 	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
@@ -458,13 +469,14 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 	fdt_addr_t reg;
 
 	/*
-	 * An MTP handed to the OS halted (J604, J715) and the J813 MTP cannot
-	 * be restarted after U-Boot shuts them down, and Linux wakes the T6050
-	 * MTP from the state iBoot left it in. J713 retains its running helper
-	 * and replays discovery packets to Linux at OS handoff.
+	 * iBoot starts the T8142 MTP before the OS, and its firmware cannot be
+	 * started again once U-Boot shuts it down, so it is left to the OS
+	 * untouched. An MTP handed to the OS halted (J604, J715) is left alone
+	 * too, and Linux wakes the T6050 MTP from the state iBoot left it in.
+	 * J713 retains its running helper and replays discovery packets to
+	 * Linux at OS handoff.
 	 */
-	if (apple_mtp_halted_for_os() ||
-	    of_machine_is_compatible("apple,j813") ||
+	if (apple_mtp_kbd_t8142(dev) || apple_mtp_halted_for_os() ||
 	    of_machine_is_compatible("apple,t6050"))
 		return -ENODEV;
 	priv->j713 = of_machine_is_compatible("apple,j713") ||

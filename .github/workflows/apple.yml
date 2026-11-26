@@ -37,6 +37,8 @@ jobs:
             make O="build-$config" CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm -j2
             python3 tools/aurora_release.py --version "$RELEASE_VERSION" --config "$config" --build-dir "build-$config" --compiler aarch64-linux-gnu-gcc
           done
+          # aurora-secboot fills this region before it signs Stage 2.
+          python3 tools/aurora_uefi_seed.py build-apple_m1/u-boot-nodtb.bin
           cd dist
           sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v7

@@ -1140,6 +1140,8 @@ struct efi_signature_store *efi_sigstore_parse_sigdb(u16 *name);
 
 bool efi_secure_boot_enabled(void);
 bool efi_secure_boot_audit(void);
+/* Whether the platform requires Secure Boot to refuse rather than audit. */
+bool efi_aurora_enforce_policy(void);
 
 bool efi_capsule_auth_enabled(void);
 

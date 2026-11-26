@@ -284,7 +284,8 @@ static efi_status_t efi_transfer_secure_state(enum efi_secure_mode mode)
 		if (ret != EFI_SUCCESS)
 			goto err;
 	} else if (mode == EFI_MODE_USER &&
-		   IS_ENABLED(CONFIG_EFI_AURORA_SECBOOT_AUDIT)) {
+		   IS_ENABLED(CONFIG_EFI_AURORA_SECBOOT_AUDIT) &&
+		   !efi_aurora_enforce_policy()) {
 		/*
 		 * Keys are installed, but images are only checked and
 		 * recorded: tell the OS that Secure Boot is not enforced.
@@ -389,6 +390,20 @@ bool efi_secure_boot_enabled(void)
 bool efi_secure_boot_audit(void)
 {
 	return efi_secure_boot_audit_mode;
+}
+
+/**
+ * efi_aurora_enforce_policy() - whether Secure Boot must refuse, not audit
+ *
+ * An audit build (CONFIG_EFI_AURORA_SECBOOT_AUDIT) still refuses images that
+ * fail authentication when the platform says the boot chain before U-Boot
+ * enforced (on Apple silicon: aura's /chosen/aurora,boot-security).
+ *
+ * Return:	true to enforce
+ */
+__weak bool efi_aurora_enforce_policy(void)
+{
+	return false;
 }
 
 enum efi_auth_var_type efi_auth_var_get_type(const u16 *name,

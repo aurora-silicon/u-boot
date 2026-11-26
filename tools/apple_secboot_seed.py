@@ -12,6 +12,12 @@ file on the ESP, and refuses writes to them.
 The lists may hold the distribution's keys or keys the machine owner made.
 A list that holds one of Microsoft's UEFI CAs is refused: they would admit
 every boot loader Microsoft has signed, revoked ones included.
+
+The file is the fixed seed region of board/apple/mac/uefi-seed.var: the
+variables, zeros, and a 32-byte marker (AURORA-UEFI-SEED, the region size,
+version 1) at the end of REGION_SIZE bytes. aurora-secboot finds that region
+in the U-Boot of a Stage 2 and fills it with the owner's keys before it signs
+Stage 2; tools/aurora_uefi_seed.py checks it.
 """
 import argparse
 import struct
@@ -19,6 +25,8 @@ import uuid
 import zlib
 
 MAGIC = 0x0161566966456255
+REGION_SIZE = 16384
+MARKER = b"AURORA-UEFI-SEED" + struct.pack("<II", REGION_SIZE, 1) + bytes(8)
 GLOBAL = uuid.UUID("8be4df61-93ca-11d2-aa0d-00e098032b8c")
 IMAGE_DB = uuid.UUID("d719b2cb-3d3a-4596-a3bc-dad00e67656f")
 CERT_SHA256 = uuid.UUID("c1c41626-504c-4092-aca9-41f936934328")
@@ -89,7 +97,11 @@ def main():
     ents += entry(IMAGE_DB, "db", lists["db"])
     ents += entry(IMAGE_DB, "dbx", open(a.dbx, "rb").read() if a.dbx else empty_dbx())
     hdr = struct.pack("<QQII", 0, MAGIC, 24 + len(ents), zlib.crc32(ents) & 0xFFFFFFFF)
-    open(a.output, "wb").write(hdr + ents)
+    seed = hdr + ents
+    if len(seed) > REGION_SIZE - len(MARKER):
+        raise SystemExit(f"the variables take {len(seed)} bytes; the seed region holds "
+                         f"{REGION_SIZE - len(MARKER)}")
+    open(a.output, "wb").write(seed + bytes(REGION_SIZE - len(MARKER) - len(seed)) + MARKER)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,10 @@ import subprocess
 def test_apple_dram_maps(tmp_path):
     repo = Path(__file__).resolve().parents[3]
     source = (repo / 'arch/arm/mach-apple/board.c').read_text()
-    maps = source[source.index('static struct mm_region t8103_mem_map'):source.index('struct mm_region *mem_map')]
-    start = source.index('void build_mem_map(void)')
+    start = source.index('static const struct mm_region t8103_io_map')
+    end = source.index('struct mm_region *mem_map = apple_mem_map;\n')
+    maps = source[start:end + len('struct mm_region *mem_map = apple_mem_map;\n')]
+    start = source.index('#define APPLE_IO_MAP(map)')
     build = source[start:source.index('void enable_caches(void)', start)]
     harness = r'''
 #include <assert.h>
@@ -17,7 +19,7 @@ def test_apple_dram_maps(tmp_path):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-typedef uint64_t u64, fdt_addr_t, fdt_size_t;
+typedef uint64_t u64, fdt_addr_t, fdt_size_t, phys_addr_t, phys_size_t;
 typedef int ofnode;
 #define CONFIG_NR_DRAM_BANKS 16
 #define SZ_4K 0x1000ULL
@@ -38,13 +40,15 @@ typedef int ofnode;
 #define ALIGN_DOWN(x, n) ((x) & ~((n) - 1))
 #define ALIGN(x, n) ALIGN_DOWN((x) + (n) - 1, (n))
 #define FDT_ADDR_T_NONE UINT64_MAX
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BUILD_BUG_ON(c) _Static_assert(!(c), #c)
 struct mm_region { u64 virt, phys, size, attrs; };
 static struct { struct { u64 start, size; } bi_dram[CONFIG_NR_DRAM_BANKS]; } board;
 static struct { void *unused; typeof(board) *bd; } global = {.bd = &board}, *gd = &global;
-static struct mm_region *mem_map;
 static const char *soc;
 static bool have_fb;
-static bool of_machine_is_compatible(const char *s) { return !strcmp(s, soc); }
+static bool of_machine_is_compatible(const char *s)
+{ return !strcmp(s, soc) || !strcmp(s, "apple,j873g"); }
 static ofnode ofnode_path(const char *s) { return have_fb; }
 static bool ofnode_valid(ofnode n) { return n; }
 static u64 ofnode_get_addr_size(ofnode n, const char *s, u64 *size)
@@ -60,8 +64,14 @@ static void check_banks(const char *name, unsigned banks, bool framebuffer)
         board.bi_dram[i].size = 0x100000 + i * 0x1000;
     }
     build_mem_map();
-    unsigned slot = !strcmp(soc, "apple,t8132") ? 8 : 1;
-    assert(mem_map == (!strcmp(soc, "apple,t8132") ? t8132_mem_map : t8140_mem_map));
+    /* Every SoC: its I/O regions, then every bank, then the framebuffer. */
+    unsigned slot = 0;
+    while ((mem_map[slot].attrs & 7) == MT_DEVICE_NGNRE ||
+           (mem_map[slot].attrs & 7) == MT_DEVICE_NGNRNE)
+        slot++;
+    assert(slot);
+    if (!strcmp(soc, "apple,t8132"))
+        assert(slot == 8);
     for (unsigned i = 0; i < banks; i++) {
         assert(mem_map[slot + i].phys == ALIGN_DOWN(board.bi_dram[i].start, SZ_4K));
         assert(mem_map[slot + i].virt == mem_map[slot + i].phys);
@@ -73,7 +83,8 @@ static void check_banks(const char *name, unsigned banks, bool framebuffer)
         assert(mem_map[slot + banks].size == 0x13000);
         assert((mem_map[slot + banks].attrs & 7) == MT_NORMAL_NC);
     }
-    assert(!mem_map[slot + banks + 1].size && !mem_map[slot + banks + 1].attrs);
+    unsigned end = slot + banks + framebuffer;
+    assert(!mem_map[end].size && !mem_map[end].attrs);
     if (!strcmp(soc, "apple,t8132")) {
         /* Both split ANS BARs and PCIe ECAM must remain mapped as I/O. */
         assert(mem_map[2].phys <= 0x485cc0000 && mem_map[2].phys + mem_map[2].size > 0x4c5ce4910);
@@ -106,7 +117,9 @@ int main(int argc, char **argv)
     c.write_text(harness)
     binary = tmp_path / 'apple-map'
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', str(c), '-o', str(binary)], check=True)
-    for soc in ('apple,t8132', 'apple,t8140'):
+    for soc in ('apple,t8103', 'apple,t8112', 'apple,t6000', 'apple,t6002', 'apple,t6020',
+                'apple,t6022', 'apple,t8122', 'apple,t6030', 'apple,t8132', 'apple,t8140',
+                'apple,t6040', 'apple,t6050', 'apple,t8142', 'apple,t8152'):
         for banks in (1, 2, 16):
             for fb in (0, 1):
                 subprocess.run([str(binary), soc, str(banks), str(fb)], check=True)

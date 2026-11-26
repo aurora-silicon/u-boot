@@ -4,6 +4,7 @@
  * (C) Copyright 2021 Copyright The Asahi Linux Contributors
  */
 
+#include <dm/device.h>
 #include <mailbox.h>
 #include <malloc.h>
 
@@ -96,6 +97,26 @@ struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
 	rtk->shmem_destroy = shmem_destroy;
 
 	return rtk;
+}
+
+/* Snapshot protocol descriptors before the next stage starts receiving. */
+int apple_rtkit_get_buffers(struct apple_rtkit *rtk,
+			   struct apple_rtkit_buffer *buffers, size_t count)
+{
+	const struct apple_rtkit_buffer *live[] = {
+		&rtk->crashlog_buffer, &rtk->syslog_buffer,
+		&rtk->ioreport_buffer, &rtk->oslog_buffer,
+	};
+	int n = 0;
+
+	for (int i = 0; i < ARRAY_SIZE(live); i++) {
+		if (!live[i]->size)
+			continue;
+		if (n >= count)
+			return -ENOSPC;
+		buffers[n++] = *live[i];
+	}
+	return n;
 }
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
@@ -299,7 +320,65 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
-int apple_rtkit_boot(struct apple_rtkit *rtk)
+/*
+ * T6050: start the system endpoints the way m1n1 and Linux do there: debug,
+ * crashlog, syslog, ioreport, oslog in that order, and nothing else.  Wait
+ * for the IOP to reach ON, then send AP power ON and give its acknowledgment
+ * a short window; not every coprocessor sends it.
+ */
+static int apple_rtkit_boot_t6050(struct apple_rtkit *rtk, const int *endpoints,
+				  int nendpoints)
+{
+	static const u8 order[] = {
+		APPLE_RTKIT_EP_DEBUG, APPLE_RTKIT_EP_CRASHLOG, APPLE_RTKIT_EP_SYSLOG,
+		APPLE_RTKIT_EP_IOREPORT, APPLE_RTKIT_EP_OSLOG,
+	};
+	struct apple_mbox_msg msg;
+	int i, j, ret;
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		for (j = 0; j < nendpoints && endpoints[j] != order[i]; j++)
+			;
+		if (j == nendpoints)
+			continue;
+
+		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, order[i]) |
+			APPLE_RTKIT_MGMT_STARTEP_FLAG;
+		msg.msg1 = APPLE_RTKIT_EP_MGMT;
+		ret = mbox_send(rtk->chan, &msg);
+		if (ret < 0)
+			return ret;
+	}
+
+	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
+	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
+
+	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
+		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
+		if (ret < 0)
+			return ret;
+	}
+
+	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+	msg.msg1 = APPLE_RTKIT_EP_MGMT;
+	ret = mbox_send(rtk->chan, &msg);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 4 && rtk->ap_pwr != APPLE_RTKIT_PWR_STATE_ON; i++) {
+		ret = apple_rtkit_poll(rtk, 50000);
+		if (ret == -ETIMEDOUT)
+			continue;
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -404,12 +483,17 @@ wait_epmap:
 	if (reply & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)
 		goto wait_epmap;
 
+	if (of_machine_is_compatible("apple,t6050"))
+		return apple_rtkit_boot_t6050(rtk, endpoints, nendpoints);
+
 	for (i = 0; i < nendpoints; i++) {
 		/*
 		 * Start advertised system endpoints as Linux does. MTP waits for
 		 * them before announcing its DockChannel interfaces.
 		 */
 		if (endpoints[i] == APPLE_RTKIT_EP_MGMT)
+			continue;
+		if (endpoints[i] < 32 && !(system_eps & BIT(endpoints[i])))
 			continue;
 
 		/* Request endpoint. */
@@ -432,6 +516,11 @@ wait_epmap:
 	}
 
 	return 0;
+}
+
+int apple_rtkit_boot(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_with_sys_ep_mask(rtk, ~0U);
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)

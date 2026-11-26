@@ -75,14 +75,37 @@ static int fdt_add_reserved_regions(struct mem_region *free_mem,
 	/* process reserved-memory */
 	nodeoffset = fdt_subnode_offset(fdt_blob, 0, "reserved-memory");
 	if (nodeoffset >= 0) {
+		int na = fdt_address_cells(fdt_blob, nodeoffset);
+		int ns = fdt_size_cells(fdt_blob, nodeoffset);
+		int ranges_len = 0;
+		const void *ranges = fdt_getprop(fdt_blob, nodeoffset, "ranges",
+						 &ranges_len);
+		bool direct = (!ranges || ranges_len == 0) &&
+			      na >= 1 && na <= 2 && ns >= 1 && ns <= 2;
+
 		subnode = fdt_first_subnode(fdt_blob, nodeoffset);
 		while (subnode >= 0) {
 			/* check if this subnode has a reg property */
-			ret = fdt_get_resource(fdt_blob, subnode, "reg", 0,
-					       &res);
+			if (direct) {
+				int reg_len;
+				const fdt32_t *reg = fdt_getprop(fdt_blob, subnode,
+								 "reg", &reg_len);
+				if (reg && reg_len >= (na + ns) * (int)sizeof(*reg)) {
+					addr = fdtdec_get_number(reg, na);
+					size = fdtdec_get_number(reg + na, ns);
+					ret = 0;
+				} else {
+					ret = -FDT_ERR_NOTFOUND;
+				}
+			} else {
+				ret = fdt_get_resource(fdt_blob, subnode, "reg", 0,
+						       &res);
+				if (!ret) {
+					addr = res.start;
+					size = res.end - res.start + 1;
+				}
+			}
 			if (!ret && fdtdec_get_is_enabled(fdt_blob, subnode)) {
-				addr = res.start;
-				size = res.end - res.start + 1;
 				assert_noisy(i < MEM_RGN_COUNT);
 				add_mem_region(reserved_mem, addr, size);
 			}

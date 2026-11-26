@@ -12,6 +12,7 @@
 #include <event.h>
 #include <image.h>
 #include <mapmem.h>
+#include <ctxr_exec_window.h>
 #include <lmb.h>
 #include <log.h>
 #include <malloc.h>
@@ -464,9 +465,10 @@ static int lmb_map_update_notify(phys_addr_t addr, phys_size_t size,
 static void lmb_print_region_flags(u32 flags)
 {
 	const char * const flag_str[] = { "none", "no-map", "no-overwrite",
-					  "no-notify" };
+					  "no-notify", "ctxr-window" };
 	unsigned int pflags = flags &
-			      (LMB_NOMAP | LMB_NOOVERWRITE | LMB_NONOTIFY);
+			      (LMB_NOMAP | LMB_NOOVERWRITE | LMB_NONOTIFY |
+			       LMB_CTXR_HOLD);
 
 	if (flags != pflags) {
 		printf("invalid %#x\n", flags);
@@ -536,7 +538,8 @@ static void lmb_reserve_uboot_region(void)
 {
 	int bank;
 	ulong end, bank_end;
-	phys_addr_t rsv_start;
+	phys_addr_t rsv_start, image;
+	phys_size_t image_size;
 	ulong pram = 0;
 
 	rsv_start = gd->start_addr_sp - CONFIG_STACK_SIZE;
@@ -574,14 +577,24 @@ static void lmb_reserve_uboot_region(void)
 
 		break;
 	}
+
+	image_size = ctxr_exec_uboot_region(&image);
+	if (image_size)
+		lmb_reserve(image, image_size, LMB_NOOVERWRITE);
 }
 
 static void lmb_reserve_common(void *fdt_blob)
 {
+	struct ctxr_exec_window win;
+
 	lmb_reserve_uboot_region();
 
 	if (CONFIG_IS_ENABLED(OF_LIBFDT) && fdt_blob)
 		boot_fdt_add_mem_rsv_regions(fdt_blob);
+
+	/* Last, so that only what's free is set aside */
+	if (ctxr_exec_window_get(&win))
+		lmb_ctxr_window_init(win.base, win.size);
 }
 
 static __maybe_unused void lmb_reserve_common_spl(void)
@@ -670,6 +683,131 @@ long lmb_free(phys_addr_t base, phys_size_t size, u32 flags)
 		return ret;
 
 	return lmb_map_update_notify(base, size, LMB_MAP_OP_FREE, flags);
+}
+
+/* Only the window's own code and the LMB tests set it */
+static bool lmb_ctxr_on(void)
+{
+	return (CONFIG_IS_ENABLED(CTXR_EXEC_WINDOW) ||
+		CONFIG_IS_ENABLED(UNIT_TEST)) && lmb.ctxr_size;
+}
+
+void lmb_ctxr_window_init(phys_addr_t base, phys_size_t size)
+{
+	lmb.ctxr_base = base;
+	lmb.ctxr_size = size;
+	lmb_hold_ctxr_window(base, size);
+}
+
+void lmb_hold_ctxr_window(phys_addr_t base, phys_size_t size)
+{
+	struct lmb_region *mem = lmb.available_mem.data;
+	phys_addr_t wbase = lmb.ctxr_base;
+	phys_addr_t wend = wbase + lmb.ctxr_size;
+	int i, j;
+
+	if (!lmb_ctxr_on())
+		return;
+
+	/* Memory the window has no RAM behind stays out of the lists */
+	for (i = 0; i < lmb.available_mem.count; i++) {
+		phys_addr_t addr = max3(base, wbase, mem[i].base);
+		phys_addr_t end = min3((phys_addr_t)(base + size), wend,
+				       (phys_addr_t)(mem[i].base + mem[i].size));
+
+		while (addr < end) {
+			struct lmb_region *used;
+			phys_size_t free = lmb_get_free_size(addr);
+
+			if (free)
+				lmb_reserve(addr, min_t(phys_size_t, free,
+							end - addr),
+					    LMB_CTXR_HOLD | LMB_NOOVERWRITE);
+
+			/* addr is in a region now, either way: skip it */
+			used = lmb.used_mem.data;
+			for (j = 0; j < lmb.used_mem.count; j++) {
+				if (addr >= used[j].base &&
+				    addr < used[j].base + used[j].size)
+					break;
+			}
+			if (j == lmb.used_mem.count)
+				break;
+			addr = used[j].base + used[j].size;
+		}
+	}
+}
+
+void lmb_ctxr_window_claim(phys_addr_t base, phys_size_t size, u32 flags)
+{
+	struct lmb_region *used;
+	int i;
+
+	if (!lmb_ctxr_on())
+		return;
+
+	/* Each change can split or merge regions, so start over after it */
+	for (i = 0; i < lmb.used_mem.count; i++) {
+		phys_addr_t start, end;
+
+		used = lmb.used_mem.data;
+		start = max(base, used[i].base);
+		end = min((phys_addr_t)(base + size),
+			  (phys_addr_t)(used[i].base + used[i].size));
+		if (!(used[i].flags & LMB_CTXR_HOLD) || start >= end)
+			continue;
+
+		if (_lmb_free(&lmb.used_mem, start, end - start))
+			return;
+		lmb_reserve(start, end - start, flags | LMB_NONOTIFY);
+		i = -1;
+	}
+}
+
+int lmb_release_ctxr_window(phys_addr_t base, phys_size_t size)
+{
+	struct lmb_region *used = lmb.used_mem.data;
+	int i;
+
+	for (i = 0; i < lmb.used_mem.count; i++) {
+		if (!(used[i].flags & LMB_CTXR_HOLD) || base < used[i].base ||
+		    size > used[i].size ||
+		    base - used[i].base > used[i].size - size)
+			continue;
+		if (!lmb_free(base, size, LMB_NONE))
+			return 0;
+		/* The EFI map may not have followed: set it aside again */
+		lmb_hold_ctxr_window(base, size);
+		return -EIO;
+	}
+
+	return -ENOENT;
+}
+
+int lmb_ctxr_window_top(phys_size_t size, phys_size_t align, phys_addr_t max,
+			phys_addr_t *base)
+{
+	struct lmb_region *used = lmb.used_mem.data;
+	int i;
+
+	for (i = lmb.used_mem.count - 1; i >= 0; i--) {
+		phys_addr_t end = min_t(phys_addr_t, used[i].base + used[i].size,
+					max);
+		phys_addr_t start;
+
+		if (!(used[i].flags & LMB_CTXR_HOLD) || size > used[i].size ||
+		    end < used[i].base + size)
+			continue;
+
+		start = ALIGN_DOWN(end - size, align);
+		if (start < used[i].base)
+			continue;
+
+		*base = start;
+		return 0;
+	}
+
+	return -ENOENT;
 }
 
 static int _lmb_alloc_base(phys_size_t size, ulong align,
@@ -849,6 +987,8 @@ static int lmb_setup(bool test)
 	}
 
 	lmb.test = test;
+	lmb.ctxr_base = 0;
+	lmb.ctxr_size = 0;
 
 	return 0;
 }

@@ -13,6 +13,7 @@
 #include <malloc.h>
 #include <mapmem.h>
 #include <video.h>
+#include <video_console.h>
 
 static const efi_guid_t efi_gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
 
@@ -419,6 +420,9 @@ static efi_status_t EFIAPI gop_blt(struct efi_gop *this,
 		  buffer, operation, sx, sy, dx, dy, width, height, delta);
 
 	vid_bpp = gop_get_bpp(this);
+
+	/* The application draws on the screen now: keep the text cursor off */
+	vidconsole_park_cursors();
 
 	/* Allow for compiler optimization */
 	switch (operation) {

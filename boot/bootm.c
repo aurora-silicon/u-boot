@@ -11,6 +11,7 @@
 #include <cli.h>
 #include <command.h>
 #include <cpu_func.h>
+#include <ctxr_exec_window.h>
 #include <env.h>
 #include <errno.h>
 #include <fdt_support.h>
@@ -26,6 +27,7 @@
 #include <linux/sizes.h>
 #include <tpm-v2.h>
 #include <tpm_tcg2.h>
+#include <video_console.h>
 #if defined(CONFIG_CMD_USB)
 #include <usb.h>
 #endif
@@ -611,7 +613,7 @@ static int bootm_load_os(struct bootm_headers *images, int boot_progress)
 	ulong image_start = os.image_start;
 	ulong image_len = os.image_len;
 	ulong flush_start = ALIGN_DOWN(load, ARCH_DMA_MINALIGN);
-	bool no_overlap;
+	bool no_overlap, placed = false;
 	void *load_buf, *image_buf;
 	int err;
 
@@ -689,6 +691,8 @@ static int bootm_load_os(struct bootm_headers *images, int boot_progress)
 			printf("Failed to prep arm64 kernel (err=%d)\n", ret);
 			return BOOTM_ERR_RESET;
 		}
+		/* booti_setup() reserved where it put the image in the window */
+		placed = ctxr_exec_booti_placed(relocated_addr);
 
 		/* Handle BOOTM_STATE_LOADOS */
 		if (relocated_addr != load) {
@@ -703,7 +707,7 @@ static int bootm_load_os(struct bootm_headers *images, int boot_progress)
 		images->os.end = relocated_addr + image_size;
 	}
 
-	if (CONFIG_IS_ENABLED(LMB)) {
+	if (CONFIG_IS_ENABLED(LMB) && !placed) {
 		phys_addr_t load;
 
 		load = (phys_addr_t)images->os.load;
@@ -1209,6 +1213,8 @@ void bootm_final(int flag)
 	if (IS_ENABLED(CONFIG_BOOTSTAGE_REPORT))
 		bootstage_report();
 
+	/* Leave the frame buffer to the OS without a cursor on it */
+	vidconsole_park_cursors();
 	board_quiesce_devices();
 
 	/*

@@ -84,13 +84,24 @@ relocate_done:
 2:	mrs	x0, sctlr_el2
 	b	0f
 1:	mrs	x0, sctlr_el1
-0:	tbz	w0, #2, 5f	/* skip flushing cache if disabled */
+0:	tbz	w0, #2, 6f	/* skip flushing cache if disabled */
 	tbz	w0, #12, 4f	/* skip invalidating i-cache if disabled */
 	ic	iallu		/* i-cache invalidate all */
 	isb	sy
 4:	ldp	x0, x1, [sp, #16]
 	bl	__asm_flush_dcache_range
 	bl     __asm_flush_l3_dcache
+	b	5f
+	/*
+	 * The I-cache can be on while the D-cache is still off. The copy
+	 * went straight to memory then, but the I-cache may hold lines of
+	 * the destination, so drop them before running the new copy.
+	 */
+6:	tbz	w0, #12, 5f	/* skip invalidating i-cache if disabled */
+	dsb	sy
+	ic	iallu		/* i-cache invalidate all */
+	dsb	sy
+	isb	sy
 5:	ldp	x29, x30, [sp],#32
 	ret
 ENDPROC(relocate_code)

@@ -4,6 +4,8 @@
  * Author: Raymond Mao <raymond.mao@linaro.org>
  */
 #include <dm.h>
+#include <dm/ofnode.h>
+#include <linux/string.h>
 #include <smbios_plat.h>
 #include <stdio.h>
 #include <sysinfo.h>
@@ -79,6 +81,7 @@ enum {
 	VENDOR_AMCC = 0x50,
 	VENDOR_QUALCOMM = 0x51,
 	VENDOR_MARVELL = 0x56,
+	VENDOR_APPLE = 0x61,
 	VENDOR_INTEL = 0x69,
 	VENDOR_AMPERE = 0xc0,
 };
@@ -98,9 +101,9 @@ enum {
  */
 int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 {
-	u64 clidr_el1;
+	u64 clidr_el1, mmfr2_el1;
 	u32 csselr_el1;
-	u32 num_sets;
+	u32 num_sets, ways;
 	union ccsidr_el1 creg;
 	int cache_type;
 
@@ -140,11 +143,24 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 	asm volatile("mrs %0, ccsidr_el1" : "=r" (creg.data));
 	debug("CCSIDR_EL1 (Level %d): 0x%llx\n", level + 1, creg.data);
 
-	/* Extract cache size and associativity */
-	cinfo->line_size = 1 << (creg.no_ccidx.linesize + 4);
+	/*
+	 * Extract cache size and associativity. With FEAT_CCIDX
+	 * (ID_AA64MMFR2_EL1.CCIDX), CCSIDR_EL1 has wider fields at other
+	 * positions.
+	 */
+	asm volatile("mrs %0, id_aa64mmfr2_el1" : "=r" (mmfr2_el1));
+	if ((mmfr2_el1 >> 20) & 0xf) {
+		cinfo->line_size = 1 << (creg.ccidx_aarch64.linesize + 4);
+		ways = creg.ccidx_aarch64.associativity + 1;
+		num_sets = creg.ccidx_aarch64.numsets + 1;
+	} else {
+		cinfo->line_size = 1 << (creg.no_ccidx.linesize + 4);
+		ways = creg.no_ccidx.associativity + 1;
+		num_sets = creg.no_ccidx.numsets + 1;
+	}
 
 	/* Map the associativity value */
-	switch (creg.no_ccidx.associativity + 1) {
+	switch (ways) {
 	case CACHE_ASSOC_DIRECT_MAPPED:
 		cinfo->associativity = SMBIOS_CACHE_ASSOC_DMAPPED;
 		break;
@@ -183,14 +199,18 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 		break;
 	}
 
-	num_sets = creg.no_ccidx.numsets + 1;
-	/* Size in KB */
-	cinfo->max_size = (cinfo->associativity * num_sets * cinfo->line_size) /
-			  1024;
+	/* Size in KB, from the number of ways, not the SMBIOS code for it */
+	cinfo->max_size = (ways * num_sets * cinfo->line_size) / 1024;
+	/*
+	 * Some cores, Apple's among them, leave the geometry fields empty.
+	 * Describe no level rather than a cache of 0 KiB.
+	 */
+	if (!cinfo->max_size)
+		return -1;
 
 	debug("L%d Cache:\n", level + 1);
 	debug("Number of bytes in cache line:%u\n", cinfo->line_size);
-	debug("Associativity of cache:%u\n", cinfo->associativity);
+	debug("Associativity of cache:%u\n", ways);
 	debug("Number of sets in cache:%u\n", num_sets);
 	debug("Cache size in KB:%u\n", cinfo->max_size);
 
@@ -205,6 +225,26 @@ int sysinfo_get_cache_info(u8 level, struct cache_info *cinfo)
 	 */
 
 	return 0;
+}
+
+/* Count the enabled CPU nodes of the device tree, or return 0 if it has none */
+static int sysinfo_count_dt_cpus(void)
+{
+	ofnode cpus, node;
+	int count = 0;
+
+	cpus = ofnode_path("/cpus");
+	if (!ofnode_valid(cpus))
+		return 0;
+
+	ofnode_for_each_subnode(node, cpus) {
+		const char *type = ofnode_read_string(node, "device_type");
+
+		if (type && !strcmp(type, "cpu") && ofnode_is_enabled(node))
+			count++;
+	}
+
+	return count;
 }
 
 int sysinfo_get_processor_info(struct processor_info *pinfo)
@@ -256,6 +296,9 @@ int sysinfo_get_processor_info(struct processor_info *pinfo)
 	case VENDOR_MARVELL:
 		pinfo->manufacturer = "Marvell International Ltd";
 		break;
+	case VENDOR_APPLE:
+		pinfo->manufacturer = "Apple Inc.";
+		break;
 	case VENDOR_INTEL:
 		pinfo->manufacturer = "Intel Corporation";
 		break;
@@ -271,16 +314,29 @@ int sysinfo_get_processor_info(struct processor_info *pinfo)
 	debug("CPU architecture: 0x%x\n", midr.fields.architecture);
 	debug("CPU variant: 0x%x\n", midr.fields.variant);
 
-	/* Extract number of cores */
-	core_count = (mpidr >> 0) & 0xFF;
-	pinfo->core_count = core_count + 1;
+	/*
+	 * Count the cores in the device tree. MPIDR_EL1 only identifies the
+	 * boot core, so its Aff0 is a guess kept for boards without CPU nodes.
+	 */
+	core_count = sysinfo_count_dt_cpus();
+	if (!core_count)
+		core_count = ((mpidr >> 0) & 0xFF) + 1;
+	pinfo->core_count = core_count;
 	debug("CPU Core Count: %d\n", pinfo->core_count);
 
 	pinfo->core_enabled = pinfo->core_count;
-	pinfo->characteristics = SMBIOS_PROCESSOR_64BIT |
-		SMBIOS_PROCESSOR_ARM64_SOCID;
+	pinfo->characteristics = SMBIOS_PROCESSOR_64BIT;
 	if (pinfo->core_count > 1)
 		pinfo->characteristics |= SMBIOS_PROCESSOR_MULTICORE;
+
+	/*
+	 * The Processor ID of an Arm64 processor is the SMCCC_ARCH_SOC_ID
+	 * value when the "Arm64 SoC ID" characteristic is set and MIDR_EL1
+	 * otherwise. Nothing here queries SMCCC_ARCH_SOC_ID, so report
+	 * MIDR_EL1 rather than claim an SoC ID and leave the field empty.
+	 */
+	pinfo->id[0] = (u32)midr.data;
+	pinfo->id[1] = 0;
 
 	/*
 	 * Below fields with common values are placed under DT smbios node

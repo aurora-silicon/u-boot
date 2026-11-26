@@ -40,6 +40,7 @@ obj-y += efi_fdt.o
 obj-y += efi_file.o
 obj-$(CONFIG_EFI_LOADER_HII) += efi_hii.o efi_hii_config.o
 obj-y += efi_image_loader.o
+obj-$(CONFIG_EFI_AURORA_MEASURE) += efi_aurora_measure.o
 obj-y += efi_load_options.o
 obj-y += efi_memory.o
 obj-y += efi_root_node.o
@@ -75,7 +76,10 @@ obj-$(CONFIG_EFI_ECPT) += efi_conformance.o
 obj-$(CONFIG_EFI_DEBUG_SUPPORT) += efi_debug_support.o
 
 EFI_VAR_SEED_FILE := $(subst $\",,$(CONFIG_EFI_VAR_SEED_FILE))
-$(obj)/efi_var_seed.o: $(srctree)/$(EFI_VAR_SEED_FILE)
+# An absolute seed path is used as it is; a relative one is relative to the
+# source tree, also with O=.
+$(obj)/efi_var_seed.o: $(if $(filter /%,$(EFI_VAR_SEED_FILE)),,$(srctree)/)$(EFI_VAR_SEED_FILE)
+AFLAGS_efi_var_seed.o += -I$(srctree)
 
 ifeq ($(CONFIG_EFI_CAPSULE_AUTHENTICATE),y)
 capsule_crt_path=($(subst $(quote),,$(CONFIG_EFI_CAPSULE_CRT_FILE)))

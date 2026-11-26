@@ -9,6 +9,7 @@
 
 #include <efi_dt_fixup.h>
 #include <efi_loader.h>
+#include <lmb.h>
 #include <efi_rng.h>
 #include <fdtdec.h>
 #include <mapmem.h>
@@ -27,6 +28,12 @@ static void efi_reserve_memory(u64 addr, u64 size, bool nomap)
 {
 	int type;
 	efi_uintn_t ret;
+
+	/* Kernel placement in the CTXR window must step around it too */
+	lmb_ctxr_window_claim(ALIGN_DOWN(addr, EFI_PAGE_SIZE),
+			      ALIGN(addr + size, EFI_PAGE_SIZE) -
+			      ALIGN_DOWN(addr, EFI_PAGE_SIZE),
+			      nomap ? LMB_NOMAP : LMB_NOOVERWRITE);
 
 	/* Convert from sandbox address space. */
 	addr = (uintptr_t)map_sysmem(addr, 0);

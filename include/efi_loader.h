@@ -617,6 +617,9 @@ efi_status_t efi_env_set_load_options(efi_handle_t handle, const char *env_var,
 				      u16 **load_options);
 /* Get EFI configuration table */
 void *efi_get_configuration_table(const efi_guid_t *guid);
+/* Record a loaded EFI image in /chosen/aurora,boot-security of the OS FDT */
+void efi_aurora_measure(const void *efi, size_t efi_size, bool authenticated);
+void efi_aurora_flush(void *fdt);
 /* Install device tree */
 efi_status_t efi_install_fdt(void *fdt);
 /* Install initrd */
@@ -896,6 +899,9 @@ void *efi_alloc(size_t len);
 efi_status_t efi_realloc(void **ptr, size_t len);
 /* Allocate pages on the specified alignment */
 void *efi_alloc_aligned_pages(u64 len, int memory_type, size_t align);
+efi_status_t efi_alloc_kernel_in_ctxr_window(efi_handle_t caller, int type,
+					     int memory_type, efi_uintn_t pages,
+					     u64 *memory);
 /* More specific EFI memory allocator, called by EFI payloads */
 efi_status_t efi_allocate_pages(enum efi_allocate_type type,
 				enum efi_memory_type memory_type,
@@ -1133,6 +1139,9 @@ struct efi_signature_store *efi_build_signature_store(void *sig_list,
 struct efi_signature_store *efi_sigstore_parse_sigdb(u16 *name);
 
 bool efi_secure_boot_enabled(void);
+bool efi_secure_boot_audit(void);
+/* Whether the platform requires Secure Boot to refuse rather than audit. */
+bool efi_aurora_enforce_policy(void);
 
 bool efi_capsule_auth_enabled(void);
 

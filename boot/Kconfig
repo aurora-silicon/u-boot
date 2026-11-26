@@ -51,6 +51,32 @@ config SPL_LIB_BOOTM
 config SPL_LIB_BOOTZ
 	bool
 
+config CTXR_EXEC_WINDOW
+	bool "Keep Linux inside the CTXR window the device tree advertises"
+	depends on ARM64 && OF_CONTROL && LMB
+	default y if ARCH_APPLE
+	imply ZSTD
+	help
+	  A Linux kernel built with CONFIG_ARM64_CTXR_EXECMEM confines its
+	  executable code to the physical window advertised by
+	  /chosen/aurora,ctxr-exec-window. If its image is outside it, the
+	  kernel keeps its secondary CPUs offline. With this option, the EFI
+	  image loader, booti and bootm place the Linux image inside that
+	  window, and so does the loader code a UKI allocates for its kernel.
+	  The EFI image loader decompresses the kernel of an EFI zboot image
+	  (gzip, or zstd with ZSTD) and places it the same way. A kernel that
+	  can't be placed gets a warning and starts outside it.
+
+	  U-Boot's own image relocates to the top of the window, because it
+	  holds the EFI runtime services that kernel calls, and so does runtime
+	  code an EFI application allocates. LMB sets aside the rest of the
+	  window, and the EFI map reports it as boot services data, so nothing
+	  else allocates it. The kernel gets it back at ExitBootServices().
+
+	  Nothing changes when the property is absent, or isn't a window the
+	  kernel takes: a non-zero base and size, 16 KiB aligned, that don't
+	  wrap.
+
 config BUTTON_CMD
 	bool "Support for running a command if a button is held during boot"
 	depends on CMDLINE

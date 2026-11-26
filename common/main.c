@@ -18,6 +18,7 @@
 #include <init.h>
 #include <net.h>
 #include <version_string.h>
+#include <video_console.h>
 #include <efi_loader.h>
 #include <event.h>
 
@@ -81,6 +82,12 @@ void main_loop(void)
 		ret = bootstd_prog_boot();
 		printf("Standard boot failed (err=%dE)\n", ret);
 		panic("Failed to boot");
+	}
+
+	if (vidconsole_quiet_boot()) {
+		/* Nothing booted: show the command line on the display too */
+		vidconsole_quiet_boot_end(true);
+		printf("%s\n", version_string);
 	}
 
 	cli_loop();

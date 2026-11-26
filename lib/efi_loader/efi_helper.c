@@ -6,6 +6,7 @@
 #define LOG_CATEGORY LOGC_EFI
 
 #include <blkmap.h>
+#include <bootstage.h>
 #include <bootm.h>
 #include <efi_device_path.h>
 #include <env.h>
@@ -600,6 +601,16 @@ efi_status_t efi_install_fdt(void *fdt)
 		return EFI_LOAD_ERROR;
 	}
 
+	/*
+	 * Hand the boot timings to the payload, as bootm does.  The last
+	 * record marks the moment the device tree is handed over.
+	 */
+	if (IS_ENABLED(CONFIG_BOOTSTAGE_FDT)) {
+		bootstage_mark_name(BOOTSTAGE_ID_ALLOC, "efi_install_fdt");
+		if (bootstage_fdt_add(fdt))
+			log_warning("bootstage: failed to add to device tree\n");
+	}
+
 	/* Create memory reservations as indicated by the device tree */
 	efi_carve_out_dt_rsv(fdt);
 
@@ -612,6 +623,10 @@ efi_status_t efi_install_fdt(void *fdt)
 			return ret;
 		}
 	}
+
+	/* Images loaded before this copy existed go in its boot record */
+	if (IS_ENABLED(CONFIG_EFI_AURORA_MEASURE))
+		efi_aurora_flush(fdt);
 
 	/* Install device tree as UEFI table */
 	ret = efi_install_configuration_table(&efi_guid_fdt, fdt);

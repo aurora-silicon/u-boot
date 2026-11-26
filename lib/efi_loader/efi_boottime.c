@@ -15,6 +15,7 @@
 #include <efi_loader.h>
 #include <irq_func.h>
 #include <log.h>
+#include <video_console.h>
 #include <malloc.h>
 #include <net-common.h>
 #include <pe.h>
@@ -434,7 +435,10 @@ static efi_status_t EFIAPI efi_allocate_pages_ext(int type, int memory_type,
 	efi_status_t r;
 
 	EFI_ENTRY("%d, %d, 0x%zx, %p", type, memory_type, pages, memory);
-	r = efi_allocate_pages(type, memory_type, pages, memory);
+	r = efi_alloc_kernel_in_ctxr_window(current_image, type, memory_type,
+					    pages, memory);
+	if (r != EFI_SUCCESS)
+		r = efi_allocate_pages(type, memory_type, pages, memory);
 	return EFI_EXIT(r);
 }
 
@@ -2244,6 +2248,7 @@ static efi_status_t EFIAPI efi_exit_boot_services(efi_handle_t image_handle,
 		bootm_disable_interrupts();
 		if (IS_ENABLED(CONFIG_DM_ETH))
 			eth_halt();
+		vidconsole_park_cursors();
 		board_quiesce_devices();
 		dm_remove_devices_active();
 	}

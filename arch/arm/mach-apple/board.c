@@ -6,19 +6,28 @@
 #include <dm.h>
 #include <dm/uclass-internal.h>
 #include <command.h>
+#include <console.h>
 #include <efi_loader.h>
+#include <efi_variable.h>
 #include <env.h>
+#include <env_internal.h>
+#include <fs.h>
+#include <u-boot/uuid.h>
 #include <lmb.h>
 #include <nvme.h>
 #include <part.h>
+#include <time.h>
 #include <linux/ioport.h>
-#include <linux/stringify.h>
+#include <linux/delay.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
+#include <asm/sections.h>
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
+#include <asm/arch/j713_fdt.h>
+#include <asm/arch/nvme_apple.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -849,6 +858,76 @@ static struct mm_region t6030_mem_map[] = {
 	}
 };
 
+/* Apple M4 */
+
+static struct mm_region t8132_mem_map[CONFIG_NR_DRAM_BANKS + 10] = {
+	{
+		/* SoC I/O, including PMGR, WD1, MTP, AIC and UART */
+		.virt = 0x380000000,
+		.phys = 0x380000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* USB DWC3, PHY and DART aperture */
+		.virt = 0x400000000,
+		.phys = 0x400000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ANS/NVMe and NVMMU aperture */
+		.virt = 0x480000000,
+		.phys = 0x480000000,
+		.size = SZ_2G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* J713 APCIE ECAM, from its runtime DT (config reg). */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* J713 APCIE endpoint windows (both DT ranges). */
+		.virt = 0xb80000000,
+		.phys = 0xb80000000,
+		.size = SZ_1G + SZ_512M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* GPU and DCP register aperture. */
+		.virt = 0x300000000,
+		.phys = 0x300000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ATC0 I/O */
+		.virt = 0x700000000,
+		.phys = 0x700000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* ATC1 I/O */
+		.virt = 0xb00000000,
+		.phys = 0xb00000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
 /* Apple A18 Pro (T8140) */
 
 static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
@@ -859,6 +938,43 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 		.size = 12UL * SZ_1G,
 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}
+};
+
+/*
+ * Apple M4 Pro (T6040; its blocks carry T6041 compatibles), also used for the
+ * M5 Max (T6050), whose register blocks, APCIE ECAM and PCIe windows sit at
+ * the same addresses (its GPU above 0x23_0000_0000 is left unmapped).  Every register
+ * block in the J616s devicetree below DRAM lies in 0x2_0000_0000 to
+ * 0x6_0000_0000, apart from the APCIE ECAM and the PCIe windows.  The RAM
+ * banks and the framebuffer are filled in from the m1n1-prepared FDT, as on
+ * T8140.
+ */
+static struct mm_region t6040_mem_map[CONFIG_NR_DRAM_BANKS + 5] = {
+	{
+		/* I/O */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE ECAM (the DT's config reg) */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* APCIE endpoint windows (both DT ranges) */
+		.virt = 0xb80000000,
+		.phys = 0xb80000000,
+		.size = SZ_1G + SZ_512M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
 			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
 	}
 };
@@ -916,29 +1032,150 @@ int board_init(void)
 	return 0;
 }
 
+/*
+ * dram_init() and dram_init_banksize() run before relocation with the data
+ * cache off, where a walk of the flattened device tree is slow: about 60 ms
+ * on the J700, whose 128 KiB tree has the memory node near its end.
+ * ofnode_read_resource() walks the tree up to the node twice for every reg
+ * entry (parent lookup and address translation), which cost about 4 s for
+ * the twelve J700 DRAM ranges. Walk the tree once in dram_init() instead
+ * and keep the result for dram_init_banksize().
+ *
+ * The result is what fdtdec_setup_mem_size_base() and
+ * fdtdec_setup_memory_banksize() give: the same banks in the same order
+ * and the same errors. Before relocation the control tree is always flat.
+ *
+ * In .data because .bss is not usable before relocation.
+ */
+static struct {
+	int ret;	/* for dram_init_banksize() */
+	int ranges;	/* reg entries over all memory nodes */
+	int banks;
+	struct {
+		phys_addr_t start;
+		phys_size_t size;
+	} bank[CONFIG_NR_DRAM_BANKS];
+} apple_dram __section(".data");
+
+/*
+ * Entry @index of the reg property of @node, as ofnode_read_resource()
+ * returns it. For a child of the root that is a plain decode: the cell
+ * counts are the root's and the address translation is an identity.
+ * Anything else takes the generic path.
+ */
+static int apple_dram_entry(const void *fdt, int node, int depth, int index,
+			    phys_addr_t *start, phys_size_t *size)
+{
+	const fdt32_t *reg;
+	struct resource res;
+	int na, ns, len;
+
+	na = fdt_address_cells(fdt, 0);
+	ns = fdt_size_cells(fdt, 0);
+	if (depth != 1 || na < 1 || na > 2 || ns < 1 || ns > 2) {
+		if (ofnode_read_resource(offset_to_ofnode(node), index, &res))
+			return -EINVAL;
+		*start = res.start;
+		*size = res.end - res.start + 1;
+		return 0;
+	}
+
+	reg = fdt_getprop(fdt, node, "reg", &len);
+	if (!reg || index >= len / (int)sizeof(*reg) / (na + ns))
+		return -EINVAL;
+	reg += index * (na + ns);
+	*start = fdt_read_number(reg, na);
+	*size = fdt_read_number(reg + na, ns);
+
+	return 0;
+}
+
+static bool apple_dram_is_memory(const void *fdt, int node)
+{
+	const char *type;
+	int len;
+
+	type = fdt_getprop(fdt, node, "device_type", &len);
+
+	return type && len == sizeof("memory") &&
+	       !memcmp(type, "memory", sizeof("memory")) &&
+	       ofnode_is_enabled(offset_to_ofnode(node));
+}
+
+/* Matches what fdt_path_offset(fdt, "/memory") finds. */
+static bool apple_dram_is_path(const void *fdt, int node)
+{
+	const char *name = fdt_get_name(fdt, node, NULL);
+
+	return name && !strncmp(name, "memory", 6) &&
+	       (!name[6] || name[6] == '@');
+}
+
 int dram_init(void)
 {
-	return fdtdec_setup_mem_size_base();
+	const void *fdt = gd->fdt_blob;
+	phys_addr_t start;
+	phys_size_t size;
+	int node, depth = -1, path = -1, nodes = 0, i;
+	bool fill = true;
+
+	apple_dram.ret = -EINVAL;
+	apple_dram.ranges = 0;
+	apple_dram.banks = 0;
+
+	for (node = fdt_next_node(fdt, -1, &depth); node >= 0 && depth >= 0;
+	     node = fdt_next_node(fdt, node, &depth)) {
+		if (path < 0 && depth == 1 && apple_dram_is_path(fdt, node))
+			path = node;
+		if (!apple_dram_is_memory(fdt, node))
+			continue;
+
+		/* fdtdec_setup_memory_banksize() needs the first node only. */
+		if (!nodes++)
+			apple_dram.ret = 0;
+		for (i = 0; !apple_dram_entry(fdt, node, depth, i, &start, &size); i++) {
+			apple_dram.ranges++;
+			if (!fill || apple_dram.banks == CONFIG_NR_DRAM_BANKS)
+				continue;
+			apple_dram.bank[apple_dram.banks].start = start;
+			apple_dram.bank[apple_dram.banks].size = size;
+			apple_dram.banks++;
+		}
+		/* ... and stops at the first empty node after that one. */
+		if (!i && nodes > 1)
+			fill = false;
+	}
+
+	if (apple_dram.ranges > CONFIG_NR_DRAM_BANKS)
+		apple_dram.ret = -E2BIG;
+
+	if (path < 0 || apple_dram_entry(fdt, path, 1, 0, &start, &size)) {
+		debug("%s: no /memory range\n", __func__);
+		return -EINVAL;
+	}
+	gd->ram_base = (unsigned long)start;
+	gd->ram_size = size;
+
+	return 0;
 }
 
 int dram_init_banksize(void)
 {
-	ofnode mem = ofnode_null();
-	struct resource res;
-	int bank = 0, reg;
+	int bank;
 
-	/* fdtdec_setup_memory_banksize() stops silently at the array limit. */
-	while (ofnode_valid(mem = fdtdec_get_next_memory_node(mem))) {
-		for (reg = 0; !ofnode_read_resource(mem, reg, &res); reg++) {
-			if (++bank > CONFIG_NR_DRAM_BANKS) {
-				log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
-					bank, CONFIG_NR_DRAM_BANKS);
-				return -E2BIG;
-			}
-		}
+	/* fdtdec_setup_memory_banksize() would stop silently at the limit. */
+	if (apple_dram.ret == -E2BIG)
+		log_err("Apple: %d DRAM ranges exceed CONFIG_NR_DRAM_BANKS=%d\n",
+			apple_dram.ranges, CONFIG_NR_DRAM_BANKS);
+	if (apple_dram.ret)
+		return apple_dram.ret;
+
+	for (bank = 0; bank < apple_dram.banks; bank++) {
+		gd->bd->bi_dram[bank].start = apple_dram.bank[bank].start;
+		gd->bd->bi_dram[bank].size = apple_dram.bank[bank].size;
 	}
 
-	return fdtdec_setup_memory_banksize();
+	return 0;
 }
 
 extern long fw_dtb_pointer;
@@ -977,8 +1214,14 @@ void build_mem_map(void)
 		 of_machine_is_compatible("apple,t6031") ||
 		 of_machine_is_compatible("apple,t6034"))
 		mem_map = t6030_mem_map;
+	else if (of_machine_is_compatible("apple,t8132"))
+		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t8140"))
 		mem_map = t8140_mem_map;
+	else if (of_machine_is_compatible("apple,t6040") ||
+		 of_machine_is_compatible("apple,t6041") ||
+		 of_machine_is_compatible("apple,t6050"))
+		mem_map = t6040_mem_map;
 	else if (of_machine_is_compatible("apple,t8142"))
 		mem_map = t8142_mem_map;
 	else if (of_machine_is_compatible("apple,t8152") &&
@@ -987,7 +1230,11 @@ void build_mem_map(void)
 	else
 		panic("Unsupported SoC\n");
 
-	if (mem_map == t8140_mem_map) {
+	if (mem_map == t8140_mem_map || mem_map == t8132_mem_map ||
+	    mem_map == t6040_mem_map) {
+		int ram_slot = mem_map == t8132_mem_map ? 8 :
+			       mem_map == t6040_mem_map ? 3 : 1;
+
 		/* LMB and EFI see every bank, so the MMU must map every bank. */
 		for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
 			base = gd->bd->bi_dram[bank].start;
@@ -996,13 +1243,13 @@ void build_mem_map(void)
 				break;
 			size += base - ALIGN_DOWN(base, SZ_4K);
 			base = ALIGN_DOWN(base, SZ_4K);
-			mem_map[bank + 1].virt = base;
-			mem_map[bank + 1].phys = base;
-			mem_map[bank + 1].size = ALIGN(size, SZ_4K);
-			mem_map[bank + 1].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+			mem_map[bank + ram_slot].virt = base;
+			mem_map[bank + ram_slot].phys = base;
+			mem_map[bank + ram_slot].size = ALIGN(size, SZ_4K);
+			mem_map[bank + ram_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
 						  PTE_BLOCK_INNER_SHARE;
 		}
-		fb_slot = bank + 1;
+		fb_slot = bank + ram_slot;
 		mem_map[fb_slot].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
 					 PTE_BLOCK_INNER_SHARE |
 					 PTE_BLOCK_PXN | PTE_BLOCK_UXN;
@@ -1052,12 +1299,92 @@ u64 get_page_table_size(void)
 	return SZ_256K;
 }
 
+/*
+ * The ESP U-Boot boots from, as "dev:part".  It is the ESP that the boot
+ * loader names in /chosen/asahi,efi-system-partition.
+ *
+ * Another ESP is used only when the named one does not belong to an
+ * install: it is not on the disk, U-Boot cannot read it, or it holds
+ * neither an EFI boot loader nor vendor firmware (a stub ESP that only
+ * carries Stage 2, as on the J616s, where Fedora has its own ESP).  Even
+ * then the other ESP must be the only one on the disk with an EFI boot
+ * loader, since with two installs side by side U-Boot cannot tell which
+ * is ours.  The OS is then told that ESP (see ft_board_setup()), since its
+ * firmware and boot files live there.
+ *
+ * An ESP that holds vendorfw/ belongs to the install that put it there.
+ * When it is named it is always used, with or without an EFI boot loader,
+ * and the normal boot flow takes over from it.
+ */
+#define ASAHI_EFI_LOADER	"EFI/BOOT/BOOTAA64.EFI"
+#define ASAHI_VENDORFW		"vendorfw/firmware.cpio"
+
+/* What one disk holds, as seen by asahi_esp_devpart(). */
+struct asahi_esp_scan {
+	int named;		/* ESP with the named UUID, or 0 */
+	bool named_readable;	/* U-Boot can read its file system */
+	bool named_owned;	/* it holds an EFI boot loader or vendorfw/ */
+	int first;		/* first ESP on the disk, or 0 */
+	int other;		/* first other ESP with an EFI boot loader, or 0 */
+	int others;		/* number of other ESPs with an EFI boot loader */
+};
+
+enum asahi_esp_choice {
+	ASAHI_ESP_NONE,
+	ASAHI_ESP_NAMED,	/* the named ESP, /chosen unchanged */
+	ASAHI_ESP_FIRST,	/* named ESP absent, no single other: the first ESP */
+	ASAHI_ESP_OTHER,	/* scan->other, and /chosen is told about it */
+};
+
+static enum asahi_esp_choice asahi_esp_choose(const struct asahi_esp_scan *scan)
+{
+	if (scan->named && scan->named_readable && scan->named_owned)
+		return ASAHI_ESP_NAMED;
+	if (scan->others == 1)
+		return ASAHI_ESP_OTHER;
+	if (scan->named)
+		return ASAHI_ESP_NAMED;
+	if (scan->first)
+		return ASAHI_ESP_FIRST;
+	return ASAHI_ESP_NONE;
+}
+
+static const char *asahi_esp_state(const struct asahi_esp_scan *scan,
+				   const char *uuid)
+{
+	if (!uuid)
+		return "(none named)";
+	if (!scan->named)
+		return "not on this disk";
+	if (!scan->named_readable)
+		return "unreadable";
+	if (!scan->named_owned)
+		return "has no EFI loader or vendorfw";
+	return "belongs to an install";
+}
+
+static bool asahi_esp_has(struct blk_desc *desc, int part, const char *path)
+{
+	if (fs_set_blk_dev_with_part(desc, part))
+		return false;
+
+	return fs_exists(path);
+}
+
+static char asahi_esp_uuid[UUID_STR_LEN + 1];
+static bool asahi_esp_moved;
+
 static char *asahi_esp_devpart(void)
 {
+	struct asahi_esp_scan scan;
+	enum asahi_esp_choice choice;
 	struct disk_partition info;
 	struct blk_desc *nvme_blk;
 	const char *uuid = NULL;
-	int devnum, len, p, part, ret;
+	int devnum, len, p, part;
+	char named_uuid[UUID_STR_LEN + 1];
+	char other_uuid[UUID_STR_LEN + 1];
+	char first_uuid[UUID_STR_LEN + 1];
 	static char devpart[64];
 	struct udevice *dev;
 	ofnode node;
@@ -1082,23 +1409,71 @@ static char *asahi_esp_devpart(void)
 			break;
 
 		dev = dev_get_parent(nvme_blk->bdev);
-		if (!device_is_compatible(dev, "apple,nvme-ans2") &&
-		    !device_is_compatible(dev, "apple,t8132-nvme-ans2"))
+		/* Every internal Apple controller, whatever its compatible. */
+		if (!IS_ENABLED(CONFIG_NVME_APPLE) ||
+		    dev->driver != DM_DRIVER_GET(apple_nvme))
 			continue;
 
+		memset(&scan, 0, sizeof(scan));
+		named_uuid[0] = other_uuid[0] = first_uuid[0] = '\0';
 		for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
-			ret = part_get_info(nvme_blk, p, &info);
-			if (ret < 0)
+			if (part_get_info(nvme_blk, p, &info) < 0)
 				break;
+			if (!(info.bootable & PART_EFI_SYSTEM_PARTITION))
+				continue;
 
-			if (info.bootable & PART_EFI_SYSTEM_PARTITION) {
-				if (uuid && strcasecmp(uuid, info.uuid) == 0) {
-					part = p;
-					break;
-				}
-				if (part == 0)
-					part = p;
+			if (!scan.first) {
+				scan.first = p;
+				strlcpy(first_uuid, info.uuid, sizeof(first_uuid));
 			}
+			if (!scan.named && uuid && !strcasecmp(uuid, info.uuid)) {
+				scan.named = p;
+				strlcpy(named_uuid, info.uuid, sizeof(named_uuid));
+				scan.named_readable =
+					!fs_set_blk_dev_with_part(nvme_blk, p);
+				if (scan.named_readable)
+					fs_close();
+				scan.named_owned =
+					asahi_esp_has(nvme_blk, p, ASAHI_EFI_LOADER) ||
+					asahi_esp_has(nvme_blk, p, ASAHI_VENDORFW);
+				continue;
+			}
+			if (asahi_esp_has(nvme_blk, p, ASAHI_EFI_LOADER)) {
+				if (!scan.other) {
+					scan.other = p;
+					strlcpy(other_uuid, info.uuid,
+						sizeof(other_uuid));
+				}
+				scan.others++;
+			}
+		}
+
+		choice = asahi_esp_choose(&scan);
+		switch (choice) {
+		case ASAHI_ESP_NAMED:
+			part = scan.named;
+			strlcpy(asahi_esp_uuid, named_uuid, sizeof(asahi_esp_uuid));
+			debug("ESP: named ESP %d %s; %d other ESP(s) have an EFI loader; using the named ESP\n",
+			       scan.named, asahi_esp_state(&scan, uuid),
+			       scan.others);
+			break;
+		case ASAHI_ESP_OTHER:
+			part = scan.other;
+			strlcpy(asahi_esp_uuid, other_uuid, sizeof(asahi_esp_uuid));
+			asahi_esp_moved = true;
+			debug("ESP: named ESP %.36s %s; using ESP %d %s, the only other ESP with an EFI loader, and telling the OS\n",
+			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
+			       scan.other, other_uuid);
+			break;
+		case ASAHI_ESP_FIRST:
+			part = scan.first;
+			strlcpy(asahi_esp_uuid, first_uuid, sizeof(asahi_esp_uuid));
+			debug("ESP: named ESP %.36s %s; %d ESP(s) have an EFI loader; using the first ESP %d\n",
+			       uuid ? uuid : "-", asahi_esp_state(&scan, uuid),
+			       scan.others, scan.first);
+			break;
+		case ASAHI_ESP_NONE:
+			break;
 		}
 
 		if (part > 0)
@@ -1125,16 +1500,147 @@ char *env_fat_get_dev_part(void)
 	return asahi_esp_devpart();
 }
 
+/*
+ * Aura's enforce policy.
+ *
+ * aura records what each boot stage checked in /chosen/aurora,boot-security
+ * of the devicetree it hands over. When any stage enforced, or the record
+ * says the chain up to here was verified, the boot stays on a verified
+ * path: U-Boot itself was checked, but what it reads from the ESP is not,
+ * so it must not read its saved environment, offer a console, or start
+ * anything UEFI Secure Boot did not verify, audit build or not. The keys
+ * come from the variable seed built into this image
+ * (CONFIG_EFI_VARIABLES_PRESEED), which aurora-secboot fills before it
+ * signs Stage 2.
+ */
+static bool apple_boot_enforced(void)
+{
+	ofnode node, entry;
+	const char *val;
+
+	node = ofnode_path("/chosen/aurora,boot-security");
+	if (!ofnode_valid(node))
+		return false;
+
+	val = ofnode_read_string(node, "policy");
+	if (val && !strcmp(val, "enforce"))
+		return true;
+	val = ofnode_read_string(node, "state");
+	if (val && !strcmp(val, "verified"))
+		return true;
+	ofnode_for_each_subnode(entry, node) {
+		val = ofnode_read_string(entry, "policy");
+		if (val && !strcmp(val, "enforce"))
+			return true;
+	}
+
+	return false;
+}
+
+/* Secure Boot refuses, rather than audits, under an enforcing aura. */
+bool efi_aurora_enforce_policy(void)
+{
+	return apple_boot_enforced();
+}
+
+/*
+ * A saved environment on the ESP could change the boot, so under the
+ * enforce policy the built-in one is used and nothing is saved. Otherwise
+ * the locations are the build's: a FAT build reads and writes uboot.env as
+ * before, without the nowhere location as a fallback.
+ */
+enum env_location env_get_location(enum env_operation op, int prio)
+{
+	enum env_location loc;
+
+	if (CONFIG_IS_ENABLED(ENV_IS_NOWHERE) && apple_boot_enforced())
+		return prio ? ENVL_UNKNOWN : ENVL_NOWHERE;
+
+	loc = arch_env_get_location(op, prio);
+	if (IS_ENABLED(CONFIG_ENV_IS_IN_FAT) && loc == ENVL_NOWHERE)
+		return ENVL_UNKNOWN;
+	return loc;
+}
+
+/* Whether the built-in variable seed enrols a platform key. */
+static bool apple_seed_has_pk(void)
+{
+#if CONFIG_IS_ENABLED(EFI_VARIABLES_PRESEED)
+	const struct efi_var_file *file = (void *)__efi_var_file_begin;
+	const struct efi_var_entry *var;
+	const u8 *end, *data;
+	static const u16 pk[] = u"PK";
+
+	if (file->magic != EFI_VAR_FILE_MAGIC ||
+	    file->length < sizeof(*file) || file->length > EFI_VAR_BUF_SIZE)
+		return false;
+
+	end = (const u8 *)file + file->length;
+	for (var = file->var; (const u8 *)(var + 1) < end;
+	     var = (void *)ALIGN((uintptr_t)data + var->length, 8)) {
+		size_t room = (end - (const u8 *)var->name) / sizeof(u16);
+		size_t len = u16_strnlen(var->name, room);
+
+		if (len == room)
+			return false;
+		data = (const u8 *)(var->name + len + 1);
+		if (var->length > end - data)
+			return false;
+		if (var->length && !u16_strcmp(var->name, pk) &&
+		    !guidcmp(&var->guid, &efi_global_variable_guid))
+			return true;
+	}
+#endif
+
+	return false;
+}
+
+/*
+ * The only boot under the enforce policy: the removable-media EFI path of
+ * the internal ESP, which on the secure path is a signed UKI, started with
+ * UEFI Secure Boot in force. Anything else, or a return, resets.
+ */
+static const char * const enforced_env[][2] = {
+	{ "aurora_secure_boot",
+	  "echo AURORA_UBOOT_SECURE: verified EFI on internal ESP; "
+	  "if test -n \"${fw_dev_part}\"; then "
+	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
+	  "bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi; "
+	  "echo AURORA_UBOOT_SECURE_FAIL: no verified EFI application started; "
+	  "sleep 10; reset" },
+	{ "aurora_secure_nokeys",
+	  "echo AURORA_UBOOT_SECURE_FAIL: aura enforces, but this U-Boot "
+	  "carries no Secure Boot keys; sleep 10; reset" },
+};
+
+static void apple_enforced_late_init(void)
+{
+	bool ok = IS_ENABLED(CONFIG_EFI_SECURE_BOOT) &&
+		  CONFIG_IS_ENABLED(ENV_IS_NOWHERE) && apple_seed_has_pk();
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(enforced_env); i++)
+		env_set(enforced_env[i][0], enforced_env[i][1]);
+
+	env_set("bootcmd", ok ? "run aurora_secure_boot; reset" :
+		"run aurora_secure_nokeys; reset");
+	/* Boot at once, without looking for a key, and never stop on Ctrl-C. */
+	env_set("bootdelay", "-2");
+	env_set("preboot", "");
+	disable_ctrlc(1);
+}
+
 #define KERNEL_COMP_SIZE	SZ_128M
 
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
+ * Aurora Silicon boot flow for J700 (T8140), J713 (T8132), J616s (T6040) and
+ * J714c (T6050).
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
- * path from the internal ESP: shim then loads Fedora GRUB and its BLS entries.
+ * path from the internal ESP, which selects the installed EFI boot manager.
  * If that fails, boot the kernel and initramfs named by /chosen fallback
  * properties, then try generic bootflow.  Both direct and EFI boot pass
  * m1n1's devicetree (${fdtcontroladdr}).  With no
@@ -1143,9 +1649,9 @@ char *env_fat_get_dev_part(void)
  * Nothing here is set if the variable already exists, so a saved
  * uboot.env on the ESP can override any of it.
  */
-static const char * const t8140_env[][2] = {
+static const char * const apple_efi_env[][2] = {
 	{ "aurora_boot",
-	  "echo AURORA_UBOOT_BOOT: EFI on internal ESP; run aurora_efi; "
+	  "run aurora_efi; "
 	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
 	  "echo AURORA_UBOOT_BOOT: bootflow; bootflow scan -b; "
 	  "echo AURORA_UBOOT_BOOT_FAIL: no bootable entry; run aurora_rescue" },
@@ -1153,7 +1659,7 @@ static const char * const t8140_env[][2] = {
 	  "if test -n \"${fw_dev_part}\"; then "
 	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
 	  "bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi" },
-	/* Keep MTP untouched even when every boot path fails. */
+	/* Do not restart the HID transport from a failed EFI boot path. */
 	{ "aurora_rescue",
 	  "echo; echo Nothing could be booted. Use the serial console or reset." },
 	{ "aurora_fallback",
@@ -1176,7 +1682,7 @@ static const char * const t8140_env[][2] = {
 };
 
 /* The initramfs the boot loader placed in memory, as "start:size" */
-static void t8140_loader_initrd(ofnode chosen)
+static void apple_loader_initrd(ofnode chosen)
 {
 	u64 start, end;
 	char buf[40];
@@ -1190,15 +1696,15 @@ static void t8140_loader_initrd(ofnode chosen)
 	env_set("aurora_loader_initrd", buf);
 }
 
-static void t8140_late_init(void)
+static void apple_efi_late_init(bool start_keyboard)
 {
 	const char *str;
 	ofnode chosen;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(t8140_env); i++) {
-		if (!env_get(t8140_env[i][0]))
-			env_set(t8140_env[i][0], t8140_env[i][1]);
+	for (i = 0; i < ARRAY_SIZE(apple_efi_env); i++) {
+		if (!env_get(apple_efi_env[i][0]))
+			env_set(apple_efi_env[i][0], apple_efi_env[i][1]);
 	}
 
 	/*
@@ -1207,18 +1713,20 @@ static void t8140_late_init(void)
 	 * until the USB-C PHY support has been validated; "usb start" still
 	 * works by hand.
 	 */
-	if (!strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
+	/*
+	 * Under UEFI Secure Boot the configured bootcmd stays: aurora_boot
+	 * falls back to booti, which no signature check covers.
+	 */
+	if (!IS_ENABLED(CONFIG_EFI_SECURE_BOOT) &&
+	    !strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
 		env_set("bootcmd", "run aurora_boot");
 	if (!strcmp(env_get("boot_targets") ?: "", "nvme usb"))
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
 		env_set("preboot", "");
-	/* Keep the added boot time small; a key on the console still stops it. */
-	if (!strcmp(env_get("bootdelay") ?: "", __stringify(CONFIG_BOOTDELAY)))
-		env_set("bootdelay", "1");
-
 	/* EFI ConIn uses the active stdin; keep serial input available. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) && IS_ENABLED(CONFIG_CMDLINE))
+	if (start_keyboard && IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    IS_ENABLED(CONFIG_CMDLINE))
 		run_command("mtpkbd start", 0);
 
 	chosen = ofnode_path("/chosen");
@@ -1232,19 +1740,118 @@ static void t8140_late_init(void)
 	if (str && !env_get("aurora_fallback_initrd"))
 		env_set("aurora_fallback_initrd", str);
 
-	t8140_loader_initrd(chosen);
+	apple_loader_initrd(chosen);
+}
+
+/* Prepare the live helper before the keyboard console consumes discovery. */
+static int j713_prepare_input(void)
+{
+	ofnode node, input;
+	struct udevice *helper;
+	fdt_addr_t data;
+	ulong start;
+	int ret, index;
+
+	node = ofnode_by_compatible(ofnode_null(),
+		of_machine_is_compatible("apple,j614s") ?
+		"apple,t6041-rtk-helper-asc4" : "apple,t8132-rtk-helper-asc4");
+	if (!ofnode_valid(node))
+		return -ENODEV;
+	ret = uclass_get_device_by_ofnode(UCLASS_MISC, node, &helper);
+	if (ret) {
+		printf("MTP: failed to initialize input helper (%d)\n", ret);
+		return ret;
+	}
+	input = ofnode_get_parent(ofnode_get_aliases_node("keyboard"));
+	if (!ofnode_valid(input))
+		return -ENODEV;
+	index = ofnode_stringlist_search(input, "reg-names", "data");
+	if (index < 0)
+		return index;
+	data = ofnode_get_addr_index(input, index);
+	if (data == FDT_ADDR_T_NONE)
+		return -EINVAL;
+
+	/* AP power ON can precede IOReport/buffer requests. Finish those
+	 * startup exchanges before Linux inherits a mailbox it will not poll.
+	 * Observe the first HID header without consuming any FIFO bytes. */
+	start = get_timer(0);
+	while (readl((void *)(data + 0x2c)) < 8 && get_timer(start) < 2000) {
+		ret = apple_rtkit_helper_poll(helper, 0);
+		if (ret && ret != -ETIMEDOUT) {
+			printf("J713: input startup mailbox error %d\n", ret);
+			return ret;
+		}
+		udelay(50);
+	}
+	debug("J713: input discovery FIFO has %u bytes at handoff\n",
+	      readl((void *)(data + 0x2c)));
+	if (readl((void *)(data + 0x2c)) < 8)
+		return -ETIMEDOUT;
+	apple_rtkit_helper_input_ready(helper);
+	return 0;
+}
+
+/*
+ * On a machine with a built-in keyboard, leave the USB-C ports to the OS.
+ *
+ * U-Boot drives a Type-C port as a USB 2.0 host only: its SuperSpeed lanes
+ * stay on the dummy PIPE and the alternate mode set up by the Type-C
+ * controller is not followed.  A dock that is already attached and in
+ * DisplayPort alternate mode can keep the state of such a session after the
+ * OS takes over: the Plugable UD-ULTC4K on a T6000 MacBook Pro then shows
+ * only its USB 3 hub, and its USB 2.0 hub, keyboard and mouse stay absent
+ * until the cable is reconnected.  The built-in keyboard covers the boot
+ * prompt, so "usb start" is not needed to reach it.  Machines without one
+ * keep it, and "usb start" still works by hand.
+ */
+static void apple_typec_late_init(void)
+{
+	if (!ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,spi-hid-transport")) &&
+	    !ofnode_valid(ofnode_by_compatible(ofnode_null(),
+					       "apple,dockchannel-hid")))
+		return;
+
+	if (!strcmp(env_get("preboot") ?: "", "usb start"))
+		env_set("preboot", "");
 }
 
 int board_late_init(void)
 {
+	bool start_keyboard = true;
 	u32 status = 0;
 	phys_addr_t addr;
 
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
 
-	if (of_machine_is_compatible("apple,t8140"))
-		t8140_late_init();
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
+	    (of_machine_is_compatible("apple,j713") ||
+	     of_machine_is_compatible("apple,j614s"))) {
+		int ret = j713_prepare_input();
+
+		start_keyboard = !ret;
+		if (ret)
+			printf("MTP: input unavailable (%d); continuing boot\n", ret);
+	}
+	/* T6040 and T6041 stay with Linux except for the J614s retained handoff. */
+	if ((of_machine_is_compatible("apple,t6040") &&
+	     !of_machine_is_compatible("apple,j614s")) ||
+	    of_machine_is_compatible("apple,t6041") ||
+	    of_machine_is_compatible("apple,t6050"))
+		start_keyboard = false;
+	/* A helper the OS adopts running is started for U-Boot's keyboard too. */
+	if (apple_rtkit_helper_any_keeps_running() ||
+	    of_machine_is_compatible("apple,j613") ||
+	    of_machine_is_compatible("apple,t8140") ||
+	    of_machine_is_compatible("apple,t8132") ||
+	    of_machine_is_compatible("apple,t6040") ||
+	    of_machine_is_compatible("apple,t6041") ||
+	    of_machine_is_compatible("apple,t6050"))
+		apple_efi_late_init(start_keyboard);
+	else
+		apple_typec_late_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
 	 * align by 2M and maximal FDT size 2M
@@ -1268,6 +1875,9 @@ int board_late_init(void)
 	if (status)
 		log_warning("late_init: Failed to set run time variables\n");
 
+	if (apple_boot_enforced())
+		apple_enforced_late_init();
+
 	return 0;
 }
 
@@ -1275,11 +1885,51 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 {
 	struct udevice *dev;
 	const char *stdoutname;
-	int node, ret;
+	int node, ret, imported;
+
+	imported = 0;
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT))
+		imported = apple_j713_import_fdt(blob, gd->fdt_blob);
+	if (imported < 0) {
+		printf("J713: refused OS devicetree runtime import (%d)\n", imported);
+		return imported;
+	}
 
 	/* Coprocessors handed over running must be described in every case. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
-		apple_rtkit_helper_fdt_fixup(blob);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		/*
+		 * A refused J713 handoff must not reach Linux. Elsewhere a failed
+		 * fixup only costs the OS the running session: keep booting.
+		 */
+		if (ret && (of_machine_is_compatible("apple,j713") ||
+			    of_machine_is_compatible("apple,j614s")))
+			return ret;
+		if (ret)
+			printf("RTKit helper OS handoff fixup failed (%d); continuing\n",
+			       ret);
+	}
+	if (IS_ENABLED(CONFIG_APPLE_J713_FDT) && imported) {
+		ret = apple_j713_complete_fdt(blob);
+		if (ret)
+			return ret;
+		debug("J713: OS devicetree runtime import complete\n");
+	}
+
+	/* RTKit buffers of an ANS session handed on live stay the firmware's. */
+	ret = apple_nvme_fdt_fixup(blob);
+	if (ret) {
+		printf("ANS: cannot reserve its RTKit buffers for the OS (%d)\n", ret);
+		return ret;
+	}
+
+	/* The OS finds its firmware on the ESP it was booted from. */
+	if (asahi_esp_moved) {
+		node = fdt_path_offset(blob, "/chosen");
+		if (node >= 0)
+			fdt_setprop_string(blob, node, "asahi,efi-system-partition",
+					   asahi_esp_uuid);
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

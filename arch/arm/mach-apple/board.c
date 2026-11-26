@@ -6,17 +6,24 @@
 #include <dm.h>
 #include <dm/uclass-internal.h>
 #include <command.h>
+#include <console.h>
 #include <efi_loader.h>
+#include <efi_variable.h>
 #include <env.h>
+#include <env_internal.h>
 #include <lmb.h>
+#include <mapmem.h>
 #include <nvme.h>
 #include <part.h>
 #include <linux/ioport.h>
+#include <linux/libfdt.h>
 #include <linux/stringify.h>
+#include <u-boot/sha256.h>
 
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
+#include <asm/sections.h>
 #include <asm/system.h>
 #include <asm/arch/rtkit.h>
 
@@ -1125,6 +1132,169 @@ char *env_fat_get_dev_part(void)
 	return asahi_esp_devpart();
 }
 
+/*
+ * Aura's enforce policy.
+ *
+ * aura records what each boot stage checked in /chosen/aurora,boot-security
+ * of the devicetree it hands over. When any stage enforced, or the record
+ * says the chain up to here was verified, the boot stays on a verified
+ * path: U-Boot itself was checked, but what it reads from the ESP is not,
+ * so it must not read its saved environment, offer a console, or start
+ * anything UEFI Secure Boot did not verify. The keys come from the
+ * variable seed built into this image (CONFIG_EFI_VARIABLES_PRESEED),
+ * which aurora-secboot fills before it signs Stage 2.
+ */
+static bool apple_boot_enforced(void)
+{
+	ofnode node, entry;
+	const char *val;
+
+	node = ofnode_path("/chosen/aurora,boot-security");
+	if (!ofnode_valid(node))
+		return false;
+
+	val = ofnode_read_string(node, "policy");
+	if (val && !strcmp(val, "enforce"))
+		return true;
+	val = ofnode_read_string(node, "state");
+	if (val && !strcmp(val, "verified"))
+		return true;
+	ofnode_for_each_subnode(entry, node) {
+		val = ofnode_read_string(entry, "policy");
+		if (val && !strcmp(val, "enforce"))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * A saved environment on the ESP could change the boot, so under the
+ * enforce policy the built-in one is used and nothing is saved. Otherwise
+ * the ESP's uboot.env is read and written as before, with no fallback.
+ */
+enum env_location env_get_location(enum env_operation op, int prio)
+{
+	enum env_location loc;
+
+	if (apple_boot_enforced())
+		return prio ? ENVL_UNKNOWN : ENVL_NOWHERE;
+
+	loc = arch_env_get_location(op, prio);
+	return loc == ENVL_NOWHERE ? ENVL_UNKNOWN : loc;
+}
+
+/* Whether the built-in variable seed enrols a platform key. */
+static bool apple_seed_has_pk(void)
+{
+#if CONFIG_IS_ENABLED(EFI_VARIABLES_PRESEED)
+	const struct efi_var_file *file = (void *)__efi_var_file_begin;
+	const struct efi_var_entry *var;
+	const u8 *end, *data;
+	static const u16 pk[] = u"PK";
+
+	if (file->magic != EFI_VAR_FILE_MAGIC ||
+	    file->length < sizeof(*file) || file->length > EFI_VAR_BUF_SIZE)
+		return false;
+
+	end = (const u8 *)file + file->length;
+	for (var = file->var; (const u8 *)(var + 1) < end;
+	     var = (void *)ALIGN((uintptr_t)data + var->length, 8)) {
+		size_t room = (end - (const u8 *)var->name) / sizeof(u16);
+		size_t len = u16_strnlen(var->name, room);
+
+		if (len == room)
+			return false;
+		data = (const u8 *)(var->name + len + 1);
+		if (var->length > end - data)
+			return false;
+		if (var->length && !u16_strcmp(var->name, pk) &&
+		    !guidcmp(&var->guid, &efi_global_variable_guid))
+			return true;
+	}
+#endif
+
+	return false;
+}
+
+/*
+ * The only boot under the enforce policy: the removable-media EFI path of
+ * the internal ESP, which on the secure path is a signed UKI, started with
+ * UEFI Secure Boot in force. Anything else, or a return, resets.
+ */
+static const char * const enforced_env[][2] = {
+	{ "aurora_secure_boot",
+	  "echo AURORA_UBOOT_SECURE: verified EFI on internal ESP; "
+	  "if test -n \"${fw_dev_part}\"; then "
+	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
+	  "setenv aurora_measure_size ${filesize} && "
+	  "bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi; "
+	  "echo AURORA_UBOOT_SECURE_FAIL: no verified EFI application started; "
+	  "sleep 10; reset" },
+	{ "aurora_secure_nokeys",
+	  "echo AURORA_UBOOT_SECURE_FAIL: aura enforces, but this U-Boot "
+	  "carries no Secure Boot keys; sleep 10; reset" },
+};
+
+static void apple_enforced_late_init(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(enforced_env); i++)
+		env_set(enforced_env[i][0], enforced_env[i][1]);
+
+	env_set("bootcmd", apple_seed_has_pk() ?
+		"run aurora_secure_boot; reset" :
+		"run aurora_secure_nokeys; reset");
+	/* Boot at once, without looking for a key, and never stop on Ctrl-C. */
+	env_set("bootdelay", "-2");
+	env_set("preboot", "");
+	disable_ctrlc(1);
+}
+
+/*
+ * Add what U-Boot hands over to the boot record, as aura's stages do: the
+ * EFI application the enforced boot loaded. bootefi installs this
+ * devicetree before it loads the image, and under Secure Boot the image
+ * only starts, and so only sees the record, when it verified.
+ */
+static void apple_measure_efi(void *blob)
+{
+	u8 digest[SHA256_SUM_LEN];
+	ulong addr, size;
+	int node, entry, next = 0;
+	char name[24];
+	const fdt32_t *reg;
+
+	addr = env_get_hex("kernel_addr_r", 0);
+	size = env_get_hex("aurora_measure_size", 0);
+	if (!addr || !size)
+		return;
+
+	node = fdt_path_offset(blob, "/chosen/aurora,boot-security");
+	if (node < 0)
+		return;
+	fdt_for_each_subnode(entry, blob, node) {
+		reg = fdt_getprop(blob, entry, "reg", NULL);
+		if (reg && fdt32_to_cpu(*reg) >= next)
+			next = fdt32_to_cpu(*reg) + 1;
+	}
+
+	sha256_csum_wd(map_sysmem(addr, size), size, digest, CHUNKSZ_SHA256);
+	unmap_sysmem((void *)addr);
+
+	snprintf(name, sizeof(name), "measurement@%d", next);
+	entry = fdt_add_subnode(blob, node, name);
+	if (entry < 0)
+		return;
+	fdt_setprop_u32(blob, entry, "reg", next);
+	fdt_setprop_string(blob, entry, "stage", "u-boot");
+	fdt_setprop_string(blob, entry, "policy", "enforce");
+	fdt_setprop_string(blob, entry, "component", "EFI/BOOT/BOOTAA64.EFI");
+	fdt_setprop_string(blob, entry, "verdict", "verified");
+	fdt_setprop(blob, entry, "sha256", digest, sizeof(digest));
+}
+
 #define KERNEL_COMP_SIZE	SZ_128M
 
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
@@ -1268,6 +1438,9 @@ int board_late_init(void)
 	if (status)
 		log_warning("late_init: Failed to set run time variables\n");
 
+	if (apple_boot_enforced())
+		apple_enforced_late_init();
+
 	return 0;
 }
 
@@ -1280,6 +1453,10 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	/* Coprocessors handed over running must be described in every case. */
 	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
 		apple_rtkit_helper_fdt_fixup(blob);
+
+	/* Without Secure Boot an enforced boot starts nothing to measure. */
+	if (IS_ENABLED(CONFIG_EFI_SECURE_BOOT) && apple_boot_enforced())
+		apple_measure_efi(blob);
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

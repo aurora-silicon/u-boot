@@ -76,6 +76,8 @@ obj-$(CONFIG_EFI_DEBUG_SUPPORT) += efi_debug_support.o
 
 EFI_VAR_SEED_FILE := $(subst $\",,$(CONFIG_EFI_VAR_SEED_FILE))
 $(obj)/efi_var_seed.o: $(srctree)/$(EFI_VAR_SEED_FILE)
+# A relative seed path is relative to the source tree, also with O=.
+AFLAGS_efi_var_seed.o += -I$(srctree)
 
 ifeq ($(CONFIG_EFI_CAPSULE_AUTHENTICATE),y)
 capsule_crt_path=($(subst $(quote),,$(CONFIG_EFI_CAPSULE_CRT_FILE)))

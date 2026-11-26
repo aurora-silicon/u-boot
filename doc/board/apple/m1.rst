@@ -285,6 +285,42 @@ Instructions on how to install U-Boot on your Mac can be found at:
 
 Just replace ``m1n1.macho`` with ``u-boot.macho`` in the instructions.
 
+Aura's enforce policy
+---------------------
+
+When U-Boot is started by aura (Aurora Silicon's m1n1-based boot chain),
+aura records what each stage checked in ``/chosen/aurora,boot-security`` of
+the device tree it passes, and U-Boot adds an entry for every EFI image it
+loads (``CONFIG_EFI_AURORA_MEASURE``). If any stage enforced
+(``policy = "enforce"`` on the node or on one of its ``measurement@N``
+entries) or the record says the chain is ``verified``, U-Boot itself was
+checked, but nothing it reads from the ESP was, so U-Boot keeps the boot on
+a verified path:
+
+- the saved ``uboot.env`` on the ESP is not read, and ``saveenv`` stores
+  nothing (``CONFIG_ENV_IS_NOWHERE``; without an enforcing stage a FAT build
+  reads and writes ``uboot.env`` as before);
+- the boot starts at once (``bootdelay`` is -2), Ctrl-C is ignored and
+  ``preboot`` is empty, so there is no console to interrupt it;
+- the only boot is ``EFI/BOOT/BOOTAA64.EFI`` on the internal ESP, started
+  with ``bootefi`` under UEFI Secure Boot; there is no ``booti``, bootflow,
+  boot script or USB boot. If it does not start, or returns, U-Boot resets;
+- Secure Boot refuses an image that fails authentication even in an audit
+  build (``CONFIG_EFI_AURORA_SECBOOT_AUDIT``), which otherwise only records
+  the verdict;
+- the keys (PK, KEK, db and dbx) come only from the variable seed built into
+  U-Boot (``CONFIG_EFI_VARIABLES_PRESEED``), never from ``ubootefi.var`` on
+  the ESP. ``apple_m1_defconfig`` builds in ``board/apple/mac/uefi-seed.var``:
+  an empty seed in a fixed 16 KiB region that ends in the marker
+  ``AURORA-UEFI-SEED``, which ``aurora-secboot`` fills with the owner's keys
+  before it signs Stage 2, so aura's signature covers them.
+  ``tools/apple_secboot_seed.py`` writes a seed in the same region format for
+  ``apple_secboot.config`` builds, and ``tools/aurora_uefi_seed.py`` checks
+  an image. With no platform key in the seed, U-Boot refuses and resets.
+
+Without an enforcing stage the default build boots as before; with keys in
+its seed it audits (records each verdict and starts the image).
+
 Debug UART
 ----------
 

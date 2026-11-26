@@ -10,7 +10,7 @@ fw_dtb_pointer:
 
 .global save_boot_params
 save_boot_params:
-	/* Stash DTB pointer passed by m1n1 */
+	/* Stash DTB pointer passed by aura */
 	adr	x1, fw_dtb_pointer
 	str	x0, [x1]
 

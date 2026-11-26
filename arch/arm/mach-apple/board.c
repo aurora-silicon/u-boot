@@ -864,7 +864,7 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 };
 
 /* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
- * RAM and framebuffer entries are populated from the m1n1-patched FDT.
+ * RAM and framebuffer entries are populated from the aura-patched FDT.
  */
 static struct mm_region t8142_mem_map[] = {
 	{
@@ -945,7 +945,7 @@ extern long fw_dtb_pointer;
 
 int board_fdt_blob_setup(void **fdtp)
 {
-	/* Return DTB pointer passed by m1n1 */
+	/* Return DTB pointer passed by aura */
 	*fdtp = (void *)fw_dtb_pointer;
 
 	return 0;
@@ -1052,15 +1052,36 @@ u64 get_page_table_size(void)
 	return SZ_256K;
 }
 
-static char *asahi_esp_devpart(void)
+/*
+ * The ESP Stage 1 booted from. aura names it in /chosen/aurora,efi-system-partition;
+ * LEGACY-ASAHI(2027-02-28): aura builds before the rename only write
+ * /chosen/asahi,efi-system-partition, so read that when the new name is absent.
+ */
+static const char *aurora_chosen_esp_uuid(void)
+{
+	const char *uuid;
+	ofnode node;
+	int len;
+
+	node = ofnode_path("/chosen");
+	if (!ofnode_valid(node))
+		return NULL;
+
+	uuid = ofnode_get_property(node, "aurora,efi-system-partition", &len);
+	if (!uuid)
+		uuid = ofnode_get_property(node, "asahi,efi-system-partition",
+					    &len);
+	return uuid;
+}
+
+static char *aurora_esp_devpart(void)
 {
 	struct disk_partition info;
 	struct blk_desc *nvme_blk;
 	const char *uuid = NULL;
-	int devnum, len, p, part, ret;
+	int devnum, p, part, ret;
 	static char devpart[64];
 	struct udevice *dev;
-	ofnode node;
 
 	if (devpart[0])
 		return devpart;
@@ -1069,11 +1090,7 @@ static char *asahi_esp_devpart(void)
 	if (of_machine_is_compatible("apple,t8152"))
 		return devpart;
 
-	node = ofnode_path("/chosen");
-	if (ofnode_valid(node)) {
-		uuid = ofnode_get_property(node, "asahi,efi-system-partition",
-					   &len);
-	}
+	uuid = aurora_chosen_esp_uuid();
 
 	nvme_scan_namespace();
 	for (devnum = 0, part = 0; ; devnum++) {
@@ -1122,7 +1139,7 @@ const char *env_fat_get_intf(void)
 
 char *env_fat_get_dev_part(void)
 {
-	return asahi_esp_devpart();
+	return aurora_esp_devpart();
 }
 
 #define KERNEL_COMP_SIZE	SZ_128M
@@ -1132,13 +1149,13 @@ char *env_fat_get_dev_part(void)
 /*
  * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
  *
- * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
+ * aura hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
  * path from the internal ESP: shim then loads Fedora GRUB and its BLS entries.
  * If that fails, boot the kernel and initramfs named by /chosen fallback
  * properties, then try generic bootflow.  Both direct and EFI boot pass
- * m1n1's devicetree (${fdtcontroladdr}).  With no
- * aurora,fallback-initrd, an initramfs m1n1 already loaded is used.
+ * aura's devicetree (${fdtcontroladdr}).  With no
+ * aurora,fallback-initrd, an initramfs aura already loaded is used.
  *
  * Nothing here is set if the variable already exists, so a saved
  * uboot.env on the ESP can override any of it.
@@ -1164,7 +1181,7 @@ static const char * const t8140_env[][2] = {
 	  "fi" },
 	/*
 	 * Without a named initramfs, use the one the boot loader already
-	 * placed in memory (m1n1 passes it in /chosen/linux,initrd-*).
+	 * placed in memory (aura passes it in /chosen/linux,initrd-*).
 	 */
 	{ "aurora_fallback_initrd_load",
 	  "if test -n \"${aurora_fallback_initrd}\"; then "
@@ -1241,7 +1258,7 @@ int board_late_init(void)
 	phys_addr_t addr;
 
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
-	env_set("fw_dev_part", asahi_esp_devpart());
+	env_set("fw_dev_part", aurora_esp_devpart());
 
 	if (of_machine_is_compatible("apple,t8140"))
 		t8140_late_init();
@@ -1284,12 +1301,12 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point
 	 * at "/chosen/framebuffer if a keyboard is available and
-	 * we're not running under the m1n1 hypervisor.
+	 * we're not running under the aura hypervisor.
 	 * Developers can override this behaviour by dropping
 	 * "vidconsole" from the "stdout" environment variable.
 	 */
 
-	/* EL1 means we're running under the m1n1 hypervisor. */
+	/* EL1 means we're running under the aura hypervisor. */
 	if (current_el() == 1)
 		return 0;
 

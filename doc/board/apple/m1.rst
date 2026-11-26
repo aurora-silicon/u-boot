@@ -3,8 +3,8 @@
 U-Boot for Apple Silicon Macs
 =============================
 
-Allows Apple Silicon Macs to boot U-Boot via the m1n1 bootloader
-developed by the Asahi Linux project.  At this point the machines with
+Allows Apple Silicon Macs to boot U-Boot via the aura bootloader
+(https://github.com/aurora-silicon/aura).  At this point the machines with
 the following SoCs work:
 
  - Apple M1 SoC (t8103)
@@ -33,13 +33,13 @@ Initial M5 J813 native boot
 The M5 MacBook Air (J813, T8142) additionally supports RAM-loaded native
 Linux boot with the firmware framebuffer and DockChannel console. Its
 memory map covers the ADT-measured I/O aperture from ``0x210000000`` to
-``0x600000000``. m1n1 supplies the usable RAM bank and framebuffer mapping
+``0x600000000``. aura supplies the usable RAM bank and framebuffer mapping
 through the FDT; DRAM starts at ``0x10000000000``.
 
 Use ``apple_m1_defconfig`` and ``u-boot-nodtb.bin`` with the J813 DTB from
-the companion Linux support. m1n1 must fill that DTB before entering U-Boot.
+the companion Linux support. aura must fill that DTB before entering U-Boot.
 The DT's named DockChannel ``data`` window provides the serial console.
-m1n1's string-valued ``/config/bootdelay`` is accepted alongside the existing
+aura's string-valued ``/config/bootdelay`` is accepted alongside the existing
 integer form, allowing an unattended RAM ``booti`` command.
 
 Validate using a RAM-only initramfs and ``maxcpus=1``. Record source commits,
@@ -68,26 +68,24 @@ Image creation
 --------------
 
 In order to run U-Boot on an Apple Silicon Mac, U-Boot has to be used
-as a payload for the m1n1 bootloader.  Instructions for building m1n1
-can be found here:
+as a payload for the aura bootloader.  Instructions for building aura
+can be found in its README:
 
-    https://github.com/AsahiLinux/docs/wiki/SW%3Am1n1
+    https://github.com/aurora-silicon/aura
 
 .. code-block:: bash
 
-    $ cat m1n1.macho t8103-j274.dtb u-boot-nodtb.bin > u-boot.macho
+    $ cat aura.macho t8103-j274.dtb u-boot-nodtb.bin > u-boot.macho
 
 This uses ``u-boot-nodtb.bin`` as the device tree is passed to U-Boot
-by m1n1 after making some adjustments.
+by aura after making some adjustments.
 
 Image installation
 ------------------
 
-Instructions on how to install U-Boot on your Mac can be found at:
-
-    https://github.com/AsahiLinux/docs/wiki/Developer-Quickstart
-
-Just replace ``m1n1.macho`` with ``u-boot.macho`` in the instructions.
+Install U-Boot as aura's Stage 2 payload with the aurora-installer
+(https://github.com/aurora-silicon/aurora-installer), or, for development,
+load ``u-boot.macho`` in place of ``aura.macho`` through aura's proxy.
 
 Debug UART
 ----------

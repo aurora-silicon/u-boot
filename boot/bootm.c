@@ -27,6 +27,7 @@
 #include <linux/sizes.h>
 #include <tpm-v2.h>
 #include <tpm_tcg2.h>
+#include <video_console.h>
 #if defined(CONFIG_CMD_USB)
 #include <usb.h>
 #endif
@@ -1212,6 +1213,8 @@ void bootm_final(int flag)
 	if (IS_ENABLED(CONFIG_BOOTSTAGE_REPORT))
 		bootstage_report();
 
+	/* Leave the frame buffer to the OS without a cursor on it */
+	vidconsole_park_cursors();
 	board_quiesce_devices();
 
 	/*

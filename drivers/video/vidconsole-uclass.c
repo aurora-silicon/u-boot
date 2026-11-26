@@ -14,12 +14,18 @@
 #include <command.h>
 #include <console.h>
 #include <env.h>
+#include <cyclic.h>
 #include <log.h>
 #include <dm.h>
+#include <malloc.h>
+#include <time.h>
+#include <asm/global_data.h>
 #include <video.h>
 #include <video_console.h>
 #include <video_font.h>		/* Bitmap font for code page 437 */
 #include <linux/ctype.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 int vidconsole_putc_xy(struct udevice *dev, uint x, uint y, int ch)
 {
@@ -57,6 +63,270 @@ int vidconsole_entry_start(struct udevice *dev)
 		return -ENOSYS;
 	return ops->entry_start(dev);
 }
+
+#if IS_ENABLED(CONFIG_VIDEO_CURSOR)
+/* Time the cursor stays on and off while it blinks */
+#define CURSOR_BLINK_MS		500
+/* How often the blink timer looks at the cursors */
+#define CURSOR_POLL_US		(50 * 1000)
+
+static struct cyclic_info cursor_cyc;
+static bool cursor_cyc_active;
+
+static u32 cursor_get_pixel(const u8 *p, int pbytes)
+{
+	switch (pbytes) {
+	case 4:
+		return *(const u32 *)p;
+	case 2:
+		return *(const u16 *)p;
+	default:
+		return *p;
+	}
+}
+
+static void cursor_put_pixel(u8 *p, u32 colour, int pbytes)
+{
+	switch (pbytes) {
+	case 4:
+		*(u32 *)p = colour;
+		break;
+	case 2:
+		*(u16 *)p = colour;
+		break;
+	default:
+		*p = colour;
+		break;
+	}
+}
+
+static bool cursor_wanted(struct vidconsole_priv *priv)
+{
+	return priv->cursor.enabled && !priv->cursor.parked && !priv->quiet;
+}
+
+/* Draw the cursor under the character cell at the text position */
+static void cursor_draw(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+	struct vidconsole_cursor *cur = &priv->cursor;
+	struct udevice *vid = dev->parent;
+	struct video_priv *vid_priv = dev_get_uclass_priv(vid);
+	int pbytes = VNBYTES(vid_priv->bpix);
+	int x, y, w, h, row, col;
+	size_t size;
+	u8 *line, *save;
+
+	/* The rotated consoles use another coordinate system */
+	if (cur->drawn || vid_priv->rot || !vid_priv->fb)
+		return;
+
+	h = max(priv->y_charsize / 8, 2);
+	x = VID_TO_PIXEL(priv->xcur_frac);
+	y = priv->ycur + priv->y_charsize - h;
+	w = priv->x_charsize;
+	if (x < 0 || y < 0 || x >= vid_priv->xsize || y >= vid_priv->ysize ||
+	    w <= 0)
+		return;
+	w = min(w, vid_priv->xsize - x);
+	h = min(h, vid_priv->ysize - y);
+
+	size = w * h * pbytes;
+	if (size > cur->save_size) {
+		save = realloc(cur->save, size);
+		if (!save)
+			return;
+		cur->save = save;
+		cur->save_size = size;
+	}
+
+	line = vid_priv->fb + y * vid_priv->line_length + x * pbytes;
+	save = cur->save;
+	for (row = 0; row < h; row++) {
+		memcpy(save, line, w * pbytes);
+		for (col = 0; col < w; col++)
+			cursor_put_pixel(line + col * pbytes,
+					 vid_priv->colour_fg, pbytes);
+		save += w * pbytes;
+		line += vid_priv->line_length;
+	}
+
+	cur->x = x;
+	cur->y = y;
+	cur->w = w;
+	cur->h = h;
+	cur->colour = vid_priv->colour_fg;
+	cur->drawn = true;
+	video_damage(vid, x, y, w, h);
+}
+
+/*
+ * Erase the cursor. Only pixels that still hold the cursor colour are put
+ * back, so anything drawn over the cursor in the meantime (a cleared screen,
+ * an EFI GOP blit) is left alone.
+ */
+static void cursor_erase(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+	struct vidconsole_cursor *cur = &priv->cursor;
+	struct udevice *vid = dev->parent;
+	struct video_priv *vid_priv = dev_get_uclass_priv(vid);
+	int pbytes = VNBYTES(vid_priv->bpix);
+	int row, col;
+	u8 *line, *save;
+
+	if (!cur->drawn)
+		return;
+
+	line = vid_priv->fb + cur->y * vid_priv->line_length + cur->x * pbytes;
+	save = cur->save;
+	for (row = 0; row < cur->h; row++) {
+		for (col = 0; col < cur->w; col++) {
+			u8 *p = line + col * pbytes;
+
+			if (cursor_get_pixel(p, pbytes) == cur->colour)
+				memcpy(p, save + col * pbytes, pbytes);
+		}
+		save += cur->w * pbytes;
+		line += vid_priv->line_length;
+	}
+
+	cur->drawn = false;
+	video_damage(vid, cur->x, cur->y, cur->w, cur->h);
+}
+
+/* Start of text output: take the cursor off the screen */
+static void cursor_output_start(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+	priv->cursor.busy = true;
+	cursor_erase(dev);
+}
+
+/* End of text output: show the cursor at the new position, solid for now */
+static void cursor_output_end(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+	struct vidconsole_cursor *cur = &priv->cursor;
+
+	cur->parked = false;
+	if (cursor_wanted(priv) && (gd->flags & GD_FLG_RELOC))
+		cursor_draw(dev);
+	cur->last = get_timer(0);
+	cur->busy = false;
+}
+
+static void cursor_set_enabled(struct vidconsole_priv *priv, bool enabled)
+{
+	priv->cursor.enabled = enabled;
+}
+
+/*
+ * Follow show/hide cursor requests in text that a quiet console does not
+ * draw, so the cursor is right when the console starts showing text
+ */
+static void cursor_track_quiet(struct vidconsole_priv *priv, const char *s)
+{
+	const char *p;
+
+	for (p = strstr(s, "\x1b[?25"); p; p = strstr(p + 1, "\x1b[?25")) {
+		if (p[5] == 'h' || p[5] == 'l')
+			cursor_set_enabled(priv, p[5] == 'h');
+	}
+}
+
+/* Blink timer, run from schedule() while U-Boot or an EFI app polls input */
+static void cursor_blink(struct cyclic_info *cyc)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+
+	if (uclass_get(UCLASS_VIDEO_CONSOLE, &uc))
+		return;
+
+	uclass_foreach_dev(dev, uc) {
+		struct vidconsole_priv *priv;
+		struct vidconsole_cursor *cur;
+
+		if (!device_active(dev))
+			continue;
+		priv = dev_get_uclass_priv(dev);
+		cur = &priv->cursor;
+		if (cur->busy)
+			continue;
+		if (!cursor_wanted(priv)) {
+			if (cur->drawn) {
+				cursor_erase(dev);
+				video_sync(dev->parent, true);
+			}
+			continue;
+		}
+		if (get_timer(cur->last) < CURSOR_BLINK_MS)
+			continue;
+		if (cur->drawn)
+			cursor_erase(dev);
+		else
+			cursor_draw(dev);
+		cur->last = get_timer(0);
+		video_sync(dev->parent, true);
+	}
+}
+
+void vidconsole_park_cursors(void)
+{
+	struct udevice *dev;
+	struct uclass *uc;
+
+	if (uclass_get(UCLASS_VIDEO_CONSOLE, &uc))
+		return;
+
+	uclass_foreach_dev(dev, uc) {
+		struct vidconsole_priv *priv;
+
+		if (!device_active(dev))
+			continue;
+		priv = dev_get_uclass_priv(dev);
+		priv->cursor.parked = true;
+		if (priv->cursor.drawn) {
+			cursor_erase(dev);
+			video_sync(dev->parent, true);
+		}
+	}
+}
+
+static void cursor_init(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+	priv->cursor.enabled = true;
+	if ((gd->flags & GD_FLG_RELOC) && !cursor_cyc_active) {
+		cyclic_register(&cursor_cyc, cursor_blink, CURSOR_POLL_US,
+				"vidconsole_cursor");
+		cursor_cyc_active = true;
+	}
+}
+
+static int vidconsole_pre_remove(struct udevice *dev)
+{
+	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+
+	cursor_erase(dev);
+	free(priv->cursor.save);
+	priv->cursor.save = NULL;
+	priv->cursor.save_size = 0;
+
+	return 0;
+}
+#else
+static inline void cursor_output_start(struct udevice *dev) {}
+static inline void cursor_output_end(struct udevice *dev) {}
+static inline void cursor_init(struct udevice *dev) {}
+static inline void cursor_set_enabled(struct vidconsole_priv *priv,
+				      bool enabled) {}
+static inline void cursor_track_quiet(struct vidconsole_priv *priv,
+				      const char *s) {}
+#endif /* VIDEO_CURSOR */
 
 /* Move backwards one space */
 static int vidconsole_back(struct udevice *dev)
@@ -137,6 +407,11 @@ void vidconsole_set_cursor_pos(struct udevice *dev, int x, int y)
 /**
  * set_cursor_position() - set cursor position
  *
+ * ANSI columns count from the start of the text line (xstart_frac), the same
+ * way get_cursor_position() reports them. Moving the cursor must not move the
+ * start of the line: a carriage return, a newline or a backspace at column 0
+ * would otherwise go back to the column last moved to.
+ *
  * @priv:	private data of the video console
  * @row:	new row
  * @col:	new column
@@ -144,6 +419,8 @@ void vidconsole_set_cursor_pos(struct udevice *dev, int x, int y)
 static void set_cursor_position(struct udevice *dev, int row, int col)
 {
 	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
+	struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
+	int x, y;
 
 	/*
 	 * Ensure we stay in the bounds of the screen.
@@ -152,8 +429,21 @@ static void set_cursor_position(struct udevice *dev, int row, int col)
 		row = priv->rows - 1;
 	if (col >= priv->cols)
 		col = priv->cols - 1;
+	if (row < 0)
+		row = 0;
+	if (col < 0)
+		col = 0;
 
-	vidconsole_position_cursor(dev, col, row);
+	x = VID_TO_PIXEL(priv->xstart_frac) + col * priv->x_charsize;
+	x = min_t(int, x, vid_priv->xsize - 1);
+	y = min_t(int, row * priv->y_charsize, vid_priv->ysize - 1);
+
+	priv->xcur_frac = VID_TO_POS(x);
+	priv->ycur = y;
+
+	/* make sure not to kern against the previous character */
+	priv->last_ch = 0;
+	vidconsole_entry_start(dev);
 }
 
 /**
@@ -341,6 +631,13 @@ static void vidconsole_escape_char(struct udevice *dev, char ch)
 		}
 		break;
 	}
+	case 'h':
+	case 'l':
+		/* DEC private mode 25: show (h) or hide (l) the cursor */
+		if (priv->escape_len == 5 &&
+		    !memcmp(priv->escape_buf, "[?25", 4))
+			cursor_set_enabled(priv, ch == 'h');
+		break;
 	case 'm': {
 		struct video_priv *vid_priv = dev_get_uclass_priv(dev->parent);
 		char *s = priv->escape_buf;
@@ -541,7 +838,9 @@ static void vidconsole_putc(struct stdio_dev *sdev, const char ch)
 
 	if (priv->quiet)
 		return;
+	cursor_output_start(dev);
 	ret = vidconsole_put_char(dev, ch);
+	cursor_output_end(dev);
 	if (ret) {
 #ifdef DEBUG
 		console_puts_select_stderr(true, "[vc err: putc]");
@@ -561,9 +860,13 @@ static void vidconsole_puts(struct stdio_dev *sdev, const char *s)
 	struct vidconsole_priv *priv = dev_get_uclass_priv(dev);
 	int ret;
 
-	if (priv->quiet)
+	if (priv->quiet) {
+		cursor_track_quiet(priv, s);
 		return;
+	}
+	cursor_output_start(dev);
 	ret = vidconsole_put_string(dev, s);
+	cursor_output_end(dev);
 	if (ret) {
 #ifdef DEBUG
 		char str[30];
@@ -842,6 +1145,8 @@ static int vidconsole_post_probe(struct udevice *dev)
 	sdev->puts = vidconsole_puts;
 	sdev->priv = dev;
 
+	cursor_init(dev);
+
 	return stdio_register(sdev);
 }
 
@@ -850,6 +1155,9 @@ UCLASS_DRIVER(vidconsole) = {
 	.name		= "vidconsole0",
 	.pre_probe	= vidconsole_pre_probe,
 	.post_probe	= vidconsole_post_probe,
+#if IS_ENABLED(CONFIG_VIDEO_CURSOR)
+	.pre_remove	= vidconsole_pre_remove,
+#endif
 	.per_device_auto	= sizeof(struct vidconsole_priv),
 };
 

@@ -471,3 +471,105 @@ int main(void) {
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                     str(c), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def test_dma_window_requires_dram_overlap(tmp_path):
+    repo = Path(__file__).resolve().parents[3]
+    text = (repo / 'arch/arm/mach-apple/rtkit_helper.c').read_text()
+    start = text.index('static void rtkit_helper_read_dma_window(')
+    end = text.index('static void *rtkit_helper_alloc(', start)
+    production = text[start:end]
+    unit = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+#define UCLASS_IOMMU 1
+struct global_data { unsigned long ram_base; unsigned long ram_top; };
+static struct global_data mock_gd;
+static struct global_data *gd = &mock_gd;
+struct ofnode_phandle_args { int node; int args_count; u32 args[1]; };
+struct udevice { void *priv; };
+struct rtkit_helper_priv { u64 dma_start, dma_end; struct udevice *dart; u32 dart_sid; };
+static void *dev_get_priv(struct udevice *dev) { return dev->priv; }
+static int mock_phandle_rc;
+static u64 mock_range[2];
+static int mock_range_rc;
+static struct udevice mock_dart;
+static int dev_read_phandle_with_args(struct udevice *dev, const char *list,
+                                      const char *cells, int cell_count,
+                                      int index, struct ofnode_phandle_args *out)
+{
+    (void)dev; (void)list; (void)cells; (void)cell_count; (void)index;
+    if (mock_phandle_rc)
+        return mock_phandle_rc;
+    out->node = 1;
+    out->args_count = 1;
+    out->args[0] = 1;
+    return 0;
+}
+static int ofnode_read_u64_array(int node, const char *prop, u64 *out, size_t sz)
+{
+    (void)node;
+    assert(!strcmp(prop, "apple,dma-range") && sz == 2);
+    if (mock_range_rc)
+        return mock_range_rc;
+    out[0] = mock_range[0];
+    out[1] = mock_range[1];
+    return 0;
+}
+static int uclass_get_device_by_ofnode(int id, int node, struct udevice **devp)
+{
+    (void)id; (void)node;
+    *devp = &mock_dart;
+    return 0;
+}
+''' + production + r'''
+int main(void)
+{
+    struct rtkit_helper_priv p;
+    struct udevice d = {.priv = &p};
+
+    /* T8112: 32-bit translated IOVA window lies below RAM at 0x800000000. */
+    mock_gd.ram_base = 0x800000000ULL;
+    mock_gd.ram_top = 0xa00000000ULL;
+    mock_range[0] = 0x4000ULL;
+    mock_range[1] = 0xffff0000ULL;
+    memset(&p, 0, sizeof(p));
+    rtkit_helper_read_dma_window(&d);
+    assert(p.dma_start == 0 && p.dma_end == 0 && p.dart == &mock_dart && p.dart_sid == 1);
+
+    /* T8122/T8140: DMA window overlaps the low 4 GiB of RAM at 0x10000000000. */
+    mock_gd.ram_base = 0x10000000000ULL;
+    mock_gd.ram_top = 0x10400000000ULL;
+    mock_range[0] = 0x10000004000ULL;
+    mock_range[1] = 0xffff0000ULL;
+    memset(&p, 0, sizeof(p));
+    rtkit_helper_read_dma_window(&d);
+    assert(p.dma_start == 0x10000004000ULL && p.dma_end == 0x100ffff4000ULL);
+
+    /* Window entirely above RAM is ignored. */
+    mock_range[0] = 0x20000000000ULL;
+    mock_range[1] = 0xffff0000ULL;
+    memset(&p, 0, sizeof(p));
+    rtkit_helper_read_dma_window(&d);
+    assert(p.dma_start == 0 && p.dma_end == 0);
+
+    /* Overflowing range is ignored. */
+    mock_range[0] = (u64)-0x4000ULL;
+    mock_range[1] = 0x8000ULL;
+    memset(&p, 0, sizeof(p));
+    rtkit_helper_read_dma_window(&d);
+    assert(p.dma_start == 0 && p.dma_end == 0);
+
+    return 0;
+}
+'''
+    c, binary = tmp_path / 'dma_window.c', tmp_path / 'dma_window'
+    c.write_text(unit)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                    str(c), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)

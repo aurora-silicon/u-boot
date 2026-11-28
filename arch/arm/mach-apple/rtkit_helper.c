@@ -14,11 +14,14 @@
 #include <reset.h>
 #include <linux/libfdt.h>
 
+#include <asm/global_data.h>
 #include <asm/io.h>
 #include <asm/arch/dart.h>
 #include <asm/arch/rtkit.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
+
+DECLARE_GLOBAL_DATA_PTR;
 
 /* ASC registers */
 #define REG_CPU_CTRL		0x0044
@@ -114,10 +117,22 @@ static void rtkit_helper_read_dma_window(struct udevice *dev)
 	if (dev_read_phandle_with_args(dev, "iommus", "#iommu-cells", 0, 0,
 				       &args))
 		return;
+	/*
+	 * apple,dma-range describes the DART's translated IOVA window.  In
+	 * bypass mode the coprocessor addresses physical RAM directly, so
+	 * only clamp physical allocations when that window overlaps DRAM
+	 * (e.g. T8122/T8140 RAM at 0x10000000000, not T8112 where a 32-bit
+	 * translated window [0x4000, 0xffff4000) lies below RAM at 0x800000000).
+	 */
 	if (!ofnode_read_u64_array(args.node, "apple,dma-range", range, 2) &&
 	    range[1] && range[0] <= (u64)-1 - range[1]) {
-		priv->dma_start = range[0];
-		priv->dma_end = range[0] + range[1];
+		u64 start = range[0];
+		u64 end = range[0] + range[1];
+
+		if (start < gd->ram_top && end > gd->ram_base) {
+			priv->dma_start = start;
+			priv->dma_end = end;
+		}
 	}
 
 	/* A live handoff additionally needs the DART left in bypass. */
